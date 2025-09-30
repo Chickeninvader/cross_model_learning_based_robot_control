@@ -1,3 +1,6 @@
 [submodule "external/robosuite"]
 	path = external/robosuite
 	url = https://github.com/ARISE-Initiative/robosuite.git
+[submodule "external/lsr-v2-code"]
+	path = external/lsr-v2-code
+	url = https://github.com/visual-action-planning/lsr-V2-code.git
