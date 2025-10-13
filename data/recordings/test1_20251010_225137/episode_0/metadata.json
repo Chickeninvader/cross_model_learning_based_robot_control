@@ -1,0 +1,9 @@
+{
+  "episode_num": 0,
+  "num_steps": 2269,
+  "total_reward": 97.49999999999999,
+  "duration": 33.771161,
+  "environment": "UnifiedCustomEnv",
+  "robot": "Panda",
+  "timestamp": "2025-10-10T22:52:13.382483"
+}

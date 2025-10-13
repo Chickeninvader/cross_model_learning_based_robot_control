@@ -1,0 +1,13 @@
+{
+  "episode_num": 0,
+  "num_steps": 1800,
+  "total_reward": 89.7,
+  "duration": 27.057699,
+  "environment": "UnifiedCustomEnv",
+  "robot": "Panda",
+  "timestamp": "2025-10-12T19:31:08.456780",
+  "control_freq": 50,
+  "horizon": 5000,
+  "pos_sensitivity": 3.0,
+  "rot_sensitivity": 2.0
+}
