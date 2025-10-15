@@ -1,0 +1,70 @@
+{
+  "robot": "Panda",
+  "placement_mode": "random",
+  "placement_params": {
+    "x_range": [
+      -0.15,
+      0.15
+    ],
+    "y_range": [
+      -0.15,
+      0.15
+    ]
+  },
+  "objects": [
+    {
+      "type": "box",
+      "size": 0.03,
+      "color": [
+        1.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "name": "box_0",
+      "density": 100.0
+    },
+    {
+      "type": "box",
+      "size": 0.03,
+      "color": [
+        1.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "name": "box_1",
+      "density": 100.0
+    },
+    {
+      "type": "box",
+      "size": 0.03,
+      "color": [
+        1.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "name": "box_2",
+      "density": 100.0
+    }
+  ],
+  "table_config": {
+    "size": [
+      0.8,
+      0.8,
+      0.05
+    ],
+    "height": 0.8,
+    "friction": [
+      1.0,
+      0.005,
+      0.0001
+    ]
+  },
+  "metadata": {
+    "name": "test1",
+    "created": "2025-10-10T22:51:35.106716",
+    "version": "1.0"
+  }
+}
