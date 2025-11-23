@@ -4,3 +4,33 @@
 [submodule "external/lsr-v2-code"]
 	path = external/lsr-v2-code
 	url = https://github.com/visual-action-planning/lsr-V2-code.git
+[submodule "external/Pix2Grp_CVPR2024"]
+	path = external/Pix2Grp_CVPR2024
+	url = https://github.com/SHTUPLUS/Pix2Grp_CVPR2024.git
+[submodule "external/segment-anything"]
+	path = external/segment-anything
+	url = https://github.com/facebookresearch/segment-anything.git
+[submodule "external/lang-segment-anything"]
+	path = external/lang-segment-anything
+	url = https://github.com/luca-medeiros/lang-segment-anything.git
+[submodule "external/fair-psgg"]
+	path = external/fair-psgg
+	url = https://github.com/lorjul/fair-psgg.git
+[submodule "external/VLPrompt"]
+	path = external/VLPrompt
+	url = https://github.com/franciszzj/VLPrompt.git
+[submodule "external/crossformer"]
+	path = external/crossformer
+	url = https://github.com/rail-berkeley/crossformer.git
+[submodule "external/octo"]
+	path = external/octo
+	url = https://github.com/octo-models/octo.git
+[submodule "external/robomimic"]
+	path = external/robomimic
+	url = https://github.com/ARISE-Initiative/robomimic.git
+[submodule "external/Scene-Graph-Benchmark"]
+	path = external/Scene-Graph-Benchmark
+	url = https://github.com/KaihuaTang/Scene-Graph-Benchmark.pytorch.git
+[submodule "external/graph-rcnn"]
+	path = external/graph-rcnn
+	url = https://github.com/jwyang/graph-rcnn.pytorch.git
