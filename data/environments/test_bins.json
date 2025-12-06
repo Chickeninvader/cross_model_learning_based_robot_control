@@ -1,16 +1,7 @@
 {
   "robot": "Panda",
   "placement_mode": "random",
-  "placement_params": {
-    "x_range": [
-      -0.15,
-      0.15
-    ],
-    "y_range": [
-      -0.15,
-      0.15
-    ]
-  },
+  "placement_params": {},
   "objects": [
     {
       "type": "box",
@@ -28,8 +19,8 @@
       "type": "box",
       "size": 0.025,
       "color": [
-        1.0,
         0.0,
+        1.0,
         0.0,
         1.0
       ],
@@ -40,39 +31,16 @@
       "type": "box",
       "size": 0.025,
       "color": [
+        0.0,
+        0.0,
         1.0,
-        0.0,
-        0.0,
         1.0
       ],
       "name": "box_2",
       "density": 100.0
-    },
-    {
-      "type": "box",
-      "size": 0.025,
-      "color": [
-        1.0,
-        0.0,
-        0.0,
-        1.0
-      ],
-      "name": "box_3",
-      "density": 100.0
-    },
-    {
-      "type": "box",
-      "size": 0.025,
-      "color": [
-        1.0,
-        0.0,
-        0.0,
-        1.0
-      ],
-      "name": "box_4",
-      "density": 100.0
     }
   ],
+  "arena_type": "bins",
   "table_config": {
     "size": [
       0.8,
@@ -86,9 +54,16 @@
       0.0001
     ]
   },
+  "bin_config": {
+    "bin1_pos": [
+      0.1,
+      -0.25,
+      0.8
+    ]
+  },
   "metadata": {
-    "name": "testenv",
-    "created": "2025-10-10T22:24:44.749153",
+    "name": "test_bins",
+    "created": "2025-10-21T14:08:46.136972",
     "version": "1.0"
   }
 }

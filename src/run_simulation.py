@@ -63,7 +63,7 @@ def load_env_config(env_name):
 
 def create_environment(config, enable_recording=False, camera_obs=False):
     """Create environment from configuration"""
-    from create_env import UnifiedCustomEnv
+    from create_env import UnifiedCustomEnv, validate_object_sizes
 
     # Handle both old and new config formats
     if 'objects' in config:
@@ -100,11 +100,28 @@ def create_environment(config, enable_recording=False, camera_obs=False):
             'y_range': [-placement_range, placement_range]
         }
 
+    # Get arena configuration
+    arena_type = config.get('arena_type', 'table')
+    bin_config = config.get('bin_config', {})
+    table_config = config.get('table_config', {})
+
+    # Use BinsArena-specific dimensions if using bins
+    if arena_type == 'bins':
+        table_full_size = table_config.get('size', [0.39, 0.49, 0.82])
+    else:
+        table_full_size = table_config.get('size', [0.8, 0.8, 0.05])
+
+    # Validate object sizes before creating environment
+    validate_object_sizes(object_configs, arena_type, table_full_size)
+
     env = UnifiedCustomEnv(
         robots=config['robot'],
         object_configs=object_configs,
         placement_mode=placement_mode,
         placement_params=placement_params,
+        arena_type=arena_type,
+        table_full_size=tuple(table_full_size),
+        bin1_pos=tuple(bin_config.get('bin1_pos', [0.1, -0.25, 0.8])),
         has_renderer=True,
         has_offscreen_renderer=enable_recording or camera_obs,
         use_camera_obs=camera_obs,
@@ -612,11 +629,25 @@ def run_teleoperation(args):
                 'y_range': [-placement_range, placement_range]
             }
 
+        # Get arena configuration
+        arena_type = config.get('arena_type', 'table')
+        bin_config = config.get('bin_config', {})
+        table_config = config.get('table_config', {})
+
+        # Use BinsArena-specific dimensions if using bins
+        if arena_type == 'bins':
+            table_full_size = table_config.get('size', [0.39, 0.49, 0.82])
+        else:
+            table_full_size = table_config.get('size', [0.8, 0.8, 0.05])
+
         env = UnifiedCustomEnv(
             robots=config.get('robot', args.robot),
             object_configs=object_configs,
             placement_mode=placement_mode,
             placement_params=placement_params,
+            arena_type=arena_type,
+            table_full_size=tuple(table_full_size),
+            bin1_pos=tuple(bin_config.get('bin1_pos', [0.1, -0.25, 0.8])),
             has_renderer=True,
             has_offscreen_renderer=False,
             use_camera_obs=False,

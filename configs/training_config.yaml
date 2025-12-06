@@ -1,0 +1,55 @@
+# Training Configuration
+
+# Data paths
+franka_data:
+  - data/recordings/franka_demo1
+  - data/recordings/franka_demo2
+  - data/recordings/franka_demo3
+
+sawyer_data:
+  - data/recordings/sawyer_demo1
+  - data/recordings/sawyer_demo2
+
+# Data settings
+val_split: 0.1
+max_demos_per_path: null
+cache_scene_graphs: true
+
+# Training hyperparameters
+batch_size: 32
+learning_rate: 1.0e-4
+weight_decay: 1.0e-5
+num_epochs: 100
+
+# Optimization
+gradient_clip_norm: 1.0
+lr_scheduler: cosine  # cosine, step, plateau
+warmup_epochs: 5
+
+# Curriculum learning
+curriculum_learning: true
+curriculum_start_epoch: 10
+
+# Data augmentation
+data_augmentation: true
+augment_noise_std: 0.01
+augment_apply_prob: 0.5
+
+# Logging and checkpointing
+log_dir: ./logs/cross_embodiment
+save_freq: 10  # Save checkpoint every N epochs
+eval_freq: 5   # Evaluate every N epochs
+early_stopping_patience: 20
+
+# Weights & Biases
+wandb: false
+wandb_project: cross-embodiment-learning
+wandb_entity: null
+
+# Hardware
+device: cuda
+num_workers: 4
+pin_memory: true
+
+# Resume training
+resume: null  # Path to checkpoint to resume from

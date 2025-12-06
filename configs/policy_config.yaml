@@ -1,0 +1,22 @@
+# Policy Architecture Configuration
+
+# Scene graph embedding
+scene_graph_dim: 256
+gnn_hidden_dim: 256
+gnn_layers: 3
+gnn_type: gat  # gcn, gat
+gnn_pooling: mean  # mean, max, attention
+
+# Transformer policy
+hidden_dim: 512
+num_layers: 4
+num_heads: 8
+dropout: 0.1
+activation: relu
+use_cross_attention: true
+
+# Robot-specific dimensions
+robot_state_dim_franka: 14  # 7 joint pos + 7 joint vel
+robot_state_dim_sawyer: 14
+action_dim_franka: 8  # 7 joints + 1 gripper
+action_dim_sawyer: 8

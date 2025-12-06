@@ -1,0 +1,35 @@
+# Evaluation Configuration
+
+# Model
+policy_path: logs/cross_embodiment/best.pth
+
+# Transfer settings
+source_robot: Franka  # Robot policy was trained on
+target_robot: Sawyer  # Robot to evaluate on (zero-shot)
+
+# Evaluation settings
+task: Lift  # Lift, Stack, PickPlace, Door
+num_episodes: 50
+max_steps: 500
+render: false
+
+# Ablation study
+ablation: true
+ablation_variants:
+  - full_model
+  - no_scene_graph
+  - no_cross_attention
+  - smaller_model
+
+# Output
+output_dir: ./eval_results
+save_trajectories: true
+save_videos: false
+
+# Metrics to compute
+compute_metrics:
+  - success_rate
+  - mean_reward
+  - trajectory_smoothness
+  - action_magnitude
+  - collision_rate
