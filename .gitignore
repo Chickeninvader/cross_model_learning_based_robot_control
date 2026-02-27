@@ -1,0 +1,49 @@
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+
+# ===== Virtual environments =====
+.venv/
+env/
+venv/
+
+# ===== OS files =====
+.DS_Store
+Thumbs.db
+
+# ===== IDE / editor =====
+.vscode/
+.idea/
+*.swp
+
+# ===== Logs and temp =====
+*.log
+*.tmp
+
+# ===== Large binary files =====
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.pkl
+*.npy
+*.npz
+
+# ===== Datasets (large, not tracked) =====
+datasets/
+
+# ===== Model weights (large, not tracked) =====
+models/
+
+# ===== Output / generated artifacts =====
+output/
+outputs/
+checkpoints/
+runs/
+
+# ===== External repos (cloned via scripts/setup_external.sh) =====
+external/
