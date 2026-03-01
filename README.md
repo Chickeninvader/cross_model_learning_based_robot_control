@@ -1,5 +1,83 @@
 # Cross-Model Learning-Based Robot Control
 
+## RLBench Dataset Generation — Headless Docker + OSMesa
+
+Get started
+--------
+```bash
+cd external/RLBench \
+docker-compose up -d
+```
+
+Inside docker containter, run 
+
+```bash
+python dataset_generator.py \
+    --tasks stack_cups \
+    --variations 2 \
+    --processes 1 \
+    --episodes_per_task 1 \
+    --save_path /workspace/datasets/rlbench \
+    --image_size 256 256 \
+    --renderer opengl3
+```
+
+to generate dataset 
+
+
+
+Scene Graph Generation Environment
+----------------------------------
+Create/activate your conda environment and install the Python tooling used
+for scene graph generation:
+
+```bash
+conda activate comp_robotics
+conda install -c conda-forge opencv ipywidgets matplotlib jupyterlab gymnasium -y
+```
+
+and follow the jupyter notebook in examples/scene_graph_analyzer.ipynb to annotate dataset
+
+Troubleshooting
+--------
+
+
+Quick install (OSMesa + Xvfb)
+----------------------------
+Run these as root or with sudo inside the container to install needed packages:
+
+```bash
+apt-get update && apt-get install -y \
+    mesa-utils \
+    x11-utils \
+    libosmesa6 \
+    libosmesa6-dev \
+    xvfb
+```
+
+Add this env variable
+
+```
+export LIBGL_ALWAYS_SOFTWARE=1
+export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
+export MESA_GL_VERSION_OVERRIDE=3.3
+export QT_X11_NO_MITSHM=1
+export QT_QPA_PLATFORM=xcb
+export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libOSMesa.so.6   # change if different
+export DISPLAY=:99
+```
+
+Start a headless X server (Xvfb)
+--------------------------------
+Start Xvfb and export DISPLAY before running any renderer-dependent code:
+
+```bash
+Xvfb :99 -screen 0 1280x1024x24 >/tmp/xvfb-99.log 2>&1 &
+export DISPLAY=:99
+sleep 0.5
+```
+
+
 ## Dataset Conversion: RLBench → LeRobot v3
 
 ### Prerequisites
@@ -152,3 +230,5 @@ rerun local_stack_cups_variation1_episode_0.rrd
 - `--repo-id` is just a label — it doesn't need to exist on HuggingFace
 - `--num-workers 0` avoids multiprocessing issues on the cluster
 - `--tolerance-s 1e-4` relaxes timestamp validation
+
+

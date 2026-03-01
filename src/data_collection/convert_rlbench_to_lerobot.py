@@ -35,10 +35,12 @@ from typing import Any, Dict, List
 import numpy as np
 import pandas as pd
 
-# Allow running from the repo root
-sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+# Add project root to sys.path to allow imports from src package
+_project_root = Path(__file__).parent.parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
 
-from utils.rlbench_utils import (
+from src.utils.rlbench_utils import (
     build_episode_stats,
     compute_eef_actions,
     compute_episode_boundaries,
