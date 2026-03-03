@@ -231,4 +231,107 @@ rerun local_stack_cups_variation1_episode_0.rrd
 - `--num-workers 0` avoids multiprocessing issues on the cluster
 - `--tolerance-s 1e-4` relaxes timestamp validation
 
+---
 
+## GR00T N1.5 Training on ASU Sol HPC
+
+### System Info
+
+- **OS:** Rocky Linux 8 (GLIBC 2.28)
+- **GPU:** NVIDIA A100 (sm_80 / compute capability 8.0)
+- **CUDA toolkit:** 12.6.1 (via module)
+- **GCC:** 12.1.0 (via module)
+- **Python:** 3.10 (conda env `lerobot`)
+
+### 1. Load Modules & Activate Environment
+
+```bash
+module load mamba/latest
+source activate lerobot
+module load cuda-12.6.1-gcc-12.1.0
+module load gcc-12.1.0-gcc-11.2.0
+```
+
+### 2. Install Core Python Packages
+
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+pip install -e external/lerobot
+```
+
+> **Note:** If `setuptools` version errors occur during lerobot install,
+> pin it first: `pip install "setuptools<81.0.0"`
+
+### 3. Build flash-attn from Source
+
+Pre-built wheels require GLIBC ≥ 2.32 which Sol (Rocky Linux 8) does not have.
+You must build from source.
+
+```bash
+# Clone flash-attn
+cd /scratch/$USER/tmp
+git clone https://github.com/Dao-AILab/flash-attention.git flash-attn-src
+cd flash-attn-src
+```
+
+**Patch `setup.py`** — Replace `os.rename` with `shutil.move` on the wheel-copy
+line (~line 563) to fix cross-device link errors between `/tmp` and `/scratch`:
+
+```python
+# In setup.py, near the end of the file:
+# BEFORE:
+#     os.rename(wheel_filename, wheel_path)
+# AFTER:
+import shutil
+shutil.move(wheel_filename, wheel_path)
+```
+
+**Build and install:**
+
+```bash
+export FLASH_ATTENTION_FORCE_BUILD=TRUE   # must be exactly "TRUE", not "1"
+export FLASH_ATTN_CUDA_ARCHS=80           # A100 only; avoids unsupported sm_120
+export MAX_JOBS=4                          # prevent OOM during compilation
+
+pip install . 2>&1 | tee /scratch/$USER/tmp/flashattn_build.log
+```
+
+> Build takes ~20 minutes on Sol. Verify with:
+> ```bash
+> cd /scratch/$USER   # do NOT run from the source directory
+> python -c "import flash_attn; print(flash_attn.__version__)"
+> # Expected: 2.8.3 (or newer)
+> ```
+
+### 4. Install FFmpeg & PyAV (Video Backend)
+
+`torchcodec` (the default lerobot video backend) has a C++11 ABI mismatch with
+the pip-installed PyTorch on Sol. Use `pyav` as the video backend instead.
+
+```bash
+conda install -c conda-forge ffmpeg -y
+pip install av   # PyAV — should already be installed with lerobot
+```
+
+When running training, always pass `--dataset.video_backend=pyav` (already set
+in `scripts/train_groot_1gpu_smoke.sh`).
+
+### 5. Run a Smoke Test
+
+```bash
+bash scripts/train_groot_1gpu_smoke.sh
+```
+
+This runs 1 training step with batch_size=1 to verify the full pipeline works
+(data loading, model forward pass, loss computation, checkpoint save).
+
+### Troubleshooting (Sol-specific)
+
+| Problem | Cause | Fix |
+|---|---|---|
+| `GLIBC_2.32 not found` when importing flash-attn | Pre-built wheel needs newer GLIBC | Build from source (step 3) |
+| `OSError: [Errno 18] Invalid cross-device link` during flash-attn build | `os.rename()` across `/tmp` ↔ `/scratch` | Patch setup.py: `os.rename` → `shutil.move` |
+| `FLASH_ATTENTION_FORCE_BUILD` ignored | Env var checked with `== "TRUE"` | Set exactly `TRUE`, not `1` or `true` |
+| `nvcc fatal: Unsupported gpu architecture 'compute_120'` | CUDA 12.6 doesn't support sm_120+ | Set `FLASH_ATTN_CUDA_ARCHS=80` |
+| `ModuleNotFoundError: No module named 'flash_attn_2_cuda'` | Running python from flash-attn source dir | `cd` out of the source directory first |
+| `undefined symbol: _ZN3c1013MessageLogger6streamB5cxx11Ev` in torchcodec | C++11 ABI mismatch with PyTorch | Use `--dataset.video_backend=pyav` instead |
