@@ -257,6 +257,23 @@ def compute_feature_stats(values: np.ndarray) -> dict:
     }
 
 
+def compute_feature_stats_groot(values: np.ndarray) -> dict:
+    """Compute min / max / mean / std / q01 / q99 / count for a numeric feature.
+
+    Same as :func:`compute_feature_stats` but adds ``q01``/``q99`` percentiles
+    to match the GR00T / LeRobot v3 episodes-parquet schema.
+    """
+    return {
+        "min": values.min(axis=0).tolist(),
+        "max": values.max(axis=0).tolist(),
+        "mean": values.mean(axis=0).tolist(),
+        "std": values.std(axis=0, ddof=0).tolist(),
+        "q01": np.percentile(values, 1, axis=0).tolist(),
+        "q99": np.percentile(values, 99, axis=0).tolist(),
+        "count": [int(values.shape[0])],
+    }
+
+
 def compute_image_stats_placeholder(n_frames: int) -> dict:
     """Return a fixed placeholder image stats dict (values in [0,1])."""
     return {
@@ -275,6 +292,20 @@ def compute_bool_stats(values: np.ndarray) -> dict:
         "max": [bool(arr.max())],
         "mean": [float(arr.mean())],
         "std": [float(arr.std(ddof=0))],
+        "count": [int(len(arr))],
+    }
+
+
+def compute_bool_stats_groot(values: np.ndarray) -> dict:
+    """Bool stats with q01/q99 to match GR00T episodes-parquet schema."""
+    arr = values.astype(np.float64)
+    return {
+        "min": [bool(arr.min())],
+        "max": [bool(arr.max())],
+        "mean": [float(arr.mean())],
+        "std": [float(arr.std(ddof=0))],
+        "q01": [float(np.percentile(arr, 1))],
+        "q99": [float(np.percentile(arr, 99))],
         "count": [int(len(arr))],
     }
 
@@ -352,6 +383,61 @@ def build_episode_stats(
         ("observation.images.wrist_rgb", n_wrist_frames),
         ("observation.images.mask", n_mask_frames),
     ]:
+        img_stats = compute_image_stats_placeholder(n_fr)
+        for stat_key in ("min", "max", "mean", "std", "count"):
+            d[f"stats/{cam_name}/{stat_key}"] = _to_nested_list(img_stats[stat_key])
+
+    return d
+
+
+def build_episode_stats_groot(
+    states: np.ndarray,
+    actions: np.ndarray,
+    timestamps: np.ndarray,
+    done_flags: np.ndarray,
+    rewards: np.ndarray,
+    episode_indices: np.ndarray,
+    frame_indices: np.ndarray,
+    global_indices: np.ndarray,
+    task_indices: np.ndarray,
+    task_desc_indices: np.ndarray,
+    task_name_indices: np.ndarray,
+    validity_indices: np.ndarray,
+    camera_names: List[str],
+    n_camera_frames: List[int],
+) -> dict:
+    """Return a flat dict of per-episode statistics matching GR00T format.
+
+    Includes q01/q99 percentiles and all annotation columns expected by the
+    GR00T LeRobot v3 dataset schema.
+    """
+    d: Dict[str, Any] = {}
+
+    feature_map = {
+        "observation.state": states,
+        "action": actions,
+        "timestamp": timestamps.reshape(-1, 1).astype(np.float64),
+        "episode_index": episode_indices.reshape(-1, 1).astype(np.float64),
+        "index": global_indices.reshape(-1, 1).astype(np.float64),
+        "task_index": task_indices.reshape(-1, 1).astype(np.float64),
+        "annotation.human.action.task_description": task_desc_indices.reshape(-1, 1).astype(np.float64),
+        "annotation.human.action.task_name": task_name_indices.reshape(-1, 1).astype(np.float64),
+        "annotation.human.validity": validity_indices.reshape(-1, 1).astype(np.float64),
+        "next.reward": rewards.reshape(-1, 1).astype(np.float64),
+    }
+
+    for feat_name, arr in feature_map.items():
+        stats = compute_feature_stats_groot(arr)
+        for stat_key in ("mean", "std", "min", "max", "q01", "q99", "count"):
+            d[f"stats/{feat_name}/{stat_key}"] = _to_nested_list(stats[stat_key])
+
+    # done (bool)
+    done_stats = compute_bool_stats_groot(done_flags)
+    for stat_key in ("mean", "std", "min", "max", "q01", "q99", "count"):
+        d[f"stats/next.done/{stat_key}"] = _to_nested_list(done_stats[stat_key])
+
+    # image stats (placeholder) – one per camera
+    for cam_name, n_fr in zip(camera_names, n_camera_frames):
         img_stats = compute_image_stats_placeholder(n_fr)
         for stat_key in ("min", "max", "mean", "std", "count"):
             d[f"stats/{cam_name}/{stat_key}"] = _to_nested_list(img_stats[stat_key])

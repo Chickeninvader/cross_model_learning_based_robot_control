@@ -1,15 +1,30 @@
 #!/usr/bin/env python3
 """
-Convert an RLBench dataset (one variation of one task) into LeRobot v3 format,
-splitting the trajectory into multiple episodes based on scene-graph transitions.
+Convert an RLBench dataset (one variation of one task) into LeRobot v3 format
+**compatible with the GR00T (N1.5) policy**.
+
+Key differences from the original converter
+--------------------------------------------
+* **No mask / depth channels** -- GR00T is RGB-only; we keep ``front_rgb`` and
+  ``wrist_rgb`` only.
+* **Natural-language task descriptions** derived from scene-graph transitions
+  (ConceptGraphs-style), stored as the ``annotation.human.action.task_description``
+  column that GR00T reads via ``task_index -> tasks.parquet -> "task"`` mapping.
+* **GR00T annotation columns** added to the data parquet:
+    - ``annotation.human.action.task_description`` (int64 -> task index)
+    - ``annotation.human.action.task_name`` (int64 -> task index for short name)
+    - ``annotation.human.validity`` (int64 -> always "Valid")
+    - ``next.reward`` (float64 -> 0.0, with 1.0 at the last frame)
+* **Per-episode stats** include ``q01`` / ``q99`` percentiles to match the GR00T
+  LeRobot v3 schema.
 
 Usage
 -----
-    python src/convert_rlbench_to_lerobot.py \
-        --task_name stack_cups \
-        --variation 1 \
-        --rlbench_root datasets/rlbench \
-        --output_root datasets/lerobot \
+    python src/data_collection/convert_rlbench_to_lerobot.py \\
+        --task_name stack_cups \\
+        --variation 0 \\
+        --rlbench_root datasets/rlbench \\
+        --output_root datasets/lerobot \\
         --fps 10
 
 The script reads:
@@ -17,11 +32,10 @@ The script reads:
         episodes/episode0/front_rgb/*.png
         episodes/episode0/wrist_rgb/*.png
         episodes/episode0/low_dim_obs.pkl
-        episode_mask.mp4
         <task_name>_scene_graph.json
         object_color_map.json
 
-And writes a LeRobot-v3 dataset to:
+And writes a LeRobot-v3 / GR00T-compatible dataset to:
     datasets/lerobot/<task_name>_variation<num>/
 """
 
@@ -41,12 +55,12 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from src.utils.rlbench_utils import (
-    build_episode_stats,
+    build_episode_stats_groot,
     compute_eef_actions,
     compute_episode_boundaries,
-    compute_feature_stats,
+    compute_feature_stats_groot,
     compute_image_stats_placeholder,
-    compute_bool_stats,
+    compute_bool_stats_groot,
     compute_obs_offset,
     extract_eef_state,
     find_transitions,
@@ -54,17 +68,26 @@ from src.utils.rlbench_utils import (
     load_rlbench_demo,
     load_scene_graph,
     obs_index_for_frame,
-    slice_video,
+)
+from src.utils.scene_graph_language import (
+    generate_task_descriptions,
 )
 
-# ── Codec/pix-fmt used for output videos ──────────────────────────────────
+# -- Codec/pix-fmt used for output videos -----------------------------------
 VIDEO_CODEC = "libx264"
 PIX_FMT = "yuv420p"
 
+# -- Camera names (GR00T convention) ----------------------------------------
+# Map RLBench camera dirs to GR00T-style observation keys
+CAMERAS: Dict[str, str] = {
+    "front_rgb": "observation.images.front_rgb",
+    "wrist_rgb": "observation.images.wrist_rgb",
+}
 
-# ═══════════════════════════════════════════════════════════════════════════
+
+# ===========================================================================
 # Main conversion logic
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 
 def convert(
     task_name: str,
@@ -73,23 +96,43 @@ def convert(
     output_root: str,
     fps: int = 10,
     episode_index_in_rlbench: int = 0,
+    use_context_prompt: bool = False,
 ):
-    # ── Paths ─────────────────────────────────────────────────────────────
+    """Convert one RLBench variation into GR00T-compatible LeRobot v3 format.
+
+    Parameters
+    ----------
+    task_name : str
+        RLBench task, e.g. ``"stack_cups"``.
+    variation : int
+        Variation index.
+    rlbench_root : str
+        Root containing ``<task>/variation<N>/...``.
+    output_root : str
+        Where to write the LeRobot dataset.
+    fps : int
+        Frames per second.
+    episode_index_in_rlbench : int
+        Which RLBench episode directory to read (default 0).
+    use_context_prompt : bool
+        If True, prepend the full ConceptGraphs-style scene context to each
+        task description.  Default False (concise imperative only).
+    """
+    # -- Paths ---------------------------------------------------------------
     var_dir = os.path.join(rlbench_root, task_name, f"variation{variation}")
     ep_dir = os.path.join(var_dir, "episodes", f"episode{episode_index_in_rlbench}")
     front_rgb_dir = os.path.join(ep_dir, "front_rgb")
     wrist_rgb_dir = os.path.join(ep_dir, "wrist_rgb")
     pkl_path = os.path.join(ep_dir, "low_dim_obs.pkl")
-    mask_video_path = os.path.join(var_dir, "episode_mask.mp4")
     sg_path = os.path.join(var_dir, f"{task_name}_scene_graph.json")
     color_map_path = os.path.join(var_dir, "object_color_map.json")
 
     dataset_name = f"{task_name}_variation{variation}"
     out_dir = os.path.join(output_root, dataset_name)
 
-    print(f"[INFO] Converting {var_dir} → {out_dir}")
+    print(f"[INFO] Converting {var_dir} -> {out_dir}")
 
-    # ── Load sources ──────────────────────────────────────────────────────
+    # -- Load sources --------------------------------------------------------
     observations = load_rlbench_demo(pkl_path)
     scene_graph = load_scene_graph(sg_path)
     with open(color_map_path) as f:
@@ -98,7 +141,7 @@ def convert(
     transitions = find_transitions(scene_graph)
     episodes = compute_episode_boundaries(scene_graph, transitions)
     n_episodes = len(episodes)
-    print(f"[INFO] Found {len(transitions)} transitions → {n_episodes} episodes")
+    print(f"[INFO] Found {len(transitions)} transitions -> {n_episodes} episodes")
 
     # Number of images / obs for alignment
     n_images = len(os.listdir(front_rgb_dir))
@@ -110,61 +153,63 @@ def convert(
     all_states = np.stack([extract_eef_state(o) for o in observations], axis=0)  # (n_obs, 8)
     all_actions = compute_eef_actions(observations)  # (n_obs, 8)
 
-    # Scene-graph first frame (mask video frame 0 = this image index)
-    sg_first_frame = scene_graph["frames"][0]["frame_id"]
+    objects_meta = scene_graph.get("objects", {})
 
-    # ── Determine task descriptions ───────────────────────────────────────
-    task_descriptions: List[str] = []
-    for ep in episodes:
-        begin_str = json.dumps(ep["begin_sg"])
-        end_str = json.dumps(ep["end_sg"])
-        desc = f"{task_name}: {begin_str} → {end_str}"
-        task_descriptions.append(desc)
+    # -- Generate task descriptions from scene-graph transitions -------------
+    task_descriptions: List[str] = generate_task_descriptions(
+        episodes, objects_meta, task_name, use_context=use_context_prompt,
+    )
+    # Short task-name (like "StackCups" in GR00T)
+    task_short_name = task_name.replace("_", " ").title().replace(" ", "")
+    # Validity label
+    validity_label = "Valid"
 
-    # ── Per-episode data collection ───────────────────────────────────────
-    # We accumulate rows and write a single parquet later.
+    # Build full task list: [desc_0, desc_1, ..., task_short_name, validity_label]
+    # GR00T structure: different annotation types share the same task table.
+    unique_descs = list(dict.fromkeys(task_descriptions))  # dedup, preserve order
+    all_task_strings: List[str] = unique_descs + [task_short_name, validity_label]
+    task_str_to_idx = {s: i for i, s in enumerate(all_task_strings)}
+
+    # Per-description index for task_description column
+    task_desc_idx_map = {desc: task_str_to_idx[desc] for desc in unique_descs}
+    task_name_idx = task_str_to_idx[task_short_name]
+    validity_idx = task_str_to_idx[validity_label]
+
+    print(f"[INFO] Task descriptions ({len(unique_descs)} unique):")
+    for d_ in unique_descs:
+        print(f"       [{task_str_to_idx[d_]}] {d_[:120]}{'...' if len(d_) > 120 else ''}")
+
+    # -- Per-episode data collection -----------------------------------------
     parquet_rows: List[dict] = []
     episode_meta_rows: List[dict] = []
-    global_index = 0  # monotonically increasing across all episodes
+    global_index = 0
 
-    # Episode-level scene-graph info stored in info.json later
+    # Episode-level scene-graph info stored in info.json
     episode_sg_info: List[dict] = []
 
-    # Stats accumulators (across all episodes)
-    all_ep_states: List[np.ndarray] = []
-    all_ep_actions: List[np.ndarray] = []
-    all_ep_done: List[np.ndarray] = []
-    all_ep_timestamps: List[np.ndarray] = []
-    all_ep_frame_idx: List[np.ndarray] = []
-    all_ep_episode_idx: List[np.ndarray] = []
-    all_ep_index: List[np.ndarray] = []
-    all_ep_task_idx: List[np.ndarray] = []
-
     total_frames = 0
-    total_video_frames_front = 0
-    total_video_frames_wrist = 0
-    total_video_frames_mask = 0
+    camera_names = list(CAMERAS.values())
 
     for ep_idx, ep in enumerate(episodes):
         start_frame = ep["start_frame"]
         end_frame = ep["end_frame"]
         n_frames = end_frame - start_frame + 1
-        task_idx = ep_idx  # one task per transition-episode
+        desc = task_descriptions[ep_idx]
+        desc_task_idx = task_desc_idx_map[desc]
 
-        print(f"  Episode {ep_idx}: frames {start_frame}–{end_frame} ({n_frames} frames)")
+        print(f"  Episode {ep_idx}: frames {start_frame}-{end_frame} ({n_frames} frames)")
 
-        # ── Map frame range to observation indices ────────────────────────
+        # -- Map frame range to observation indices --------------------------
         obs_start = obs_index_for_frame(start_frame, obs_offset)
         obs_end = obs_index_for_frame(end_frame, obs_offset)
-        # Clamp to valid range
         obs_start = max(0, obs_start)
         obs_end = min(n_obs - 1, obs_end)
         n_obs_frames = obs_end - obs_start + 1
 
-        ep_states = all_states[obs_start : obs_end + 1]       # (n_obs_frames, 8)
-        ep_actions = all_actions[obs_start : obs_end + 1]      # (n_obs_frames, 8)
+        ep_states = all_states[obs_start : obs_end + 1]
+        ep_actions = all_actions[obs_start : obs_end + 1]
 
-        # If obs count < image count for this segment, we pad/repeat last
+        # Pad / trim to match image count
         if n_obs_frames < n_frames:
             pad = n_frames - n_obs_frames
             ep_states = np.concatenate([ep_states, np.tile(ep_states[-1:], (pad, 1))], axis=0)
@@ -173,102 +218,86 @@ def convert(
             ep_states = ep_states[:n_frames]
             ep_actions = ep_actions[:n_frames]
 
-        # ── Create videos ─────────────────────────────────────────────────
+        # -- Create videos (RGB only, no mask) -------------------------------
         chunk_idx = 0
-        file_idx = ep_idx  # one file per episode
+        file_idx = ep_idx
 
-        for cam_name, img_dir in [
-            ("observation.images.front_rgb", front_rgb_dir),
-            ("observation.images.wrist_rgb", wrist_rgb_dir),
-        ]:
+        for cam_dir, cam_key in CAMERAS.items():
+            img_dir = os.path.join(ep_dir, cam_dir)
             vid_out = os.path.join(
-                out_dir, "videos", cam_name,
+                out_dir, "videos", cam_key,
                 f"chunk-{chunk_idx:03d}", f"file-{file_idx:03d}.mp4",
             )
             print(f"    Creating video {vid_out}")
             images_to_video(img_dir, vid_out, start_frame, end_frame, fps,
                             codec=VIDEO_CODEC, pix_fmt=PIX_FMT)
 
-        # ── Mask video – slice from episode_mask.mp4 ─────────────────────
-        mask_vid_out = os.path.join(
-            out_dir, "videos", "observation.images.mask",
-            f"chunk-{chunk_idx:03d}", f"file-{file_idx:03d}.mp4",
-        )
-        print(f"    Slicing mask video → {mask_vid_out}")
-        slice_video(
-            mask_video_path, mask_vid_out,
-            start_frame, end_frame,
-            video_first_frame=sg_first_frame,
-            fps=fps, codec=VIDEO_CODEC, pix_fmt=PIX_FMT,
-        )
-
-        # ── Build parquet rows ────────────────────────────────────────────
-        timestamps = np.arange(n_frames, dtype=np.float32) / fps
+        # -- Build parquet rows ----------------------------------------------
+        timestamps = np.arange(n_frames, dtype=np.float64) / fps
         frame_indices = np.arange(n_frames, dtype=np.int64)
         done_flags = np.zeros(n_frames, dtype=bool)
         done_flags[-1] = True
+        rewards = np.zeros(n_frames, dtype=np.float64)
+        rewards[-1] = 1.0
         global_indices = np.arange(global_index, global_index + n_frames, dtype=np.int64)
         episode_indices = np.full(n_frames, ep_idx, dtype=np.int64)
-        task_indices = np.full(n_frames, task_idx, dtype=np.int64)
+        task_indices = np.full(n_frames, desc_task_idx, dtype=np.int64)
+        task_desc_indices = np.full(n_frames, desc_task_idx, dtype=np.int64)
+        task_name_indices_arr = np.full(n_frames, task_name_idx, dtype=np.int64)
+        validity_indices = np.full(n_frames, validity_idx, dtype=np.int64)
 
         for i in range(n_frames):
             parquet_rows.append({
                 "observation.state": ep_states[i].tolist(),
                 "action": ep_actions[i].tolist(),
-                "episode_index": int(episode_indices[i]),
-                "frame_index": int(frame_indices[i]),
                 "timestamp": float(timestamps[i]),
-                "next.done": bool(done_flags[i]),
-                "index": int(global_indices[i]),
+                "annotation.human.action.task_description": int(task_desc_indices[i]),
                 "task_index": int(task_indices[i]),
+                "annotation.human.action.task_name": int(task_name_indices_arr[i]),
+                "annotation.human.validity": int(validity_indices[i]),
+                "episode_index": int(episode_indices[i]),
+                "index": int(global_indices[i]),
+                "next.reward": float(rewards[i]),
+                "next.done": bool(done_flags[i]),
             })
 
-        # Accumulate for global stats
-        all_ep_states.append(ep_states)
-        all_ep_actions.append(ep_actions)
-        all_ep_done.append(done_flags)
-        all_ep_timestamps.append(timestamps)
-        all_ep_frame_idx.append(frame_indices)
-        all_ep_episode_idx.append(episode_indices)
-        all_ep_index.append(global_indices)
-        all_ep_task_idx.append(task_indices)
-
-        # ── Episode metadata row ──────────────────────────────────────────
+        # -- Episode metadata row --------------------------------------------
         ep_duration = n_frames / fps
         ep_meta: Dict[str, Any] = {
             "episode_index": ep_idx,
             "data/chunk_index": chunk_idx,
-            "data/file_index": 0,  # all data in one parquet file
+            "data/file_index": 0,
             "dataset_from_index": global_index,
             "dataset_to_index": global_index + n_frames,
-            "tasks": np.array(task_descriptions[ep_idx:ep_idx + 1], dtype=object),
+            "tasks": np.array([desc, task_short_name, validity_label], dtype=object),
             "length": n_frames,
             "meta/episodes/chunk_index": 0,
             "meta/episodes/file_index": 0,
         }
 
         # Per-video columns
-        for cam in ["observation.images.front_rgb",
-                     "observation.images.wrist_rgb",
-                     "observation.images.mask"]:
-            ep_meta[f"videos/{cam}/chunk_index"] = chunk_idx
-            ep_meta[f"videos/{cam}/file_index"] = file_idx
-            ep_meta[f"videos/{cam}/from_timestamp"] = 0.0
-            ep_meta[f"videos/{cam}/to_timestamp"] = float(ep_duration)
+        for cam_key in camera_names:
+            ep_meta[f"videos/{cam_key}/chunk_index"] = chunk_idx
+            ep_meta[f"videos/{cam_key}/file_index"] = file_idx
+            ep_meta[f"videos/{cam_key}/from_timestamp"] = 0.0
+            ep_meta[f"videos/{cam_key}/to_timestamp"] = float(ep_duration)
 
-        # Per-episode stats
-        ep_stats = build_episode_stats(
+        # Per-episode stats (GR00T format with q01/q99)
+        ep_stats = build_episode_stats_groot(
             states=ep_states,
             actions=ep_actions,
-            episode_indices=episode_indices,
-            frame_indices=frame_indices,
             timestamps=timestamps,
             done_flags=done_flags,
+            rewards=rewards,
+            episode_indices=episode_indices,
+            frame_indices=frame_indices,
             global_indices=global_indices,
             task_indices=task_indices,
-            n_front_frames=n_frames,
-            n_wrist_frames=n_frames,
-            n_mask_frames=n_frames,
+            task_desc_indices=task_desc_indices,
+            task_name_indices=task_name_indices_arr,
+            validity_indices=validity_indices,
+            camera_names=camera_names,
+            n_camera_frames=[n_frames] * len(camera_names),
         )
         ep_meta.update(ep_stats)
         episode_meta_rows.append(ep_meta)
@@ -280,17 +309,15 @@ def convert(
             "end_frame": end_frame,
             "begin_scene_graph": ep["begin_sg"],
             "end_scene_graph": ep["end_sg"],
+            "task_description": desc,
         })
 
         total_frames += n_frames
-        total_video_frames_front += n_frames
-        total_video_frames_wrist += n_frames
-        total_video_frames_mask += n_frames
         global_index += n_frames
 
-    # ═════════════════════════════════════════════════════════════════════
+    # =======================================================================
     # Write data parquet
-    # ═════════════════════════════════════════════════════════════════════
+    # =======================================================================
     data_dir = os.path.join(out_dir, "data", "chunk-000")
     os.makedirs(data_dir, exist_ok=True)
     df = pd.DataFrame(parquet_rows)
@@ -298,40 +325,39 @@ def convert(
     df.to_parquet(data_parquet_path, index=False)
     print(f"[INFO] Wrote {data_parquet_path}  ({len(df)} rows)")
 
-    # ═════════════════════════════════════════════════════════════════════
+    # =======================================================================
     # Write meta/tasks.parquet
-    # ═════════════════════════════════════════════════════════════════════
+    # =======================================================================
     meta_dir = os.path.join(out_dir, "meta")
     os.makedirs(meta_dir, exist_ok=True)
-    tasks_df = pd.DataFrame({
-        "task_index": list(range(len(task_descriptions))),
-    }, index=task_descriptions)
+    tasks_df = pd.DataFrame(
+        {"task_index": list(range(len(all_task_strings)))},
+        index=all_task_strings,
+    )
     tasks_df.to_parquet(os.path.join(meta_dir, "tasks.parquet"))
-    print(f"[INFO] Wrote tasks.parquet")
+    print(f"[INFO] Wrote tasks.parquet ({len(all_task_strings)} entries)")
 
-    # ═════════════════════════════════════════════════════════════════════
+    # =======================================================================
     # Write meta/episodes/chunk-000/file-000.parquet
-    # ═════════════════════════════════════════════════════════════════════
+    # =======================================================================
     ep_meta_dir = os.path.join(meta_dir, "episodes", "chunk-000")
     os.makedirs(ep_meta_dir, exist_ok=True)
     ep_df = pd.DataFrame(episode_meta_rows)
     ep_df.to_parquet(os.path.join(ep_meta_dir, "file-000.parquet"), index=False)
     print(f"[INFO] Wrote episodes parquet")
 
-    # ═════════════════════════════════════════════════════════════════════
+    # =======================================================================
     # Write meta/info.json
-    # ═════════════════════════════════════════════════════════════════════
-    # Determine image shape from first image
+    # =======================================================================
     from PIL import Image
     sample_img = Image.open(os.path.join(front_rgb_dir, "0.png"))
     img_w, img_h = sample_img.size
 
-    splits = {}
-    for ep_idx in range(n_episodes):
-        splits[f"episode_{ep_idx}"] = f"{ep_idx}:{ep_idx + 1}"
-    splits["train"] = f"0:{n_episodes}"
+    splits = {
+        "train": f"0:{n_episodes}",
+    }
 
-    def _video_feature(name: str, shape: list):
+    def _video_feature(shape: list):
         return {
             "dtype": "video",
             "shape": shape,
@@ -345,73 +371,89 @@ def convert(
             },
         }
 
+    # State / action motor names (EEF)
+    motor_names = [
+        "eef_x", "eef_y", "eef_z",
+        "eef_qx", "eef_qy", "eef_qz", "eef_qw",
+        "gripper_open",
+    ]
+
     info = {
         "codebase_version": "v3.0",
         "robot_type": "rlbench_franka",
         "total_episodes": n_episodes,
         "total_frames": total_frames,
-        "total_tasks": len(task_descriptions),
+        "total_tasks": len(all_task_strings),
         "chunks_size": 1000,
         "fps": fps,
         "splits": splits,
         "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
         "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
         "features": {
-            "observation.images.front_rgb": _video_feature(
-                "front_rgb", [img_h, img_w, 3]
-            ),
-            "observation.images.wrist_rgb": _video_feature(
-                "wrist_rgb", [img_h, img_w, 3]
-            ),
-            "observation.images.mask": _video_feature(
-                "mask", [img_h, img_w, 3]
-            ),
             "observation.state": {
                 "dtype": "float32",
                 "shape": [8],
-                "names": {
-                    "motors": [
-                        "eef_x", "eef_y", "eef_z",
-                        "eef_qx", "eef_qy", "eef_qz", "eef_qw",
-                        "gripper_open",
-                    ]
-                },
+                "names": motor_names,
                 "fps": fps,
             },
             "action": {
                 "dtype": "float32",
                 "shape": [8],
-                "names": {
-                    "motors": [
-                        "eef_x", "eef_y", "eef_z",
-                        "eef_qx", "eef_qy", "eef_qz", "eef_qw",
-                        "gripper_open",
-                    ]
-                },
+                "names": motor_names,
+                "fps": fps,
+            },
+            "timestamp": {
+                "dtype": "float64",
+                "shape": [1],
+                "fps": fps,
+            },
+            "annotation.human.action.task_description": {
+                "dtype": "int64",
+                "shape": [1],
+                "fps": fps,
+            },
+            "task_index": {
+                "dtype": "int64",
+                "shape": [1],
+                "fps": fps,
+            },
+            "annotation.human.action.task_name": {
+                "dtype": "int64",
+                "shape": [1],
+                "fps": fps,
+            },
+            "annotation.human.validity": {
+                "dtype": "int64",
+                "shape": [1],
                 "fps": fps,
             },
             "episode_index": {
-                "dtype": "int64", "shape": [1], "names": None, "fps": fps,
-            },
-            "frame_index": {
-                "dtype": "int64", "shape": [1], "names": None, "fps": fps,
-            },
-            "timestamp": {
-                "dtype": "float32", "shape": [1], "names": None, "fps": fps,
-            },
-            "next.done": {
-                "dtype": "bool", "shape": [1], "names": None, "fps": fps,
+                "dtype": "int64",
+                "shape": [1],
+                "fps": fps,
             },
             "index": {
-                "dtype": "int64", "shape": [1], "names": None, "fps": fps,
+                "dtype": "int64",
+                "shape": [1],
+                "fps": fps,
             },
-            "task_index": {
-                "dtype": "int64", "shape": [1], "names": None, "fps": fps,
+            "next.reward": {
+                "dtype": "float64",
+                "shape": [1],
+                "fps": fps,
             },
+            "next.done": {
+                "dtype": "bool",
+                "shape": [1],
+                "fps": fps,
+            },
+            # Cameras (RGB only -- no mask/depth)
+            "observation.images.front_rgb": _video_feature([img_h, img_w, 3]),
+            "observation.images.wrist_rgb": _video_feature([img_h, img_w, 3]),
         },
         # Extra RLBench-specific metadata
         "object_color_map": object_color_map,
-        "scene_graph_objects": scene_graph.get("objects", {}),
+        "scene_graph_objects": objects_meta,
         "episodes_scene_graph": episode_sg_info,
     }
 
@@ -420,53 +462,77 @@ def convert(
         json.dump(info, f, indent=4)
     print(f"[INFO] Wrote {info_path}")
 
-    # ═════════════════════════════════════════════════════════════════════
-    # Write meta/stats.json  (global stats over the whole dataset)
-    # ═════════════════════════════════════════════════════════════════════
-    cat_states = np.concatenate(all_ep_states, axis=0)
-    cat_actions = np.concatenate(all_ep_actions, axis=0)
-    cat_done = np.concatenate(all_ep_done, axis=0)
-    cat_timestamps = np.concatenate(all_ep_timestamps, axis=0)
-    cat_frame_idx = np.concatenate(all_ep_frame_idx, axis=0)
-    cat_episode_idx = np.concatenate(all_ep_episode_idx, axis=0)
-    cat_index = np.concatenate(all_ep_index, axis=0)
-    cat_task_idx = np.concatenate(all_ep_task_idx, axis=0)
+    # =======================================================================
+    # Write meta/stats.json  (global stats -- GR00T format)
+    # =======================================================================
+    cat_states = np.concatenate(
+        [all_states[max(0, obs_index_for_frame(ep["start_frame"], obs_offset)):
+                    min(n_obs, obs_index_for_frame(ep["end_frame"], obs_offset) + 1)]
+         for ep in episodes], axis=0,
+    )
+    cat_actions = np.concatenate(
+        [all_actions[max(0, obs_index_for_frame(ep["start_frame"], obs_offset)):
+                     min(n_obs, obs_index_for_frame(ep["end_frame"], obs_offset) + 1)]
+         for ep in episodes], axis=0,
+    )
 
-    stats = {
-        "observation.state": compute_feature_stats(cat_states),
-        "action": compute_feature_stats(cat_actions),
-        "next.done": compute_bool_stats(cat_done),
-        "episode_index": compute_feature_stats(cat_episode_idx.reshape(-1, 1).astype(np.float64)),
-        "frame_index": compute_feature_stats(cat_frame_idx.reshape(-1, 1).astype(np.float64)),
-        "timestamp": compute_feature_stats(cat_timestamps.reshape(-1, 1).astype(np.float64)),
-        "index": compute_feature_stats(cat_index.reshape(-1, 1).astype(np.float64)),
-        "task_index": compute_feature_stats(cat_task_idx.reshape(-1, 1).astype(np.float64)),
-        "observation.images.front_rgb": compute_image_stats_placeholder(total_video_frames_front),
-        "observation.images.wrist_rgb": compute_image_stats_placeholder(total_video_frames_wrist),
-        "observation.images.mask": compute_image_stats_placeholder(total_video_frames_mask),
+    # Rebuild global arrays from parquet data for exact consistency
+    all_timestamps = np.array([r["timestamp"] for r in parquet_rows], dtype=np.float64)
+    all_task_idx = np.array([r["task_index"] for r in parquet_rows], dtype=np.float64)
+    all_ep_idx = np.array([r["episode_index"] for r in parquet_rows], dtype=np.float64)
+    all_g_idx = np.array([r["index"] for r in parquet_rows], dtype=np.float64)
+    all_done = np.array([r["next.done"] for r in parquet_rows], dtype=np.float64)
+    all_reward = np.array([r["next.reward"] for r in parquet_rows], dtype=np.float64)
+    all_desc_idx = np.array([r["annotation.human.action.task_description"] for r in parquet_rows], dtype=np.float64)
+    all_name_idx = np.array([r["annotation.human.action.task_name"] for r in parquet_rows], dtype=np.float64)
+    all_valid_idx = np.array([r["annotation.human.validity"] for r in parquet_rows], dtype=np.float64)
+
+    stats: Dict[str, Any] = {}
+    stats_map = {
+        "observation.state": cat_states.astype(np.float64),
+        "action": cat_actions.astype(np.float64),
+        "timestamp": all_timestamps.reshape(-1, 1),
+        "annotation.human.action.task_description": all_desc_idx.reshape(-1, 1),
+        "task_index": all_task_idx.reshape(-1, 1),
+        "annotation.human.action.task_name": all_name_idx.reshape(-1, 1),
+        "annotation.human.validity": all_valid_idx.reshape(-1, 1),
+        "episode_index": all_ep_idx.reshape(-1, 1),
+        "index": all_g_idx.reshape(-1, 1),
+        "next.reward": all_reward.reshape(-1, 1),
     }
+    for feat_name, arr in stats_map.items():
+        stats[feat_name] = compute_feature_stats_groot(arr)
+
+    # Bool feature
+    stats["next.done"] = compute_bool_stats_groot(np.array([r["next.done"] for r in parquet_rows]))
+
+    # Image placeholder stats
+    for cam_key in camera_names:
+        stats[cam_key] = compute_image_stats_placeholder(total_frames)
 
     stats_path = os.path.join(meta_dir, "stats.json")
     with open(stats_path, "w") as f:
         json.dump(stats, f, indent=4)
     print(f"[INFO] Wrote {stats_path}")
 
-    print(f"\n[DONE] Dataset '{dataset_name}' written to {out_dir}")
+    print(f"\n[DONE] GR00T-compatible dataset '{dataset_name}' written to {out_dir}")
     print(f"       {n_episodes} episodes, {total_frames} total frames, {fps} fps")
+    print(f"       Tasks: {all_task_strings}")
+    return out_dir
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # CLI
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Convert an RLBench variation dataset to LeRobot v3 format."
+        description="Convert an RLBench variation dataset to GR00T-compatible LeRobot v3 format."
     )
     p.add_argument("--task_name", type=str, required=True,
                    help="RLBench task name, e.g. stack_cups")
     p.add_argument("--variation", type=int, required=True,
-                   help="Variation number, e.g. 1")
+                   help="Variation number, e.g. 0")
     p.add_argument("--rlbench_root", type=str, default="datasets/rlbench",
                    help="Root directory containing RLBench datasets")
     p.add_argument("--output_root", type=str, default="datasets/lerobot",
@@ -475,6 +541,8 @@ def parse_args():
                    help="Frames per second for the output dataset")
     p.add_argument("--episode", type=int, default=0,
                    help="Episode index inside the RLBench variation directory")
+    p.add_argument("--use_context_prompt", action="store_true",
+                   help="Use ConceptGraphs-style context in task descriptions")
     return p.parse_args()
 
 
@@ -487,4 +555,5 @@ if __name__ == "__main__":
         output_root=args.output_root,
         fps=args.fps,
         episode_index_in_rlbench=args.episode,
+        use_context_prompt=args.use_context_prompt,
     )

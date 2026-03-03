@@ -47,3 +47,5 @@ runs/
 
 # ===== External repos (cloned via scripts/setup_external.sh) =====
 external/
+src/install.sh
+scripts/

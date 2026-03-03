@@ -28,9 +28,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-dev \
     libgles2-mesa-dev \
     mesa-common-dev \
-    mesa-utils \
-    libosmesa6 \
-    libosmesa6-dev \
     libxcb-xinerama0 \
     libxcb-icccm4 \
     libxcb-image0 \
@@ -95,7 +92,7 @@ SHELL ["/bin/bash", "-lc"]
 # -----------------------------
 # 4) Create comp robotics conda env from yml
 # -----------------------------
-ARG ENV_YML=environment.yml
+ARG ENV_YML=iros2026_codebase/iros2026_v1/compositional_robotics/environment.yml
 
 WORKDIR /workspace
 
@@ -128,23 +125,11 @@ RUN python -m pip install --no-cache-dir numpy==1.26.4
 ENV PYTHONUNBUFFERED=1
 ENV CUDA_VISIBLE_DEVICES=0
 ENV XDG_RUNTIME_DIR=/tmp/runtime-root
-ENV DISPLAY=:99
-ENV QT_AUTO_SCREEN_SCALE_FACTOR=1
-ENV LIBGL_ALWAYS_SOFTWARE=1
-ENV GALLIUM_DRIVER=softpipe
-ENV LP_NUM_THREADS=1
+ENV DISPLAY=:0
+ENV export QT_AUTO_SCREEN_SCALE_FACTOR=1
 
 # Create XDG runtime directory
 RUN mkdir -p /tmp/runtime-root && chmod 700 /tmp/runtime-root
-
-# -----------------------------
-# 11) Create startup script to launch Xvfb
-# -----------------------------
-RUN echo '#!/bin/bash\n\
-Xvfb :99 -screen 0 1280x1024x24 -ac +extension GLX +render -noreset &\n\
-sleep 2\n\
-exec "$@"' > /usr/local/bin/start-xvfb.sh && \
-    chmod +x /usr/local/bin/start-xvfb.sh
 
 # -----------------------------
 # 10) Auto-activate conda environment on shell startup
@@ -158,6 +143,4 @@ WORKDIR /workspace
 RUN python -c "import numpy; print(numpy.__version__)" && \
     python -c "import sys; print(sys.executable)"
 
-ENTRYPOINT ["/usr/local/bin/start-xvfb.sh"]
 CMD ["/bin/bash"]
-

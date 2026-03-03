@@ -111,7 +111,7 @@ class JointVelocityDummyPolicy(Policy):
         pass
 
     def predict(self, obs: Observation) -> np.ndarray:
-        return np.zeros(8, dtype=np.float64)   # 7 joints + gripper open
+        return np.random.rand(8)   # 7 joints + gripper open
 
 
 class RandomPolicy(Policy):
