@@ -18,22 +18,36 @@ Usage (dummy / random actions):
         --episodes 1 --max_steps 100 \
         --policy dummy \
         --save_path output/rlbench_inference
+        
+python src/inference/rlbench/infer_rlbench.py \
+    --task stack_cups --variation 0 \
+    --action_mode ee_planning \
+    --policy lerobot \
+    --checkpoint output/lerobot/groot_smoke_stack_cups_variation1_20260303_182119/checkpoints/last/pretrained_model \
+    --dataset_root datasets/lerobot/stack_cups_variation1 \
+    --task_description "Pick up cup 1."
 
-Usage (LeRobot checkpoint — stub, fill in later):
+Usage (LeRobot checkpoint — e.g. GROOT):
     python src/inference/rlbench/infer_rlbench.py \
         --task stack_cups --variation 0 \
         --policy lerobot \
-        --checkpoint path/to/checkpoint
+        --checkpoint output/lerobot/groot_smoke_stack_cups_variation1_20260303_182119/checkpoints/last/pretrained_model \
+        --dataset_root datasets/lerobot/stack_cups_variation1 \
+        --task_description "Pick up cup 1."
 """
 
 import argparse
+import json
 import os
 import pickle
 import sys
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
+from copy import copy
 from pathlib import Path
 
 import numpy as np
+import torch
 from PIL import Image
 
 # ---------------------------------------------------------------------------
@@ -156,24 +170,146 @@ class JointVelocityRandomPolicy(Policy):
 
 
 class LeRobotPolicy(Policy):
-    """Placeholder for a trained LeRobot model (e.g. SmolVLA).
+    """Run a trained LeRobot policy (e.g. GROOT / SmolVLA) in RLBench.
 
-    TODO: load the checkpoint, implement pre/post processing, call model.
+    Loads the checkpoint using LeRobot's factory utilities and runs the full
+    inference pipeline:  observation → preprocessor → policy → postprocessor → action.
     """
 
-    def __init__(self, checkpoint_path: str):
+    def __init__(
+        self,
+        checkpoint_path: str,
+        dataset_root: str,
+        task_description: str = "",
+        device: str | None = None,
+    ):
+        # ---- lazy LeRobot imports (keeps non-lerobot paths dependency-free) ----
+        from lerobot.configs.policies import PreTrainedConfig
+        from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+        from lerobot.policies.factory import make_policy, make_pre_post_processors
+        from lerobot.policies.utils import prepare_observation_for_inference
+
         self.checkpoint_path = checkpoint_path
-        # self.model = ...  # load your LeRobot model here
-        print(f"[LeRobotPolicy] checkpoint: {checkpoint_path}  (not loaded yet)")
+        self.task_description = task_description
+        self._prepare_obs = prepare_observation_for_inference
+
+        # ---- resolve device ----
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(device)
+
+        # ---- load dataset metadata (for feature spec + stats) ----
+        # We need a repo_id for the LeRobotDatasetMetadata constructor.
+        # Since we're loading from a local path, we create a dummy repo_id
+        # and point `root` at the actual directory.
+        dataset_root = Path(dataset_root)
+        ds_meta = LeRobotDatasetMetadata(
+            repo_id="local/rlbench_dataset",
+            root=dataset_root,
+        )
+        self.ds_features = ds_meta.features
+
+        # ---- load policy config from checkpoint ----
+        policy_cfg = PreTrainedConfig.from_pretrained(checkpoint_path)
+        policy_cfg.pretrained_path = checkpoint_path
+        policy_cfg.device = str(self.device)
+
+        # ---- build the policy model ----
+        self.model = make_policy(policy_cfg, ds_meta=ds_meta)
+        self.model.eval()
+        print(f"[LeRobotPolicy] Loaded {policy_cfg.type} from {checkpoint_path}")
+        print(f"  input_features : {list(policy_cfg.input_features.keys())}")
+        print(f"  output_features: {list(policy_cfg.output_features.keys())}")
+        print(f"  device         : {self.device}")
+
+        # ---- build pre/post processor pipelines ----
+        self.preprocessor, self.postprocessor = make_pre_post_processors(
+            policy_cfg,
+            pretrained_path=checkpoint_path,
+            dataset_stats=ds_meta.stats,
+        )
+
+        self.use_amp = policy_cfg.use_amp
+
+        # ---- figure out which cameras the policy expects ----
+        # e.g.  "observation.images.front_rgb" → "front_rgb"
+        self.image_keys = [
+            k for k in self.ds_features
+            if k.startswith("observation.images.")
+        ]
+        # The state key is always "observation.state"
+        self.state_key = "observation.state"
 
     def reset(self):
-        pass
+        """Reset internal action-chunk cache in the policy."""
+        self.model.reset()
+
+    # ------------------------------------------------------------------
+    # RLBench Observation  →  LeRobot observation dict  →  action
+    # ------------------------------------------------------------------
+    def _obs_to_dict(self, obs: Observation) -> dict:
+        """Convert an RLBench Observation to the flat dict that LeRobot expects.
+
+        Keys produced (matching the dataset info.json):
+            observation.state         – (8,) float32  [x y z qx qy qz qw gripper]
+            observation.images.<cam>  – (H, W, 3) uint8  (only cameras the policy needs)
+        """
+        # state: EEF pose (7) + gripper open flag (1)
+        state = np.concatenate([
+            obs.gripper_pose.astype(np.float32),            # (7,)
+            np.array([float(obs.gripper_open)], dtype=np.float32),  # (1,)
+        ])
+
+        obs_dict: dict = {
+            self.state_key: state,
+        }
+
+        # Map LeRobot image key → RLBench attribute name
+        # e.g. "observation.images.front_rgb" → obs.front_rgb
+        for img_key in self.image_keys:
+            cam_attr = img_key.split("observation.images.")[-1]   # "front_rgb"
+            img_data = getattr(obs, cam_attr, None)
+            if img_data is not None:
+                # RLBench images are uint8 (H, W, 3) — exactly what LeRobot expects
+                obs_dict[img_key] = img_data.astype(np.uint8)
+            else:
+                raise RuntimeError(
+                    f"Policy expects image '{img_key}' but RLBench observation "
+                    f"has no attribute '{cam_attr}'. Available cameras: "
+                    f"{[a for a in dir(obs) if a.endswith('_rgb')]}"
+                )
+
+        return obs_dict
 
     def predict(self, obs: Observation) -> np.ndarray:
-        # ---- stub: just stay in place ----
-        pose = obs.gripper_pose.copy()
-        gripper = np.array([float(obs.gripper_open)])
-        return np.concatenate([pose, gripper])
+        """Full LeRobot inference pipeline: obs → preprocess → model → postprocess → action."""
+        obs_dict = self._obs_to_dict(obs)
+        obs_dict = copy(obs_dict)
+
+        with (
+            torch.inference_mode(),
+            torch.autocast(device_type=self.device.type)
+            if self.device.type == "cuda" and self.use_amp
+            else nullcontext(),
+        ):
+            # numpy → tensor, images /255 + CHW, add batch dim, move to device
+            obs_dict = self._prepare_obs(
+                obs_dict, self.device,
+                task=self.task_description,
+                robot_type="rlbench_franka",
+            )
+            # preprocessor (normalization, GROOT packing, etc.)
+            obs_dict = self.preprocessor(obs_dict)
+
+            # policy forward
+            action_tensor = self.model.select_action(obs_dict)
+
+            # postprocessor (unnormalization, action unpacking, etc.)
+            action_tensor = self.postprocessor(action_tensor)
+
+        # action_tensor: (1, action_dim) or (action_dim,)
+        action = action_tensor.squeeze(0).cpu().numpy().astype(np.float64)
+        return action
 
 
 # ===================================================================
@@ -263,7 +399,14 @@ def build_policy(args) -> Policy:
     elif args.policy == "lerobot":
         if not args.checkpoint:
             raise ValueError("--checkpoint is required for --policy lerobot")
-        return LeRobotPolicy(args.checkpoint)
+        if not args.dataset_root:
+            raise ValueError("--dataset_root is required for --policy lerobot")
+        return LeRobotPolicy(
+            checkpoint_path=args.checkpoint,
+            dataset_root=args.dataset_root,
+            task_description=args.task_description or "",
+            device=args.device,
+        )
     else:
         raise ValueError(f"Unknown policy: {args.policy}")
 
@@ -412,7 +555,15 @@ def parse_args():
                    choices=["dummy", "random", "lerobot"],
                    help="Which policy to use (default: dummy = stay in place).")
     p.add_argument("--checkpoint", type=str, default=None,
-                   help="Path to LeRobot checkpoint (required if --policy lerobot).")
+                   help="Path to LeRobot pretrained_model dir (required if --policy lerobot).")
+    p.add_argument("--dataset_root", type=str, default=None,
+                   help="Path to LeRobot dataset root (has meta/ data/ dirs). "
+                        "Required for --policy lerobot to get feature spec + stats.")
+    p.add_argument("--task_description", type=str, default=None,
+                   help="Natural-language task description for the policy "
+                        "(e.g. 'Pick up cup 1.').")
+    p.add_argument("--device", type=str, default=None,
+                   help="Torch device for policy inference (default: auto).")
 
     p.add_argument("--image_size", nargs=2, type=int, default=[256, 256],
                    help="Image resolution (H W).")
