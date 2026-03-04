@@ -233,8 +233,10 @@ class LeRobotPolicy(Policy):
 
         # ---- figure out which cameras the policy expects ----
         # e.g.  "observation.images.front_rgb" → "front_rgb"
+        # Use policy's input_features, not dataset features, to avoid requiring
+        # cameras that were in training data but aren't needed by the model
         self.image_keys = [
-            k for k in self.ds_features
+            k for k in policy_cfg.input_features.keys()
             if k.startswith("observation.images.")
         ]
         # The state key is always "observation.state"

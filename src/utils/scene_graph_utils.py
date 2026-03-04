@@ -541,3 +541,139 @@ def create_rlbench_mask_video(mask_paths, object_mapping, objects, output_path,
     writer.release()
     print(f"Mask video saved: {output_path} ({n_written} frames)")
     return output_path
+
+
+def save_relationship_template(scene_graph, gripper_states, output_path):
+    """Save relationship template based on gripper state transitions.
+    
+    This extracts relationship patterns at each gripper transition point,
+    allowing reuse across different variations/episodes of the same task.
+    
+    Args:
+        scene_graph: Scene graph dict with 'frames' list
+        gripper_states: List of bool (gripper closed states)
+        output_path: Where to save the template JSON
+    
+    Returns:
+        Template dict
+    """
+    template = {
+        'description': 'Relationship template based on gripper transitions',
+        'transitions': []
+    }
+    
+    # Find all gripper state changes
+    gripper_changes = []
+    for i in range(1, len(gripper_states)):
+        if gripper_states[i] != gripper_states[i-1]:
+            gripper_changes.append({
+                'frame': i,
+                'from_state': 'open' if not gripper_states[i-1] else 'closed',
+                'to_state': 'closed' if gripper_states[i] else 'open'
+            })
+    
+    # For each transition, capture the relationships that start at that frame
+    for trans_idx, trans in enumerate(gripper_changes):
+        frame_id = trans['frame']
+        
+        # Find this frame in scene graph
+        frame_data = None
+        for frame in scene_graph['frames']:
+            if frame['frame_id'] == frame_id:
+                frame_data = frame
+                break
+        
+        if frame_data:
+            template['transitions'].append({
+                'transition_index': trans_idx,
+                'from_state': trans['from_state'],
+                'to_state': trans['to_state'],
+                'relationships': frame_data.get('relationships', [])
+            })
+    
+    # Save template
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    with open(output_path, 'w') as f:
+        json.dump(template, f, indent=2)
+    
+    print(f"✓ Relationship template saved: {output_path}")
+    print(f"  Captured {len(template['transitions'])} gripper transitions")
+    
+    return template
+
+
+def apply_relationship_template(template_path, scene_graph, gripper_states):
+    """Apply a relationship template to a scene graph based on gripper transitions.
+    
+    Args:
+        template_path: Path to template JSON file
+        scene_graph: Scene graph dict to modify (in-place)
+        gripper_states: List of bool (gripper closed states) for this variation
+    
+    Returns:
+        Modified scene_graph
+    """
+    # Load template
+    with open(template_path, 'r') as f:
+        template = json.load(f)
+    
+    # Find gripper transitions in current data
+    gripper_changes = []
+    for i in range(1, len(gripper_states)):
+        if gripper_states[i] != gripper_states[i-1]:
+            gripper_changes.append({
+                'frame': i,
+                'from_state': 'open' if not gripper_states[i-1] else 'closed',
+                'to_state': 'closed' if gripper_states[i] else 'open'
+            })
+    
+    print(f"Template has {len(template['transitions'])} transitions")
+    print(f"Current variation has {len(gripper_changes)} transitions")
+
+    # Build a list of (start_frame_id, relationships) segments by matching
+    # template transitions to current transitions in order.
+    # Segment 0: frame 0 up to first transition → no relationships (empty)
+    # Segment N: from transition N frame onwards → template transition N's relationships
+    segments = []  # list of (start_frame_id, relationships_list)
+
+    applied_count = 0
+    for tmpl_trans in template['transitions']:
+        trans_idx = tmpl_trans['transition_index']
+
+        if trans_idx >= len(gripper_changes):
+            print(f"⚠ No matching transition {trans_idx} in current variation (only {len(gripper_changes)} found)")
+            continue
+
+        current_trans = gripper_changes[trans_idx]
+
+        if (current_trans['from_state'] != tmpl_trans['from_state'] or
+                current_trans['to_state'] != tmpl_trans['to_state']):
+            print(f"⚠ Transition {trans_idx} type mismatch: "
+                  f"template={tmpl_trans['from_state']}->{tmpl_trans['to_state']}, "
+                  f"current={current_trans['from_state']}->{current_trans['to_state']}")
+            continue
+
+        segments.append((current_trans['frame'], tmpl_trans['relationships']))
+        applied_count += 1
+        print(f"✓ Matched transition {trans_idx}: "
+              f"{tmpl_trans['from_state']} -> {tmpl_trans['to_state']} "
+              f"at frame {current_trans['frame']}")
+
+    # Sort segments by start frame so we can do a simple forward scan
+    segments.sort(key=lambda s: s[0])
+
+    # Walk every frame in the scene graph and assign relationships based on
+    # which segment it falls into.  Before the first segment → empty list.
+    seg_idx = 0
+    current_rels = []  # relationships active before any transition
+    for frame in scene_graph['frames']:
+        fid = frame['frame_id']
+        # Advance to the next segment whose start_frame has been reached
+        while seg_idx < len(segments) and fid >= segments[seg_idx][0]:
+            current_rels = [r.copy() for r in segments[seg_idx][1]]
+            seg_idx += 1
+        # Simply set — no merging, no selective removal
+        frame['relationships'] = [r.copy() for r in current_rels]
+
+    print(f"\n✓ Applied {applied_count} transitions from template to {len(scene_graph['frames'])} frames")
+    return scene_graph

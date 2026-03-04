@@ -7,17 +7,19 @@ services:
       dockerfile: Dockerfile
     image: rlbench:latest
     container_name: rlbench
+    runtime: nvidia
     environment:
       - DISPLAY=${DISPLAY}
       - XDG_RUNTIME_DIR=/tmp/runtime-root
       - QT_QPA_PLATFORM_PLUGIN_PATH=/root/CoppeliaSim
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics
     volumes:
       - ./:/workspace:cached
       - /tmp/.X11-unix:/tmp/.X11-unix
       - /tmp/runtime-root:/tmp/runtime-root
       - /etc/passwd:/etc/passwd:ro
       - /etc/group:/etc/group:ro
-    # No GPU/device mappings — running in CPU-only mode
     tty: true
     stdin_open: true
     command: bash
