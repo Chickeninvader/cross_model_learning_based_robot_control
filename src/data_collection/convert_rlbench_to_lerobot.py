@@ -74,7 +74,7 @@ from src.utils.scene_graph_language import (
 )
 
 # -- Codec/pix-fmt used for output videos -----------------------------------
-VIDEO_CODEC = "libx264"
+VIDEO_CODEC = "libopenh264"
 PIX_FMT = "yuv420p"
 
 # -- Camera names (GR00T convention) ----------------------------------------
@@ -531,8 +531,8 @@ def parse_args():
     )
     p.add_argument("--task_name", type=str, required=True,
                    help="RLBench task name, e.g. stack_cups")
-    p.add_argument("--variation", type=int, required=True,
-                   help="Variation number, e.g. 0")
+    p.add_argument("--variation", type=int,
+                   help="Variation number. if not type, processes all variations found in the task directory")
     p.add_argument("--rlbench_root", type=str, default="datasets/rlbench",
                    help="Root directory containing RLBench datasets")
     p.add_argument("--output_root", type=str, default="datasets/lerobot",
@@ -548,12 +548,31 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    convert(
-        task_name=args.task_name,
-        variation=args.variation,
-        rlbench_root=args.rlbench_root,
-        output_root=args.output_root,
-        fps=args.fps,
-        episode_index_in_rlbench=args.episode,
-        use_context_prompt=args.use_context_prompt,
-    )
+    if args.variation is not None:
+        convert(
+            task_name=args.task_name,
+            variation=args.variation,
+            rlbench_root=args.rlbench_root,
+            output_root=args.output_root,
+            fps=args.fps,
+            episode_index_in_rlbench=args.episode,
+            use_context_prompt=args.use_context_prompt,
+        )
+        exit(0)
+
+    # Process all variations in the task directory
+    task_dir = os.path.join(args.rlbench_root, args.task_name)
+    variations = [d for d in os.listdir(task_dir) if d.startswith("variation")]
+    variations = sorted(variations, key=lambda x: int(x.replace("variation", "")))
+    print(f"[INFO] Found variations: {variations}")
+    for var in variations:
+        var_num = int(var.replace("variation", ""))
+        convert(
+            task_name=args.task_name,
+            variation=var_num,
+            rlbench_root=args.rlbench_root,
+            output_root=args.output_root,
+            fps=args.fps,
+            episode_index_in_rlbench=args.episode,
+            use_context_prompt=args.use_context_prompt,
+        )

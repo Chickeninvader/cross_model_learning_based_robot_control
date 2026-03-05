@@ -5,6 +5,26 @@ This folder contains tools for creating **scene graph annotations** for RLBench 
 1. **Create `info.json`** — define objects, relationships, and handle-to-object mappings
 2. **Annotate scene graphs** — label per-frame object relationships in the episode
 
+
+## Target datasets for generate scenegraph:
+1. stack_cups
+2. stack_blocks
+3. stack_chairs
+4. lamp_on
+5. lamp_off
+6. take umbrella out
+7. take plate out of color dish
+8. take off weighting scale
+9. take money out of safe
+10. remove cup
+11. put umbrella in umbrella stand
+12. put rubbish in bin
+13. put knife on chopping board
+14. put knife in knife block
+15. push buttons
+16. push button
+17. pick up cup variation
+18. meat on grill
 ---
 
 ## Prerequisites
