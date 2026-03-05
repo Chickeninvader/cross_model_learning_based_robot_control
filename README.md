@@ -112,12 +112,11 @@ datasets/rlbench/<task_name>/variation<num>/
 ### Convert a Dataset
 
 ```bash
-python src/convert_rlbench_to_lerobot.py \
+python src/data_collection/convert_rlbench_to_lerobot.py \
     --task_name stack_cups \
-    --variation 1 \
     --rlbench_root datasets/rlbench \
     --output_root datasets/lerobot \
-    --fps 10
+    --fps 20            
 ```
 
 **Arguments:**
@@ -128,7 +127,7 @@ python src/convert_rlbench_to_lerobot.py \
 | `--variation` | (required) | Variation number, e.g. `1` |
 | `--rlbench_root` | `datasets/rlbench` | Root directory of RLBench datasets |
 | `--output_root` | `datasets/lerobot` | Root directory for output LeRobot datasets |
-| `--fps` | `10` | Frames per second for output videos and timestamps |
+| `--fps` | `20` | Frames per second for output videos and timestamps |
 | `--episode` | `0` | Episode index inside the RLBench variation directory |
 
 ### LeRobot Dataset Structure (Output)

@@ -164,7 +164,7 @@ def images_to_video(
     frame_start: int,
     frame_end: int,
     fps: int = 10,
-    codec: str = "libx264",
+    codec: str = "libopenh264",
     pix_fmt: str = "yuv420p",
 ) -> str:
     """Encode a range of numbered PNGs [frame_start..frame_end] into an MP4.
@@ -210,7 +210,7 @@ def slice_video(
     frame_end: int,
     video_first_frame: int,
     fps: int = 10,
-    codec: str = "libx264",
+    codec: str = "libopenh264",
     pix_fmt: str = "yuv420p",
 ) -> str:
     """Extract frames [frame_start..frame_end] from *input_video* (whose first
