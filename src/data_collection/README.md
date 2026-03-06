@@ -1,22 +1,23 @@
 # RLBench Scene Graph Data Collection
 
-This folder contains tools for creating **scene graph annotations** for RLBench episodes. The workflow has two steps:
+This folder contains tools for creating **scene graph annotations** for RLBench episodes. The workflow has three steps:
 
 1. **Create `info.json`** — define objects, relationships, and handle-to-object mappings
 2. **Annotate scene graphs** — label per-frame object relationships in the episode
+3. **(Optional) Reuse relationship templates** — annotate once and apply relationships to other variations
 
 
 ## Target datasets for generate scenegraph:
-1. stack_cups
-2. stack_blocks
-3. stack_chairs
-4. lamp_on
-5. lamp_off
-6. take umbrella out
-7. take plate out of color dish
-8. take off weighting scale
-9. take money out of safe
-10. remove cup
+1. stack_cups #
+2. stack_blocks #
+3. stack_chairs #
+4. lamp_on #
+5. lamp_off #
+6. take umbrella out of umbrella_stand #
+7. take_plate_off_colored_dish_rack #
+8. take off weighting scale !?
+9. take money out of safe #
+10. remove cup !?
 11. put umbrella in umbrella stand
 12. put rubbish in bin
 13. put knife on chopping board
@@ -161,3 +162,141 @@ The **vivid** mask video (`episode_mask.mp4`) maps each index to a bright, disti
 - **Multiple handles per object**: The robot arm typically has 3+ handles (links, gripper fingers). Map all of them to `robot`.
 - **Gripper changes**: The notebook auto-detects gripper open/close transitions — use the navigation buttons to jump to key moments for annotation.
 - **Re-editing**: Both notebooks support re-running. `create_info_json.ipynb` loads existing `info.json` if present.
+
+---
+
+## Relationship Template System (Optional)
+
+The relationship template system lets you **annotate relationships once** and **apply them to other variations** of the same task.
+
+### Key Concept: Gripper-Transition Templates
+
+Templates are based on gripper transitions:
+1. Identify gripper state changes (open→closed, closed→open)
+2. Save relationships present at each transition
+3. Apply those relationships to corresponding transitions in a new variation
+
+Why this works well:
+- Gripper transitions are semantically meaningful (grasp/release events)
+- Relationship changes usually happen around those events
+- Variations can differ in frame timing while preserving transition order
+
+### Create a Template (One-Time Per Task)
+
+1. Open `RLBench_scene_graph_collection.ipynb`
+2. Set a reference variation (usually variation 0)
+3. Annotate relationships in the scene graph editor
+4. Click **Save as Template**
+
+Template output path:
+```
+/workspace/datasets/rlbench/<task_name>/<task_name>_relationship_template.json
+```
+
+### Apply Template to Other Variations
+
+#### Option A: Notebook (Interactive)
+
+1. Switch `VARIATION` to a new variation
+2. Run cells to the editor
+3. Click **Load Template**
+4. Review and adjust if needed
+5. Click **Save Scene Graph**
+
+#### Option B: Batch Script (Automated)
+
+```bash
+cd /workspace/src/data_collection
+
+python apply_template_batch.py \
+        --task stack_cups \
+        --episode 0 \
+        --camera front
+```
+
+This generates for each variation:
+- `<task>_scene_graph.json`
+- `episode_overlay.mp4`
+- `episode_mask.mp4`
+- `episode_mask_encoded.mp4`
+- `object_color_map.json`
+
+Faster mode (scene graphs only):
+
+```bash
+python apply_template_batch.py \
+        --task stack_cups \
+        --skip-videos
+```
+
+### Template JSON Format
+
+```json
+{
+    "description": "Relationship template based on gripper transitions",
+    "transitions": [
+        {
+            "transition_index": 0,
+            "from_state": "open",
+            "to_state": "closed",
+            "relationships": [
+                {
+                    "object1": "robot",
+                    "object2": "cup_1",
+                    "type": "approaching"
+                }
+            ]
+        }
+    ]
+}
+```
+
+### Programmatic API
+
+Available in `src/utils/scene_graph_utils.py`:
+
+- `save_relationship_template(scene_graph, gripper_states, output_path)`
+- `apply_relationship_template(template_path, scene_graph, gripper_states)`
+
+Example:
+
+```python
+import sys
+import json
+sys.path.insert(0, '/workspace/src')
+import utils.scene_graph_utils as utils
+
+demo, image_data = utils.load_episode_data('stack_cups', 1, 0)
+gripper_states = utils.extract_gripper_states(demo)
+
+scene_graph = {...}
+template_path = '/workspace/datasets/rlbench/stack_cups/stack_cups_relationship_template.json'
+utils.apply_relationship_template(template_path, scene_graph, gripper_states)
+
+with open('/workspace/datasets/rlbench/stack_cups/variation1/stack_cups_scene_graph.json', 'w') as f:
+        json.dump(scene_graph, f, indent=2)
+```
+
+### Template Troubleshooting
+
+**Template not found**
+- Ensure template exists at `/workspace/datasets/rlbench/<task>/<task>_relationship_template.json`
+- Save a template once via **Save as Template**
+- Or pass a custom path with `--template`
+
+**Transition mismatch warnings**
+- Check transition order/type between source and target variation
+- Some variations may require a dedicated template
+
+**Relationships look incorrect after apply**
+- Verify gripper states are extracted correctly
+- Inspect template JSON relationships
+- Manually correct edge cases in the notebook
+
+### Template Best Practices
+
+- Use a representative reference variation
+- Keep relationship naming consistent (`holding`, `on`, `above`, etc.)
+- Validate 1–2 target variations before full batch processing
+- Use `--skip-videos` when you only need scene graph JSONs
+- See `batch_examples.sh` for ready-to-use command patterns

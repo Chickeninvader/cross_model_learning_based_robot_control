@@ -12,9 +12,9 @@ docker-compose up -d
 Inside docker containter, run 
 
 ```bash
-python dataset_generator.py \
-    --tasks stack_cups \
-    --variations 2 \
+python /workspace/external/RLBench/rlbench# python dataset_generator.py \
+    --tasks put_rubbish_in_bin \
+    --variations 0 \
     --processes 1 \
     --episodes_per_task 1 \
     --save_path /workspace/datasets/rlbench \

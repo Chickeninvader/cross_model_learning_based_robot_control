@@ -154,8 +154,8 @@ def main():
     )
     parser.add_argument('--task', type=str, required=True,
                        help='Task name (e.g., stack_cups)')
-    parser.add_argument('--variations', type=int, nargs='+', required=True,
-                       help='Variation numbers to process (e.g., 1 2 3)')
+    parser.add_argument('--variations', type=int, nargs='+', default=None,
+                       help='Variation numbers to process (e.g., 1 2 3). If not specified, processes all variations under the task.')
     parser.add_argument('--episode', type=int, default=0,
                        help='Episode number (default: 0)')
     parser.add_argument('--dataset_path', type=str, default='/workspace/datasets/rlbench',
@@ -169,6 +169,29 @@ def main():
                        help='Skip video generation (only create scene graphs)')
     
     args = parser.parse_args()
+    
+    # Auto-discover variations if not specified
+    if args.variations is None:
+        task_dir = os.path.join(args.dataset_path, args.task)
+        if not os.path.exists(task_dir):
+            print(f"❌ Task directory not found: {task_dir}")
+            return 1
+        
+        variations = []
+        for item in sorted(os.listdir(task_dir)):
+            if item.startswith('variation') and os.path.isdir(os.path.join(task_dir, item)):
+                try:
+                    var_num = int(item.replace('variation', ''))
+                    variations.append(var_num)
+                except ValueError:
+                    pass
+        
+        if not variations:
+            print(f"❌ No variations found in {task_dir}")
+            return 1
+        
+        args.variations = variations
+        print(f"Auto-discovered variations: {variations}")
     
     # Determine template path
     if args.template:
