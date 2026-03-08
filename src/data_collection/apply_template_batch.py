@@ -77,7 +77,7 @@ def process_variation(task_name, variation, episode, dataset_path, camera, templ
     
     # Extract positions
     positions = utils.extract_positions_over_time(
-        image_data, OBJECTS, handles_by_object, start_frame=20
+        image_data, OBJECTS, handles_by_object, start_frame=0
     )
     
     # Build scene graph
@@ -127,7 +127,7 @@ def process_variation(task_name, variation, episode, dataset_path, camera, templ
         try:
             result = utils.create_videos(
                 image_data, OBJECTS, OBJECT_MAPPING, handles_by_object,
-                scene_graph, output_dir, start_frame=20
+                scene_graph, output_dir, start_frame=0
             )
             
             if result:

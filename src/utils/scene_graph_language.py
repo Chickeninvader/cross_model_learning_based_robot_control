@@ -157,12 +157,10 @@ def scene_graph_transition_to_task_with_context(
     """Like :func:`scene_graph_transition_to_task` but prepends a structured
     scene-graph context block (ConceptGraphs-style) before the instruction.
 
-    The full prompt is of the form::
-
-        Scene: [{"id": "cup_1", "type": "cup_1"}, ...]
-        Current relations: [{"object1": "robot", "object2": "cup_1", "type": "holding"}]
-        Goal relations: [{"object1": "cup_1", "object2": "cup_2", "type": "stacked"}]
-        Instruction: Stack cup 1 on cup 2.
+    The full prompt includes:
+    1. A description of the prompt format
+    2. An example showing the structure
+    3. The actual scene graph transition data
 
     This richer format is useful when the language encoder has enough capacity
     (e.g. Qwen2.5-7B-Instruct).
@@ -171,13 +169,28 @@ def scene_graph_transition_to_task_with_context(
         begin_rels, end_rels, objects_meta, task_name
     )
 
-    scene_lines = format_scene_graph_context(objects_meta, begin_rels)
-    goal_lines = json.dumps(end_rels, separators=(",", ":"))
+    # Build the actual scene data
+    scene_json = json.dumps(_objects_to_list(objects_meta), separators=(',', ':'))
+    current_rels_json = json.dumps(begin_rels, separators=(',', ':'))
+    goal_rels_json = json.dumps(end_rels, separators=(',', ':'))
 
+    # Construct the full prompt with description, example, and actual data
     prompt = (
-        f"Scene: {json.dumps(_objects_to_list(objects_meta), separators=(',', ':'))}\n"
-        f"Current relations: {json.dumps(begin_rels, separators=(',', ':'))}\n"
-        f"Goal relations: {goal_lines}\n"
+        "This prompt describes a robotic manipulation task using scene graphs. "
+        "It consists of a structured scene description followed by an instruction. "
+        "The scene includes objects with their metadata and relationships between them. "
+        "The instruction describes changes needed to transition from the current state to the goal state.\n"
+        "\n"
+        "Example format:\n"
+        'Scene: [{"id":"cup_1","type":"cup"},{"id":"cup_2","type":"cup"},{"id":"robot","type":"robot"}]\n'
+        'Current relations: [{"object1":"robot","object2":"cup_1","type":"holding"}]\n'
+        'Goal relations: [{"object1":"cup_1","object2":"cup_2","type":"stacked"}]\n'
+        "Instruction: Stack cup 1 on cup 2.\n"
+        "\n"
+        "Current task:\n"
+        f"Scene: {scene_json}\n"
+        f"Current relations: {current_rels_json}\n"
+        f"Goal relations: {goal_rels_json}\n"
         f"Instruction: {instruction}"
     )
     return prompt

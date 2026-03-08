@@ -76,6 +76,104 @@ def compute_eef_actions(observations: list) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# 2b. Delta EEF (relative) action helpers
+# ---------------------------------------------------------------------------
+
+def _quat_conjugate(q: np.ndarray) -> np.ndarray:
+    """Conjugate (inverse for unit quaternions) of quaternion(s) [qx, qy, qz, qw]."""
+    conj = q.copy()
+    conj[..., :3] *= -1
+    return conj
+
+
+def _quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    """Hamilton product q1 * q2 for quaternions [qx, qy, qz, qw].
+
+    Supports batched inputs: shapes (..., 4).
+    """
+    x1, y1, z1, w1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
+    x2, y2, z2, w2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
+    return np.stack([
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+    ], axis=-1)
+
+
+def compute_delta_eef_actions(observations: list) -> np.ndarray:
+    """Compute *delta* EEF actions for every timestep.
+
+    action[t] = state[t+1] - state[t]  (for position),
+                quat_relative(state[t+1], state[t])  (for orientation),
+                gripper_open[t+1]  (absolute, since it's discrete).
+    action[-1] = zeros (position/rotation) + current gripper.
+
+    Convention: delta_quat = q_{t+1} * conj(q_t) (world-frame delta).
+
+    Returns shape (T, 8) float32:
+        [delta_x, delta_y, delta_z, delta_qx, delta_qy, delta_qz, delta_qw, gripper_open]
+    """
+    states = np.stack([extract_eef_state(o) for o in observations], axis=0)  # (T, 8)
+    T = states.shape[0]
+    actions = np.zeros_like(states)  # (T, 8)
+
+    # Position delta: pos_{t+1} - pos_t
+    actions[:-1, :3] = states[1:, :3] - states[:-1, :3]
+
+    # Orientation delta: q_delta = q_{t+1} * conj(q_t)
+    q_curr = states[:-1, 3:7]  # (T-1, 4)  [qx, qy, qz, qw]
+    q_next = states[1:, 3:7]   # (T-1, 4)
+    q_delta = _quat_multiply(q_next, _quat_conjugate(q_curr))
+    # Normalise to ensure unit quaternion
+    q_delta /= (np.linalg.norm(q_delta, axis=-1, keepdims=True) + 1e-8)
+    actions[:-1, 3:7] = q_delta
+
+    # Last action: identity rotation [0,0,0,1], zero position delta
+    actions[-1, 3:7] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+
+    # Gripper: keep absolute (next-step value); last repeats current
+    actions[:-1, 7] = states[1:, 7]
+    actions[-1, 7] = states[-1, 7]
+
+    return actions.astype(np.float32)
+
+
+def delta_action_to_absolute(
+    delta_action: np.ndarray,
+    current_state: np.ndarray,
+) -> np.ndarray:
+    """Convert a delta EEF action back to an absolute target pose.
+
+    Parameters
+    ----------
+    delta_action : (8,) [dx, dy, dz, dqx, dqy, dqz, dqw, gripper]
+    current_state : (8,) or (7,) current absolute EEF pose
+        [x, y, z, qx, qy, qz, qw, (gripper)]
+
+    Returns
+    -------
+    (8,) absolute target [x, y, z, qx, qy, qz, qw, gripper]
+    """
+    target = np.zeros(8, dtype=np.float64)
+
+    # Position: current + delta
+    target[:3] = current_state[:3] + delta_action[:3]
+
+    # Orientation: q_target = q_delta * q_current
+    q_curr = current_state[3:7]
+    q_delta = delta_action[3:7]
+    q_target = _quat_multiply(q_delta, q_curr)
+    q_target /= (np.linalg.norm(q_target) + 1e-8)
+    target[3:7] = q_target
+
+    # Gripper: pass through (already absolute)
+    target[7] = delta_action[7]
+
+    return target
+
+
+# ---------------------------------------------------------------------------
 # 3. Scene-graph helpers
 # ---------------------------------------------------------------------------
 
@@ -120,20 +218,50 @@ def find_transitions(scene_graph: dict) -> List[dict]:
 def compute_episode_boundaries(
     scene_graph: dict,
     transitions: List[dict],
+    n_total_images: int | None = None,
 ) -> List[dict]:
     """Split a scene-graph timeline into episodes at each transition.
 
-    Returns a list of episode dicts:
-        start_frame  – inclusive first image index
-        end_frame    – inclusive last image index
-        begin_sg     – relationships at the start of the segment
-        end_sg       – goal relationships (the state after the transition)
+    Each transition produces one episode that ends just before the transition
+    frame.  The first episode always starts at frame 0 (the true beginning of
+    the RLBench recording, even though scene-graph annotation may start later).
+    The last episode extends to the final available image frame.
+
+    Parameters
+    ----------
+    scene_graph : dict
+        The loaded scene graph JSON.
+    transitions : list[dict]
+        Output of :func:`find_transitions`.
+    n_total_images : int, optional
+        Total number of images in the episode directory (0.png … N-1.png).
+        If provided, the last episode extends to frame ``n_total_images - 1``
+        instead of the scene graph's last ``frame_id``.
+
+    Returns
+    -------
+    list[dict]
+        Episode dicts with keys ``start_frame``, ``end_frame``,
+        ``begin_sg``, ``end_sg``.
     """
     frames = scene_graph["frames"]
-    first_frame = frames[0]["frame_id"]
-    last_frame = frames[-1]["frame_id"]
+    # The first image frame is always 0 (RLBench numbering)
+    first_frame = 0
+    if n_total_images is not None:
+        last_frame = n_total_images - 1
+    else:
+        last_frame = frames[-1]["frame_id"]
 
-    # Build boundary frame list  [first, t0, t1, ..., last+1]
+    if not transitions:
+        # No transitions — single episode covering everything
+        return [{
+            "start_frame": first_frame,
+            "end_frame": last_frame,
+            "begin_sg": frames[0]["relationships"] if frames else [],
+            "end_sg": frames[-1]["relationships"] if frames else [],
+        }]
+
+    # Build boundary frame list:  [0, t0, t1, ..., last+1]
     boundaries = [first_frame] + [t["frame_id"] for t in transitions] + [last_frame + 1]
 
     episodes = []
@@ -311,21 +439,19 @@ def compute_bool_stats_groot(values: np.ndarray) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 6. Observation-index alignment
+# 6. (DEPRECATED) Observation-index alignment
+#    Kept for backward compatibility but no longer used.
+#    Images and observations are now treated as 1:1 (no offset).
 # ---------------------------------------------------------------------------
 
 def compute_obs_offset(n_images: int, n_obs: int) -> int:
-    """Return the image-index offset for observation 0.
-
-    Assumes observations align with the *last* n_obs images,
-    i.e.  obs[i] ↔ image[i + offset].
-    """
-    return n_images - n_obs
+    """DEPRECATED: offset is always 0 (1:1 mapping)."""
+    return 0
 
 
-def obs_index_for_frame(frame_idx: int, obs_offset: int) -> int:
-    """Map an image frame index to the corresponding observation index."""
-    return frame_idx - obs_offset
+def obs_index_for_frame(frame_idx: int, obs_offset: int = 0) -> int:
+    """DEPRECATED: frame index == observation index (1:1 mapping)."""
+    return frame_idx
 
 
 # ---------------------------------------------------------------------------

@@ -48,6 +48,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+# Add project root to sys.path for local imports
+_project_root = Path(__file__).parent.parent.parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
+from src.utils.rlbench_utils import delta_action_to_absolute
 from PIL import Image
 
 # ---------------------------------------------------------------------------
@@ -284,7 +291,11 @@ class LeRobotPolicy(Policy):
         return obs_dict
 
     def predict(self, obs: Observation) -> np.ndarray:
-        """Full LeRobot inference pipeline: obs → preprocess → model → postprocess → action."""
+        """Full LeRobot inference pipeline: obs → preprocess → model → postprocess → action.
+
+        The model outputs a *delta* EEF action [dx, dy, dz, dqx, dqy, dqz, dqw, gripper].
+        This method converts it back to an *absolute* target pose for the RLBench controller.
+        """
         obs_dict = self._obs_to_dict(obs)
         obs_dict = copy(obs_dict)
 
@@ -310,7 +321,14 @@ class LeRobotPolicy(Policy):
             action_tensor = self.postprocessor(action_tensor)
 
         # action_tensor: (1, action_dim) or (action_dim,)
-        action = action_tensor.squeeze(0).cpu().numpy().astype(np.float64)
+        delta_action = action_tensor.squeeze(0).cpu().numpy().astype(np.float64)
+
+        # Convert delta action → absolute target pose for the RLBench controller
+        current_state = np.concatenate([
+            obs.gripper_pose.astype(np.float64),              # (7,)
+            np.array([float(obs.gripper_open)], dtype=np.float64),  # (1,)
+        ])
+        action = delta_action_to_absolute(delta_action, current_state)
         return action
 
 
@@ -506,7 +524,8 @@ def run_inference(args):
         for step in range(args.max_steps):
             action = policy.predict(observations[-1])
 
-            # action[:7] = absolute EEF pose,  action[7] = gripper
+            # action[:7] = absolute EEF target pose (delta→absolute already
+            # converted inside LeRobotPolicy.predict),  action[7] = gripper
             try:
                 obs, reward, terminate = task_env.step(action)
             except Exception as e:

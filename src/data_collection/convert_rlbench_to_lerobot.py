@@ -57,17 +57,16 @@ if str(_project_root) not in sys.path:
 from src.utils.rlbench_utils import (
     build_episode_stats_groot,
     compute_eef_actions,
+    compute_delta_eef_actions,
     compute_episode_boundaries,
     compute_feature_stats_groot,
     compute_image_stats_placeholder,
     compute_bool_stats_groot,
-    compute_obs_offset,
     extract_eef_state,
     find_transitions,
     images_to_video,
     load_rlbench_demo,
     load_scene_graph,
-    obs_index_for_frame,
 )
 from src.utils.scene_graph_language import (
     generate_task_descriptions,
@@ -139,19 +138,27 @@ def convert(
         object_color_map = json.load(f)
 
     transitions = find_transitions(scene_graph)
-    episodes = compute_episode_boundaries(scene_graph, transitions)
+
+    # Frame count = observation count (1:1 mapping, no offset).
+    # Extra images in the directory (if any) are ignored.
+    n_obs = len(observations)
+    n_frames_total = n_obs
+    print(f"[INFO] Observations: {n_obs} (= number of frames to convert)")
+
+    # Episode boundaries are based on the scene graph, clamped to [0, n_obs-1].
+    episodes = compute_episode_boundaries(scene_graph, transitions, n_total_images=n_obs)
     n_episodes = len(episodes)
     print(f"[INFO] Found {len(transitions)} transitions -> {n_episodes} episodes")
+    for _ti, _t in enumerate(transitions):
+        print(f"       Transition {_ti} at frame {_t['frame_id']}")
+    for _ei, _ep in enumerate(episodes):
+        print(f"       Episode {_ei}: frames {_ep['start_frame']}-{_ep['end_frame']} "
+              f"({_ep['end_frame'] - _ep['start_frame'] + 1} frames)")
 
-    # Number of images / obs for alignment
-    n_images = len(os.listdir(front_rgb_dir))
-    n_obs = len(observations)
-    obs_offset = compute_obs_offset(n_images, n_obs)
-    print(f"[INFO] Images: {n_images}, Observations: {n_obs}, obs_offset: {obs_offset}")
-
-    # Pre-compute ALL EEF states and actions for the full observation list
+    # Pre-compute ALL EEF states for the full observation list
     all_states = np.stack([extract_eef_state(o) for o in observations], axis=0)  # (n_obs, 8)
-    all_actions = compute_eef_actions(observations)  # (n_obs, 8)
+    # NOTE: Delta actions are computed per-episode below (not globally),
+    # because global deltas would be wrong at episode boundaries.
 
     objects_meta = scene_graph.get("objects", {})
 
@@ -199,17 +206,18 @@ def convert(
 
         print(f"  Episode {ep_idx}: frames {start_frame}-{end_frame} ({n_frames} frames)")
 
-        # -- Map frame range to observation indices --------------------------
-        obs_start = obs_index_for_frame(start_frame, obs_offset)
-        obs_end = obs_index_for_frame(end_frame, obs_offset)
-        obs_start = max(0, obs_start)
-        obs_end = min(n_obs - 1, obs_end)
+        # -- Observation slice (1:1 with frames, no offset) ----------------
+        obs_start = max(0, start_frame)
+        obs_end = min(n_obs - 1, end_frame)
         n_obs_frames = obs_end - obs_start + 1
 
         ep_states = all_states[obs_start : obs_end + 1]
-        ep_actions = all_actions[obs_start : obs_end + 1]
 
-        # Pad / trim to match image count
+        # Compute delta actions WITHIN this episode only (not globally)
+        ep_obs_slice = observations[obs_start : obs_end + 1]
+        ep_actions = compute_delta_eef_actions(ep_obs_slice)  # (n_obs_frames, 8)
+
+        # Safety: if episode boundary extends past obs range, pad/trim
         if n_obs_frames < n_frames:
             pad = n_frames - n_obs_frames
             ep_states = np.concatenate([ep_states, np.tile(ep_states[-1:], (pad, 1))], axis=0)
@@ -217,6 +225,13 @@ def convert(
         elif n_obs_frames > n_frames:
             ep_states = ep_states[:n_frames]
             ep_actions = ep_actions[:n_frames]
+
+        # Debug: report obs alignment for this episode
+        print(f"    obs[{obs_start}..{obs_end}] ({n_obs_frames} obs), "
+              f"n_frames={n_frames}, padded={max(0, n_frames - n_obs_frames)}")
+        if n_obs_frames > 0:
+            print(f"    gripper[first]={ep_states[0, 7]:.1f}, gripper[last]={ep_states[min(n_obs_frames, n_frames)-1, 7]:.1f}")
+            print(f"    action delta_pos range: {ep_actions[:, :3].min(0)} to {ep_actions[:, :3].max(0)}")
 
         # -- Create videos (RGB only, no mask) -------------------------------
         chunk_idx = 0
@@ -372,9 +387,14 @@ def convert(
         }
 
     # State / action motor names (EEF)
-    motor_names = [
+    state_motor_names = [
         "eef_x", "eef_y", "eef_z",
         "eef_qx", "eef_qy", "eef_qz", "eef_qw",
+        "gripper_open",
+    ]
+    action_motor_names = [
+        "delta_eef_x", "delta_eef_y", "delta_eef_z",
+        "delta_eef_qx", "delta_eef_qy", "delta_eef_qz", "delta_eef_qw",
         "gripper_open",
     ]
 
@@ -393,13 +413,13 @@ def convert(
             "observation.state": {
                 "dtype": "float32",
                 "shape": [8],
-                "names": motor_names,
+                "names": state_motor_names,
                 "fps": fps,
             },
             "action": {
                 "dtype": "float32",
                 "shape": [8],
-                "names": motor_names,
+                "names": action_motor_names,
                 "fps": fps,
             },
             "timestamp": {
@@ -465,16 +485,15 @@ def convert(
     # =======================================================================
     # Write meta/stats.json  (global stats -- GR00T format)
     # =======================================================================
-    cat_states = np.concatenate(
-        [all_states[max(0, obs_index_for_frame(ep["start_frame"], obs_offset)):
-                    min(n_obs, obs_index_for_frame(ep["end_frame"], obs_offset) + 1)]
-         for ep in episodes], axis=0,
-    )
-    cat_actions = np.concatenate(
-        [all_actions[max(0, obs_index_for_frame(ep["start_frame"], obs_offset)):
-                     min(n_obs, obs_index_for_frame(ep["end_frame"], obs_offset) + 1)]
-         for ep in episodes], axis=0,
-    )
+    cat_states_list = []
+    cat_actions_list = []
+    for ep in episodes:
+        s = max(0, ep["start_frame"])
+        e = min(n_obs, ep["end_frame"] + 1)
+        cat_states_list.append(all_states[s:e])
+        cat_actions_list.append(compute_delta_eef_actions(observations[s:e]))
+    cat_states = np.concatenate(cat_states_list, axis=0)
+    cat_actions = np.concatenate(cat_actions_list, axis=0)
 
     # Rebuild global arrays from parquet data for exact consistency
     all_timestamps = np.array([r["timestamp"] for r in parquet_rows], dtype=np.float64)
@@ -537,7 +556,7 @@ def parse_args():
                    help="Root directory containing RLBench datasets")
     p.add_argument("--output_root", type=str, default="datasets/lerobot",
                    help="Root directory for output LeRobot datasets")
-    p.add_argument("--fps", type=int, default=10,
+    p.add_argument("--fps", type=int, default=20,
                    help="Frames per second for the output dataset")
     p.add_argument("--episode", type=int, default=0,
                    help="Episode index inside the RLBench variation directory")

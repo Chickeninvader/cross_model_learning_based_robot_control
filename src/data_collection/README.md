@@ -15,17 +15,17 @@ This folder contains tools for creating **scene graph annotations** for RLBench 
 5. lamp_off #
 6. take umbrella out of umbrella_stand #
 7. take_plate_off_colored_dish_rack #
-8. take off weighting scale !?
+8. take_off_weighting_scale !?
 9. take money out of safe #
-10. remove cup !?
-11. put umbrella in umbrella stand
-12. put rubbish in bin
-13. put knife on chopping board
-14. put knife in knife block
-15. push buttons
-16. push button
-17. pick up cup variation
-18. meat on grill
+10. remove cup #
+11. put umbrella in umbrella stand #
+12. put rubbish in bin #
+13. put knife on chopping board #
+14. put knife in knife block !?
+15. push buttons #
+16. push button #
+17. pick up cup variation #
+18. meat on grill #
 ---
 
 ## Prerequisites
@@ -209,7 +209,7 @@ Template output path:
 cd /workspace/src/data_collection
 
 python apply_template_batch.py \
-        --task stack_cups \
+        --task put_rubbish_in_bin \
         --episode 0 \
         --camera front
 ```

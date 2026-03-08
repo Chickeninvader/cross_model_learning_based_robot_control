@@ -132,7 +132,7 @@ def calculate_object_position(mask_handles, handle_list):
     center_x = int(np.mean(coords[1]))
     return (center_x, center_y)
 
-def extract_positions_over_time(image_data, objects, handles_by_object, start_frame=20):
+def extract_positions_over_time(image_data, objects, handles_by_object, start_frame=0):
     """Extract positions for all OBJECTS over the episode.
     
     When an object is occluded (not visible in the mask), the last known position
@@ -228,7 +228,7 @@ def mask_id_to_vivid(mask_id_image):
 
 
 def create_videos(image_data, objects, object_mapping, handles_by_object,
-                  scene_graph, output_dir, start_frame=20):
+                  scene_graph, output_dir, start_frame=0):
     """Create overlay + encoded-mask + vivid-mask videos and save object_color_map.json."""
     if not image_data['rgb']:
         print("No RGB images"); return None
