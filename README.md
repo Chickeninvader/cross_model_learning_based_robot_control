@@ -1,18 +1,31 @@
 # Cross-Model Learning-Based Robot Control
 
-## RLBench Dataset Generation — Headless Docker + OSMesa
+A pipeline for generating RLBench demonstrations, converting them to
+GR00T-compatible LeRobot v3 datasets, and training NVIDIA GR00T N1.5 policies.
 
-Get started
---------
+## Table of Contents
+
+1. [RLBench Dataset Generation](#rlbench-dataset-generation)
+2. [Scene Graph Generation](#scene-graph-generation-environment)
+3. [Dataset Conversion (RLBench → LeRobot v3)](#dataset-conversion-rlbench--lerobot-v3)
+4. [GR00T N1.5 Training](#groot-n15-training-on-asu-sol-hpc)
+5. [Troubleshooting](#troubleshooting-sol-specific)
+
+---
+
+## RLBench Dataset Generation
+
+### Quick Start (Headless Docker + OSMesa)
+
 ```bash
-cd external/RLBench \
+cd external/RLBench
 docker-compose up -d
 ```
 
-Inside docker containter, run 
+Inside the Docker container:
 
 ```bash
-python /workspace/external/RLBench/rlbench# python dataset_generator.py \
+python /workspace/external/RLBench/rlbench/dataset_generator.py \
     --tasks put_rubbish_in_bin \
     --variations 0 \
     --processes 1 \
@@ -22,54 +35,28 @@ python /workspace/external/RLBench/rlbench# python dataset_generator.py \
     --renderer opengl3
 ```
 
-to generate dataset 
+### Quick Install (OSMesa + Xvfb)
 
-
-
-Scene Graph Generation Environment
-----------------------------------
-Create/activate your conda environment and install the Python tooling used
-for scene graph generation:
-
-```bash
-conda activate comp_robotics
-conda install -c conda-forge opencv ipywidgets matplotlib jupyterlab gymnasium -y
-```
-
-and follow the jupyter notebook in examples/scene_graph_analyzer.ipynb to annotate dataset
-
-Troubleshooting
---------
-
-
-Quick install (OSMesa + Xvfb)
-----------------------------
-Run these as root or with sudo inside the container to install needed packages:
+Run as root or with `sudo` inside the container:
 
 ```bash
 apt-get update && apt-get install -y \
-    mesa-utils \
-    x11-utils \
-    libosmesa6 \
-    libosmesa6-dev \
-    xvfb
+    mesa-utils x11-utils libosmesa6 libosmesa6-dev xvfb
 ```
 
-Add this env variable
+Add these environment variables:
 
-```
+```bash
 export LIBGL_ALWAYS_SOFTWARE=1
 export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
 export MESA_GL_VERSION_OVERRIDE=3.3
 export QT_X11_NO_MITSHM=1
 export QT_QPA_PLATFORM=xcb
-export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libOSMesa.so.6   # change if different
+export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libOSMesa.so.6
 export DISPLAY=:99
 ```
 
-Start a headless X server (Xvfb)
---------------------------------
-Start Xvfb and export DISPLAY before running any renderer-dependent code:
+Start headless X server:
 
 ```bash
 Xvfb :99 -screen 0 1280x1024x24 >/tmp/xvfb-99.log 2>&1 &
@@ -77,158 +64,158 @@ export DISPLAY=:99
 sleep 0.5
 ```
 
+---
+
+## Scene Graph Generation Environment
+
+```bash
+conda activate comp_robotics
+conda install -c conda-forge opencv ipywidgets matplotlib jupyterlab gymnasium -y
+```
+
+Follow the notebook in `examples/scene_graph_analyzer.ipynb` to annotate datasets.
+
+---
 
 ## Dataset Conversion: RLBench → LeRobot v3
 
 ### Prerequisites
 
-- Python 3.10+ with conda env `lerobot_gpu` activated
-- Packages: `pandas`, `pyarrow`, `numpy`, `Pillow`, `ffmpeg` (CLI)
-- For visualization: `lerobot`, `rerun-sdk`
+- Python 3.10+ with conda env `lerobot` activated
+- Packages: `pandas`, `pyarrow`, `numpy`, `Pillow`, `av` (PyAV)
 
 ```bash
-source activate lerobot_gpu
+source activate lerobot
 ```
 
 ### RLBench Dataset Structure (Input)
-
-Each task/variation must follow this layout:
 
 ```
 datasets/rlbench/<task_name>/variation<num>/
 ├── episodes/
 │   └── episode0/
-│       ├── front_rgb/        # 0.png, 1.png, ..., N.png
-│       ├── wrist_rgb/        # 0.png, 1.png, ..., N.png
-│       ├── front_mask/       # 0.png, 1.png, ..., N.png
-│       └── low_dim_obs.pkl   # RLBench Demo object with observations
-├── episode_mask.mp4          # Segmentation mask video
-├── <task_name>_scene_graph.json   # Per-frame scene graph with relationships
-└── object_color_map.json     # Object name → mask color mapping
+│       ├── front_rgb/        # 0.png, 1.png, …, N.png
+│       ├── wrist_rgb/        # 0.png, 1.png, …, N.png
+│       └── low_dim_obs.pkl   # RLBench Demo observations
+├── <task_name>_scene_graph.json   # Per-frame scene graph
+└── object_color_map.json          # Object name → mask color
 ```
 
-**Scene graph JSON** must contain `"objects"` and `"frames"` arrays. Each frame has `"frame_id"`, `"relationships"` (list of `{object1, object2, type}`). Transitions between different relationship states define episode boundaries.
-
-### Convert a Dataset
+### Convert a Single Variation
 
 ```bash
 python src/data_collection/convert_rlbench_to_lerobot.py \
     --task_name stack_cups \
+    --variation 0 \
     --rlbench_root datasets/rlbench \
     --output_root datasets/lerobot \
-    --fps 20            
+    --fps 20
 ```
 
-**Arguments:**
+### Convert All Variations + Merge
+
+When `--variation` is omitted, the script converts **every** variation found
+under `datasets/rlbench/<task_name>/` and then automatically **merges** them
+into a single `<task_name>_all` dataset:
+
+```bash
+python src/data_collection/convert_rlbench_to_lerobot.py \
+    --task_name put_rubbish_in_bin \
+    --rlbench_root datasets/rlbench \
+    --output_root datasets/lerobot \
+    --fps 20
+```
+
+This produces:
+
+```
+datasets/lerobot/
+├── put_rubbish_in_bin_variation0/   # per-variation dataset
+├── put_rubbish_in_bin_variation1/
+├── …
+└── put_rubbish_in_bin_all/          # merged dataset (all variations)
+```
+
+Use `--no_merge` to skip the merge step and only produce per-variation datasets.
+
+#### Arguments
 
 | Argument | Default | Description |
 |---|---|---|
-| `--task_name` | (required) | RLBench task name, e.g. `stack_cups` |
-| `--variation` | (required) | Variation number, e.g. `1` |
+| `--task_name` | *(required)* | RLBench task name, e.g. `stack_cups` |
+| `--variation` | *(all)* | Variation number. Omit to process all and merge. |
 | `--rlbench_root` | `datasets/rlbench` | Root directory of RLBench datasets |
 | `--output_root` | `datasets/lerobot` | Root directory for output LeRobot datasets |
-| `--fps` | `20` | Frames per second for output videos and timestamps |
+| `--fps` | `20` | Frames per second for output videos |
 | `--episode` | `0` | Episode index inside the RLBench variation directory |
+| `--use_context_prompt` | `false` | Prepend ConceptGraphs context to task descriptions |
+| `--no_merge` | `false` | Skip auto-merge when processing all variations |
 
 ### LeRobot Dataset Structure (Output)
-
-The output at `datasets/lerobot/<task_name>_variation<num>/` follows LeRobot v3 format:
 
 ```
 datasets/lerobot/<task_name>_variation<num>/
 ├── meta/
-│   ├── info.json              # Dataset metadata, features, splits, object color map, scene graphs
-│   ├── stats.json             # Global min/max/mean/std for all features
-│   ├── tasks.parquet          # Task descriptions (one per transition-episode)
+│   ├── info.json              # Dataset metadata, features, splits
+│   ├── stats.json             # Global min/max/mean/std/q01/q99
+│   ├── tasks.parquet          # Task descriptions
 │   └── episodes/
 │       └── chunk-000/
 │           └── file-000.parquet   # Per-episode metadata and stats
 ├── data/
 │   └── chunk-000/
-│       └── file-000.parquet   # Per-frame data: observation.state, action, timestamps, etc.
+│       └── file-000.parquet   # Per-frame data
 └── videos/
     ├── observation.images.front_rgb/
     │   └── chunk-000/
     │       ├── file-000.mp4   # Episode 0 front camera
     │       └── file-001.mp4   # Episode 1 front camera
-    ├── observation.images.wrist_rgb/
-    │   └── chunk-000/
-    │       ├── file-000.mp4
-    │       └── file-001.mp4
-    └── observation.images.mask/
+    └── observation.images.wrist_rgb/
         └── chunk-000/
-            ├── file-000.mp4   # Episode 0 segmentation mask
+            ├── file-000.mp4
             └── file-001.mp4
 ```
 
-**Data columns** in the parquet file:
+**Data columns:**
 
 | Column | Type | Description |
 |---|---|---|
 | `observation.state` | float32[8] | EEF pose (x,y,z,qx,qy,qz,qw) + gripper_open |
-| `action` | float32[8] | Next-step EEF target (same format as state) |
-| `episode_index` | int64 | Which episode this frame belongs to |
-| `frame_index` | int64 | Frame index within the episode (0-based) |
-| `timestamp` | float32 | Time in seconds from episode start |
+| `action` | float32[8] | Delta EEF action + gripper_open |
+| `episode_index` | int64 | Episode this frame belongs to |
+| `timestamp` | float64 | Time in seconds from episode start |
 | `next.done` | bool | True on the last frame of each episode |
+| `next.reward` | float64 | 0.0 except 1.0 on last frame |
 | `index` | int64 | Global frame index across all episodes |
-| `task_index` | int64 | Task/transition index |
+| `task_index` | int64 | Index into tasks.parquet |
+| `annotation.human.action.task_description` | int64 | Task description index (GR00T) |
+| `annotation.human.action.task_name` | int64 | Short task name index (GR00T) |
+| `annotation.human.validity` | int64 | Validity label index (GR00T) |
 
-**Episode splitting:** The trajectory is split at scene-graph transitions. For example, if the scene graph goes from "no relationships" → "robot holding cup_1" → "no relationships", that creates 2 episodes:
-- Episode 0: approach + grasp (begin: `[]`, end: `[robot holding cup_1]`)
-- Episode 1: place + release (begin: `[robot holding cup_1]`, end: `[]`)
+**Episode splitting:** Trajectories are split at scene-graph transitions.
+For example, if the scene graph transitions from "no relationships" →
+"robot holding cup" → "no relationships", that creates 2 episodes:
+- Episode 0: approach + grasp
+- Episode 1: place + release
 
 ### Visualize a Converted Dataset
 
-Save a `.rrd` file for offline viewing with [Rerun](https://rerun.io/):
-
 ```bash
-# Visualize episode 0
 CUDA_VISIBLE_DEVICES="" python3 external/lerobot/src/lerobot/scripts/lerobot_dataset_viz.py \
     --repo-id local/<task_name>_variation<num> \
     --root datasets/lerobot/<task_name>_variation<num> \
     --episode-index 0 \
     --save 1 \
     --output-dir datasets/lerobot/<task_name>_variation<num>/output \
-    --batch-size 16 \
-    --num-workers 0 \
-    --tolerance-s 1e-4
-```
-
-**Example** (stack_cups variation 1, both episodes):
-
-```bash
-# Episode 0
-CUDA_VISIBLE_DEVICES="" python3 external/lerobot/src/lerobot/scripts/lerobot_dataset_viz.py \
-    --repo-id local/stack_cups_variation1 \
-    --root datasets/lerobot/stack_cups_variation1 \
-    --episode-index 0 \
-    --save 1 \
-    --output-dir datasets/lerobot/stack_cups_variation1/output \
-    --batch-size 16 --num-workers 0 --tolerance-s 1e-4
-
-# Episode 1
-CUDA_VISIBLE_DEVICES="" python3 external/lerobot/src/lerobot/scripts/lerobot_dataset_viz.py \
-    --repo-id local/stack_cups_variation1 \
-    --root datasets/lerobot/stack_cups_variation1 \
-    --episode-index 1 \
-    --save 1 \
-    --output-dir datasets/lerobot/stack_cups_variation1/output \
     --batch-size 16 --num-workers 0 --tolerance-s 1e-4
 ```
 
-The `.rrd` files are saved to `datasets/lerobot/<task_name>_variation<num>/output/`. Download them to your local machine and open with:
+Download the `.rrd` files and open with [Rerun](https://rerun.io/):
 
 ```bash
-pip install rerun-sdk   # if not installed
+pip install rerun-sdk
 rerun local_stack_cups_variation1_episode_0.rrd
 ```
-
-**Notes:**
-- `CUDA_VISIBLE_DEVICES=""` skips GPU initialization (faster startup on cluster nodes)
-- `--repo-id` is just a label — it doesn't need to exist on HuggingFace
-- `--num-workers 0` avoids multiprocessing issues on the cluster
-- `--tolerance-s 1e-4` relaxes timestamp validation
 
 ---
 
@@ -318,11 +305,26 @@ in `scripts/train_groot_1gpu_smoke.sh`).
 ### 5. Run a Smoke Test
 
 ```bash
-bash scripts/train_groot_1gpu_smoke.sh
+# Single variation
+bash scripts/train_groot_1gpu_smoke.sh stack_cups_variation1
+
+# All variations (merged dataset)
+bash scripts/train_groot_1gpu_smoke.sh put_rubbish_in_bin_all datasets/lerobot/put_rubbish_in_bin_all
+
+# Absolute path on HPC
+bash scripts/train_groot_1gpu_smoke.sh put_rubbish_in_bin_all \
+    /scratch/kpham34/cross_model_learning_based_robot_control/datasets/lerobot/put_rubbish_in_bin_all
 ```
 
-This runs 1 training step with batch_size=1 to verify the full pipeline works
-(data loading, model forward pass, loss computation, checkpoint save).
+The first positional argument is the dataset ID, the second (optional) is the
+dataset root path (defaults to `datasets/lerobot/<DATASET_ID>`).
+
+All parameters can be overridden via environment variables:
+
+```bash
+BATCH_SIZE=4 NUM_STEPS=1000 SAVE_FREQ=100 LOG_FREQ=10 NUM_PROCESSES=2 \
+    bash scripts/train_groot_1gpu_smoke.sh put_rubbish_in_bin_all
+```
 
 ### Troubleshooting (Sol-specific)
 

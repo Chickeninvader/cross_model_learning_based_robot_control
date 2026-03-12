@@ -54,6 +54,9 @@ _project_root = Path(__file__).parent.parent.parent
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
+import re
+import shutil
+
 from src.utils.rlbench_utils import (
     build_episode_stats_groot,
     compute_eef_actions,
@@ -541,6 +544,270 @@ def convert(
 
 
 # ===========================================================================
+# Merge all per-variation datasets into one
+# ===========================================================================
+
+def merge_all_variations(
+    task_name: str,
+    input_root: str,
+    output_root: str | None = None,
+    output_name: str | None = None,
+):
+    """Merge all ``<task_name>_variation*`` datasets under *input_root*
+    into a single combined dataset.
+
+    Each episode's video is **copied** (not re-encoded or concatenated) with
+    a re-indexed filename so that every episode has its own video file.
+
+    Parameters
+    ----------
+    task_name : str
+        RLBench task name, e.g. ``"put_rubbish_in_bin"``.
+    input_root : str
+        Directory containing the per-variation datasets
+        (``<task_name>_variation0/``, ``<task_name>_variation1/``, …).
+    output_root : str or None
+        Where to write the merged dataset.  Defaults to *input_root*.
+    output_name : str or None
+        Name for the output dataset directory.
+        Defaults to ``<task_name>_all``.
+
+    Returns
+    -------
+    str
+        Path to the merged dataset directory.
+    """
+    if output_root is None:
+        output_root = input_root
+
+    # Discover variation directories
+    pattern = re.compile(rf"^{re.escape(task_name)}_variation(\d+)$")
+    variations = [
+        d for d in os.listdir(input_root)
+        if pattern.match(d) and os.path.isdir(os.path.join(input_root, d))
+    ]
+    variations.sort(key=lambda x: int(re.search(r"(\d+)$", x).group(1)))
+
+    if not variations:
+        print(f"[WARN] merge_all_variations: no variations found for '{task_name}' in {input_root}")
+        return None
+
+    dataset_name = output_name or f"{task_name}_all"
+    out_dir = os.path.join(output_root, dataset_name)
+    print(f"\n{'='*60}")
+    print(f"[MERGE] Merging {len(variations)} variation(s) -> {out_dir}")
+    print(f"{'='*60}")
+    for v in variations:
+        print(f"       - {v}")
+
+    # -- Collect data from each per-variation dataset ------------------------
+    all_data_rows: List[pd.DataFrame] = []
+    all_episode_meta: List[dict] = []
+    video_copy_ops: List[dict] = []
+    all_task_strings: List[str] = []
+    all_task_string_set: set = set()
+
+    ref_info = _load_json(os.path.join(input_root, variations[0], "meta", "info.json"))
+    fps = ref_info["fps"]
+    features = ref_info["features"]
+    camera_keys = [k for k, v in features.items() if v.get("dtype") == "video"]
+
+    global_episode_idx = 0
+    global_frame_idx = 0
+    total_frames = 0
+    variation_summaries: List[dict] = []
+
+    for var_name in variations:
+        ds_dir = os.path.join(input_root, var_name)
+        info = _load_json(os.path.join(ds_dir, "meta", "info.json"))
+        tasks_df = pd.read_parquet(os.path.join(ds_dir, "meta", "tasks.parquet"))
+        episodes_df = pd.read_parquet(
+            os.path.join(ds_dir, "meta", "episodes", "chunk-000", "file-000.parquet")
+        )
+        data_df = pd.read_parquet(
+            os.path.join(ds_dir, "data", "chunk-000", "file-000.parquet")
+        )
+
+        n_episodes = info["total_episodes"]
+        n_frames = info["total_frames"]
+
+        # Collect unique task strings
+        for task_str in tasks_df.index.tolist():
+            if task_str not in all_task_string_set:
+                all_task_strings.append(task_str)
+                all_task_string_set.add(task_str)
+
+        ep_offset = global_episode_idx
+        frame_offset = global_frame_idx
+
+        # Re-index data
+        df = data_df.copy()
+        df["episode_index"] = df["episode_index"] + ep_offset
+        df["index"] = df["index"] + frame_offset
+        all_data_rows.append(df)
+
+        # Re-index episodes and schedule video copies
+        for _, ep_row in episodes_df.iterrows():
+            old_ep_idx = int(ep_row["episode_index"])
+            new_ep_idx = old_ep_idx + ep_offset
+            new_file_idx = new_ep_idx
+            chunk_idx = 0
+
+            length = int(ep_row["length"])
+            new_from = (
+                global_frame_idx
+                + int(ep_row["dataset_from_index"])
+                - int(episodes_df.iloc[0]["dataset_from_index"])
+            )
+            new_to = new_from + length
+
+            ep_meta: Dict[str, Any] = {
+                "episode_index": new_ep_idx,
+                "data/chunk_index": chunk_idx,
+                "data/file_index": 0,
+                "dataset_from_index": new_from,
+                "dataset_to_index": new_to,
+                "length": length,
+                "meta/episodes/chunk_index": 0,
+                "meta/episodes/file_index": 0,
+            }
+            if "tasks" in ep_row.index:
+                ep_meta["tasks"] = ep_row["tasks"]
+
+            for cam_key in camera_keys:
+                old_chunk = int(ep_row.get(f"videos/{cam_key}/chunk_index", 0))
+                old_file = int(ep_row.get(f"videos/{cam_key}/file_index", old_ep_idx))
+                ep_meta[f"videos/{cam_key}/chunk_index"] = chunk_idx
+                ep_meta[f"videos/{cam_key}/file_index"] = new_file_idx
+                ep_meta[f"videos/{cam_key}/from_timestamp"] = float(
+                    ep_row.get(f"videos/{cam_key}/from_timestamp", 0.0)
+                )
+                ep_meta[f"videos/{cam_key}/to_timestamp"] = float(
+                    ep_row.get(f"videos/{cam_key}/to_timestamp", length / fps)
+                )
+                video_copy_ops.append({
+                    "src": os.path.join(
+                        ds_dir, "videos", cam_key,
+                        f"chunk-{old_chunk:03d}", f"file-{old_file:03d}.mp4",
+                    ),
+                    "dst": os.path.join(
+                        out_dir, "videos", cam_key,
+                        f"chunk-{chunk_idx:03d}", f"file-{new_file_idx:03d}.mp4",
+                    ),
+                })
+
+            # Copy per-episode stats
+            for col in ep_row.index:
+                if col.startswith("stats/"):
+                    ep_meta[col] = ep_row[col]
+
+            all_episode_meta.append(ep_meta)
+
+        variation_summaries.append({
+            "name": var_name, "episodes": n_episodes, "frames": n_frames,
+            "ep_offset": ep_offset, "frame_offset": frame_offset,
+        })
+        global_episode_idx += n_episodes
+        global_frame_idx += n_frames
+        total_frames += n_frames
+
+    total_episodes = global_episode_idx
+    print(f"[MERGE] Total: {total_episodes} episodes, {total_frames} frames")
+
+    # -- Unified task table --------------------------------------------------
+    task_str_to_idx = {s: i for i, s in enumerate(all_task_strings)}
+
+    # -- Remap task indices in data ------------------------------------------
+    merged_data = pd.concat(all_data_rows, ignore_index=True)
+    for vi, var_name in enumerate(variations):
+        ds_dir = os.path.join(input_root, var_name)
+        old_tasks_df = pd.read_parquet(os.path.join(ds_dir, "meta", "tasks.parquet"))
+        old_idx_to_str = {
+            int(row["task_index"]): ts for ts, row in old_tasks_df.iterrows()
+        }
+        vs = variation_summaries[vi]
+        frame_start, frame_end = vs["frame_offset"], vs["frame_offset"] + vs["frames"]
+        mask = (merged_data["index"] >= frame_start) & (merged_data["index"] < frame_end)
+        for col in [
+            "annotation.human.action.task_description", "task_index",
+            "annotation.human.action.task_name", "annotation.human.validity",
+        ]:
+            if col in merged_data.columns:
+                old_vals = merged_data.loc[mask, col].values
+                merged_data.loc[mask, col] = np.array([
+                    task_str_to_idx.get(old_idx_to_str.get(int(v), ""), int(v))
+                    for v in old_vals
+                ])
+
+    merged_data["index"] = np.arange(len(merged_data), dtype=np.int64)
+
+    # -- Copy video files ----------------------------------------------------
+    print(f"[MERGE] Copying {len(video_copy_ops)} video files ...")
+    for op in video_copy_ops:
+        os.makedirs(os.path.dirname(op["dst"]), exist_ok=True)
+        shutil.copy2(op["src"], op["dst"])
+
+    # -- Write data parquet --------------------------------------------------
+    data_dir = os.path.join(out_dir, "data", "chunk-000")
+    os.makedirs(data_dir, exist_ok=True)
+    merged_data.to_parquet(os.path.join(data_dir, "file-000.parquet"), index=False)
+    print(f"[MERGE] Wrote data parquet ({len(merged_data)} rows)")
+
+    # -- Write meta/tasks.parquet --------------------------------------------
+    meta_dir = os.path.join(out_dir, "meta")
+    os.makedirs(meta_dir, exist_ok=True)
+    pd.DataFrame(
+        {"task_index": list(range(len(all_task_strings)))}, index=all_task_strings
+    ).to_parquet(os.path.join(meta_dir, "tasks.parquet"))
+
+    # -- Write meta/episodes parquet -----------------------------------------
+    ep_meta_dir = os.path.join(meta_dir, "episodes", "chunk-000")
+    os.makedirs(ep_meta_dir, exist_ok=True)
+    pd.DataFrame(all_episode_meta).to_parquet(
+        os.path.join(ep_meta_dir, "file-000.parquet"), index=False
+    )
+
+    # -- Write meta/info.json ------------------------------------------------
+    info_out = dict(ref_info)
+    info_out["total_episodes"] = total_episodes
+    info_out["total_frames"] = total_frames
+    info_out["total_tasks"] = len(all_task_strings)
+    info_out["splits"] = {"train": f"0:{total_episodes}"}
+    for key in ["object_color_map", "scene_graph_objects", "episodes_scene_graph"]:
+        info_out.pop(key, None)
+    info_out["merged_from"] = [v["name"] for v in variation_summaries]
+    with open(os.path.join(meta_dir, "info.json"), "w") as f:
+        json.dump(info_out, f, indent=4)
+
+    # -- Write meta/stats.json -----------------------------------------------
+    stats: Dict[str, Any] = {}
+    for feat_name in ["observation.state", "action"]:
+        arr = np.stack(merged_data[feat_name].values).astype(np.float64)
+        stats[feat_name] = compute_feature_stats_groot(arr)
+    for col in [
+        "timestamp", "annotation.human.action.task_description", "task_index",
+        "annotation.human.action.task_name", "annotation.human.validity",
+        "episode_index", "index", "next.reward",
+    ]:
+        arr = merged_data[col].values.astype(np.float64).reshape(-1, 1)
+        stats[col] = compute_feature_stats_groot(arr)
+    stats["next.done"] = compute_bool_stats_groot(merged_data["next.done"].values)
+    for cam_key in camera_keys:
+        stats[cam_key] = compute_image_stats_placeholder(total_frames)
+    with open(os.path.join(meta_dir, "stats.json"), "w") as f:
+        json.dump(stats, f, indent=4)
+
+    print(f"\n[DONE] Merged dataset '{dataset_name}' written to {out_dir}")
+    print(f"       {total_episodes} episodes, {total_frames} frames from {len(variations)} variations")
+    return out_dir
+
+
+def _load_json(path: str) -> dict:
+    with open(path) as f:
+        return json.load(f)
+
+
+# ===========================================================================
 # CLI
 # ===========================================================================
 
@@ -551,7 +818,8 @@ def parse_args():
     p.add_argument("--task_name", type=str, required=True,
                    help="RLBench task name, e.g. stack_cups")
     p.add_argument("--variation", type=int,
-                   help="Variation number. if not type, processes all variations found in the task directory")
+                   help="Variation number. If omitted, processes ALL variations "
+                        "and merges them into <task_name>_all.")
     p.add_argument("--rlbench_root", type=str, default="datasets/rlbench",
                    help="Root directory containing RLBench datasets")
     p.add_argument("--output_root", type=str, default="datasets/lerobot",
@@ -562,12 +830,16 @@ def parse_args():
                    help="Episode index inside the RLBench variation directory")
     p.add_argument("--use_context_prompt", action="store_true",
                    help="Use ConceptGraphs-style context in task descriptions")
+    p.add_argument("--no_merge", action="store_true",
+                   help="When processing all variations, skip the merge step "
+                        "(only produce per-variation datasets).")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     if args.variation is not None:
+        # --- Single variation mode ---
         convert(
             task_name=args.task_name,
             variation=args.variation,
@@ -579,7 +851,7 @@ if __name__ == "__main__":
         )
         exit(0)
 
-    # Process all variations in the task directory
+    # --- All-variations mode: convert each, then merge ----------------------
     task_dir = os.path.join(args.rlbench_root, args.task_name)
     variations = [d for d in os.listdir(task_dir) if d.startswith("variation")]
     variations = sorted(variations, key=lambda x: int(x.replace("variation", "")))
@@ -594,4 +866,12 @@ if __name__ == "__main__":
             fps=args.fps,
             episode_index_in_rlbench=args.episode,
             use_context_prompt=args.use_context_prompt,
+        )
+
+    # Merge all per-variation datasets into one
+    if not args.no_merge:
+        merge_all_variations(
+            task_name=args.task_name,
+            input_root=args.output_root,
+            output_root=args.output_root,
         )
