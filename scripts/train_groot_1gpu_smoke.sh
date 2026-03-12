@@ -17,7 +17,8 @@ set -euo pipefail
 #
 # Environment variable overrides (take precedence over positional args):
 #   DATASET_ID, DATASET_ROOT, OUTPUT_DIR, JOB_NAME, BATCH_SIZE,
-#   NUM_STEPS, SAVE_FREQ, LOG_FREQ, NUM_PROCESSES
+#   NUM_STEPS, SAVE_FREQ, LOG_FREQ, NUM_PROCESSES, NUM_WORKERS,
+#   TUNE_DIFFUSION_MODEL, TUNE_PROJECTOR, TUNE_VISUAL, TUNE_LLM
 # ---------------------------------------------------------------------------
 
 # Positional args with env-var fallback
@@ -30,6 +31,13 @@ NUM_STEPS="${NUM_STEPS:-1}"
 SAVE_FREQ="${SAVE_FREQ:-1}"
 LOG_FREQ="${LOG_FREQ:-1}"
 NUM_PROCESSES="${NUM_PROCESSES:-1}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
+
+# Policy tuning toggles
+TUNE_DIFFUSION_MODEL="${TUNE_DIFFUSION_MODEL:-false}"
+TUNE_PROJECTOR="${TUNE_PROJECTOR:-true}"
+TUNE_VISUAL="${TUNE_VISUAL:-false}"
+TUNE_LLM="${TUNE_LLM:-false}"
 
 echo "=========================================="
 echo " GR00T Training"
@@ -39,6 +47,11 @@ echo "  OUTPUT_DIR   : ${OUTPUT_DIR}"
 echo "  BATCH_SIZE   : ${BATCH_SIZE}"
 echo "  NUM_STEPS    : ${NUM_STEPS}"
 echo "  NUM_PROCESSES: ${NUM_PROCESSES}"
+echo "  NUM_WORKERS  : ${NUM_WORKERS}"
+echo "  TUNE_DIFFUSION_MODEL: ${TUNE_DIFFUSION_MODEL}"
+echo "  TUNE_PROJECTOR      : ${TUNE_PROJECTOR}"
+echo "  TUNE_VISUAL         : ${TUNE_VISUAL}"
+echo "  TUNE_LLM            : ${TUNE_LLM}"
 echo "=========================================="
 
 accelerate launch \
@@ -50,9 +63,13 @@ accelerate launch \
   --steps="${NUM_STEPS}" \
   --save_freq="${SAVE_FREQ}" \
   --log_freq="${LOG_FREQ}" \
+  --num_workers="${NUM_WORKERS}" \
   --policy.type=groot \
   --policy.push_to_hub=false \
-  --policy.tune_diffusion_model=false \
+  --policy.tune_diffusion_model="${TUNE_DIFFUSION_MODEL}" \
+  --policy.tune_projector="${TUNE_PROJECTOR}" \
+  --policy.tune_visual="${TUNE_VISUAL}" \
+  --policy.tune_llm="${TUNE_LLM}" \
   --dataset.repo_id="${DATASET_ID}" \
   --dataset.root="${DATASET_ROOT}" \
   --dataset.use_imagenet_stats=false \
