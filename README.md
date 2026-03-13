@@ -10,6 +10,7 @@ GR00T-compatible LeRobot v3 datasets, and training NVIDIA GR00T N1.5 policies.
 3. [Dataset Conversion (RLBench → LeRobot v3)](#dataset-conversion-rlbench--lerobot-v3)
 4. [GR00T N1.5 Training](#groot-n15-training-on-asu-sol-hpc)
 5. [Troubleshooting](#troubleshooting-sol-specific)
+6. [RLBench Inference (Simulator)](#rlbench-inference-simulator)
 
 ---
 
@@ -25,14 +26,22 @@ docker-compose up -d
 Inside the Docker container:
 
 ```bash
-python /workspace/external/RLBench/rlbench/dataset_generator.py \
+# IMPORTANT: use the vendored repos under /workspace/external (not any
+# pip-installed packages in the conda env).
+export PYTHONPATH="/workspace/external/RLBench:/workspace/external/lerobot/src:${PYTHONPATH:-}"
+
+cd /workspace/external/RLBench
+python -m rlbench.dataset_generator \
     --tasks put_rubbish_in_bin \
-    --variations 0 \
+    --variations 1 \
     --processes 1 \
     --episodes_per_task 1 \
+    --start_variation 0 \
     --save_path /workspace/datasets/rlbench \
     --image_size 256 256 \
     --renderer opengl3
+
+# Use `--variations -1` to collect all variations for a task.
 ```
 
 ### Quick Install (OSMesa + Xvfb)
@@ -361,3 +370,97 @@ BATCH_SIZE=4 NUM_STEPS=1000 SAVE_FREQ=100 LOG_FREQ=10 NUM_PROCESSES=2 \
 | `nvcc fatal: Unsupported gpu architecture 'compute_120'` | CUDA 12.6 doesn't support sm_120+ | Set `FLASH_ATTN_CUDA_ARCHS=80` |
 | `ModuleNotFoundError: No module named 'flash_attn_2_cuda'` | Running python from flash-attn source dir | `cd` out of the source directory first |
 | `undefined symbol: _ZN3c1013MessageLogger6streamB5cxx11Ev` in torchcodec | C++11 ABI mismatch with PyTorch | Use `--dataset.video_backend=pyav` instead |
+
+---
+
+## RLBench Inference (Simulator)
+
+Use [src/inference/rlbench/infer_rlbench.py](src/inference/rlbench/infer_rlbench.py) to run a trained policy inside the RLBench simulator and record the resulting observations (front + wrist RGB + low-dim).
+
+### Prerequisites
+
+- Run this in an environment where RLBench + PyRep works headlessly (e.g., the Docker/Xvfb setup from **RLBench Dataset Generation** above).
+- Make sure `rlbench` and `lerobot` are importable (either installed in your env, or via `PYTHONPATH`).
+
+If you are using the vendored repos in this workspace, from the repo root you can do:
+
+```bash
+export PYTHONPATH="$(pwd)/external/RLBench:$(pwd)/external/lerobot/src:${PYTHONPATH:-}"
+```
+
+- Optional: install `ffmpeg` if you want the script to also generate `.mp4` preview videos (it will still save PNGs + `low_dim_obs.pkl` without ffmpeg).
+
+### LeRobot checkpoint inference (GR00T / SmolVLA)
+
+The script expects an **EEF-pose action mode** for LeRobot policies (they output delta-EEF actions which are converted to absolute EEF targets for RLBench).
+
+- Use: `--action_mode ee_planning` (recommended) or `--action_mode ee_ik`
+- Avoid: `--action_mode joint_velocity` with `--policy lerobot`
+
+Multi-instruction support: you can pass multiple ordered instructions in `--task_description` (separated by sentences, newlines, `;`, or `|`). The script will execute them **sequentially**, running each instruction for `--max_steps` steps, and continuing from the current simulator state.
+
+Example:
+
+```bash
+python src/inference/rlbench/infer_rlbench.py \
+    --task put_rubbish_in_bin --variation 0 \
+    --episodes 1 --max_steps 300 \
+    --policy lerobot \
+    --action_mode ee_planning --renderer opengl3 \
+    --checkpoint output/lerobot/smolvla_put_rubbish_in_bin_all_20260312_183353 \
+    --dataset_root datasets/lerobot_without_prompt/put_rubbish_in_bin_all \
+    --task_description "Pick up paper. Release paper, then place paper in trash bin" \
+    --device cuda \
+    --save_path output/rlbench_inference/smolvla_multi_instruction
+```
+
+`--checkpoint` can point to any of:
+
+- a `pretrained_model/` directory
+- a checkpoint directory containing `pretrained_model/`
+- a run directory containing `checkpoints/` (the script will use `checkpoints/last` if present, otherwise the highest-numbered checkpoint)
+
+#### Example: GR00T
+
+```bash
+python src/inference/rlbench/infer_rlbench.py \
+    --task put_rubbish_in_bin --variation 0 \
+    --episodes 1 --max_steps 300 \
+    --policy lerobot \
+    --action_mode ee_planning --renderer opengl3 \
+    --checkpoint output/lerobot/groot_smoke_put_rubbish_in_bin_all_20260312_132849 \
+    --dataset_root datasets/lerobot_without_prompt/put_rubbish_in_bin_all \
+    --task_description "Put the rubbish in the bin." \
+    --device cuda \
+    --save_path output/rlbench_inference/groot_put_rubbish_in_bin_v0
+```
+
+#### Example: SmolVLA (trained on a merged dataset)
+
+```bash
+python src/inference/rlbench/infer_rlbench.py \
+    --task put_rubbish_in_bin --variation 0 \
+    --episodes 1 --max_steps 300 \
+    --policy lerobot \
+    --action_mode ee_planning --renderer opengl3 \
+    --checkpoint output/lerobot/smolvla_put_rubbish_in_bin_all_20260312_183353 \
+    --dataset_root datasets/lerobot_without_prompt/put_rubbish_in_bin_all \
+    --task_description "Pick up paper." \
+    --device cuda \
+    --save_path output/rlbench_inference/smolvla_put_rubbish_in_bin_v0
+```
+
+SmolVLA note: some SmolVLA checkpoints list visual inputs as `observation.images.camera1/2/3` in their config, but the saved `policy_preprocessor.json` contains a `rename_observations_processor` that maps RLBench dataset keys (`front_rgb`, `wrist_rgb`) to those camera slots. The inference script automatically uses that saved rename map when `policy_cfg.type == "smolvla"` (no extra CLI flags).
+
+### Output format
+
+For each episode, the script writes:
+
+```
+<save_path>/episode0/
+├── front_rgb/0.png, 1.png, ...
+├── wrist_rgb/0.png, 1.png, ...
+├── low_dim_obs.pkl
+├── front_rgb.mp4        # if ffmpeg available
+└── wrist_rgb.mp4        # if ffmpeg available
+```

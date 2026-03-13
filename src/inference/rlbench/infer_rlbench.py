@@ -34,12 +34,22 @@ Usage (LeRobot checkpoint — e.g. GROOT):
         --checkpoint output/lerobot/groot_smoke_stack_cups_variation1_20260303_182119/checkpoints/last/pretrained_model \
         --dataset_root datasets/lerobot/stack_cups_variation1 \
         --task_description "Pick up cup 1."
+
+Usage (LeRobot checkpoint — e.g. SmolVLA):
+    python src/inference/rlbench/infer_rlbench.py \
+        --task put_rubbish_in_bin --variation 0 \
+        --action_mode ee_planning \
+        --policy lerobot \
+        --checkpoint output/lerobot/smolvla_put_rubbish_in_bin_all_20260312_183353 \
+        --dataset_root datasets/lerobot_without_prompt/put_rubbish_in_bin_all \
+        --task_description "Pick up paper. Release paper, then place paper in trash bin."
 """
 
 import argparse
 import json
 import os
 import pickle
+import re
 import sys
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
@@ -188,6 +198,7 @@ class LeRobotPolicy(Policy):
         checkpoint_path: str,
         dataset_root: str,
         task_description: str = "",
+        rename_map: dict[str, str] | None = None,
         device: str | None = None,
     ):
         # ---- lazy LeRobot imports (keeps non-lerobot paths dependency-free) ----
@@ -196,7 +207,7 @@ class LeRobotPolicy(Policy):
         from lerobot.policies.factory import make_policy, make_pre_post_processors
         from lerobot.policies.utils import prepare_observation_for_inference
 
-        self.checkpoint_path = checkpoint_path
+        self.checkpoint_path = self._resolve_pretrained_model_dir(checkpoint_path)
         self.task_description = task_description
         self._prepare_obs = prepare_observation_for_inference
 
@@ -217,41 +228,143 @@ class LeRobotPolicy(Policy):
         self.ds_features = ds_meta.features
 
         # ---- load policy config from checkpoint ----
-        policy_cfg = PreTrainedConfig.from_pretrained(checkpoint_path)
-        policy_cfg.pretrained_path = checkpoint_path
+        policy_cfg = PreTrainedConfig.from_pretrained(self.checkpoint_path)
+        policy_cfg.pretrained_path = self.checkpoint_path
         policy_cfg.device = str(self.device)
 
+        # ---- auto-detect rename_map from checkpoint preprocessor if not provided ----
+        # Some checkpoints (e.g., SmolVLA) use camera keys like camera1/2/3 but rely on
+        # a saved `rename_observations_processor` to map dataset keys (front/wrist) to those.
+        # Passing a truthy rename_map to `make_policy` bypasses strict visual-key validation.
+        if rename_map is None and policy_cfg.type == "smolvla":
+            rename_map = self._load_rename_map_from_checkpoint(self.checkpoint_path)
+        self.rename_map = rename_map
+
         # ---- build the policy model ----
-        self.model = make_policy(policy_cfg, ds_meta=ds_meta)
+        self.model = make_policy(policy_cfg, ds_meta=ds_meta, rename_map=self.rename_map)
         self.model.eval()
-        print(f"[LeRobotPolicy] Loaded {policy_cfg.type} from {checkpoint_path}")
+        print(f"[LeRobotPolicy] Loaded {policy_cfg.type} from {self.checkpoint_path}")
         print(f"  input_features : {list(policy_cfg.input_features.keys())}")
         print(f"  output_features: {list(policy_cfg.output_features.keys())}")
         print(f"  device         : {self.device}")
+        if self.rename_map:
+            print(f"  rename_map     : {self.rename_map}")
 
         # ---- build pre/post processor pipelines ----
         self.preprocessor, self.postprocessor = make_pre_post_processors(
             policy_cfg,
-            pretrained_path=checkpoint_path,
+            pretrained_path=self.checkpoint_path,
             dataset_stats=ds_meta.stats,
         )
 
+        # Ensure the loaded processor pipelines follow the requested device.
+        self._force_device_in_pipeline(self.preprocessor, self.device)
+        self._force_device_in_pipeline(self.postprocessor, self.device)
+
         self.use_amp = policy_cfg.use_amp
 
-        # ---- figure out which cameras the policy expects ----
-        # e.g.  "observation.images.front_rgb" → "front_rgb"
-        # Use policy's input_features, not dataset features, to avoid requiring
-        # cameras that were in training data but aren't needed by the model
-        self.image_keys = [
-            k for k in policy_cfg.input_features.keys()
-            if k.startswith("observation.images.")
+        # ---- decide which RLBench cameras to fetch ----
+        # RLBench Observation provides `front_rgb` and `wrist_rgb` in this script.
+        # Some checkpoints (e.g., SmolVLA) expect different camera keys (camera1/2/3)
+        # but ship a `rename_observations_processor` in the saved preprocessor.
+        # So we provide RLBench/dataset keys (front/wrist) and let the preprocessor
+        # rename them if needed.
+        preferred = [
+            "observation.images.front_rgb",
+            "observation.images.wrist_rgb",
         ]
+        self.image_keys = [k for k in preferred if k in self.ds_features]
+        if not self.image_keys:
+            self.image_keys = sorted(
+                k for k in self.ds_features.keys() if k.startswith("observation.images.")
+            )
+        if not self.image_keys:
+            raise RuntimeError(
+                "No image keys found to fetch from RLBench. "
+                "Expected dataset features to include observation.images.* or at least front_rgb/wrist_rgb."
+            )
         # The state key is always "observation.state"
         self.state_key = "observation.state"
 
     def reset(self):
-        """Reset internal action-chunk cache in the policy."""
-        self.model.reset()
+        """Reset internal action-chunk cache in the policy (if present)."""
+        reset_fn = getattr(self.model, "reset", None)
+        if callable(reset_fn):
+            reset_fn()
+
+    @staticmethod
+    def _resolve_pretrained_model_dir(path: str) -> str:
+        """Resolve a user-provided path to a `pretrained_model/` directory."""
+        p = Path(path)
+
+        # 1) Direct path to pretrained_model
+        if (p / "config.json").is_file():
+            return str(p)
+
+        # 2) Path points to a checkpoint dir that contains pretrained_model/
+        if (p / "pretrained_model" / "config.json").is_file():
+            return str(p / "pretrained_model")
+
+        # 3) Path points to a run dir that contains checkpoints/
+        last = p / "checkpoints" / "last" / "pretrained_model"
+        if (last / "config.json").is_file():
+            return str(last)
+
+        ckpt_root = p / "checkpoints"
+        if ckpt_root.is_dir():
+            candidates: list[Path] = []
+            for ckpt_dir in ckpt_root.iterdir():
+                if not ckpt_dir.is_dir():
+                    continue
+                pm = ckpt_dir / "pretrained_model"
+                if (pm / "config.json").is_file():
+                    candidates.append(pm)
+
+            if candidates:
+                def _score(pm_dir: Path) -> tuple[int, str]:
+                    name = pm_dir.parent.name
+                    return (int(name) if name.isdigit() else -1, name)
+
+                candidates.sort(key=_score)
+                return str(candidates[-1])
+
+        raise FileNotFoundError(
+            f"Could not find a LeRobot pretrained_model directory from: {path}. "
+            "Expected one of: <...>/pretrained_model/, <...>/checkpoints/<id>/pretrained_model/, "
+            "or <run_dir>/checkpoints/last/pretrained_model/."
+        )
+
+    @staticmethod
+    def _load_rename_map_from_checkpoint(checkpoint_path: str) -> dict[str, str] | None:
+        preproc_path = Path(checkpoint_path) / "policy_preprocessor.json"
+        if not preproc_path.is_file():
+            return None
+        try:
+            with open(preproc_path, "r") as f:
+                preproc_cfg = json.load(f)
+
+            for step in preproc_cfg.get("steps", []):
+                if step.get("registry_name") != "rename_observations_processor":
+                    continue
+                rename_map = step.get("config", {}).get("rename_map", None)
+                if isinstance(rename_map, dict) and rename_map:
+                    if all(isinstance(k, str) and isinstance(v, str) for k, v in rename_map.items()):
+                        return rename_map
+        except Exception as exc:  # nosec: B110
+            print(f"[LeRobotPolicy] Warning: failed to read rename_map from {preproc_path}: {exc}")
+        return None
+
+    @staticmethod
+    def _force_device_in_pipeline(pipeline, device: torch.device) -> None:
+        steps = getattr(pipeline, "steps", [])
+        for step in steps:
+            registry_name = getattr(step.__class__, "_registry_name", None)
+            if registry_name != "device_processor":
+                continue
+            step.device = str(device)
+            post_init = getattr(step, "__post_init__", None)
+            if callable(post_init):
+                post_init()
 
     # ------------------------------------------------------------------
     # RLBench Observation  →  LeRobot observation dict  →  action
@@ -450,6 +563,42 @@ def build_policy(args) -> Policy:
         raise ValueError(f"Unknown policy: {args.policy}")
 
 
+def _split_task_description_into_steps(task_description: str) -> list[str]:
+    """Split a single task_description string into ordered instruction steps.
+
+    Supported delimiters (highest priority first):
+      - explicit: '|'  (e.g. "Pick up.|Place.")
+      - newlines
+      - semicolons
+      - sentence boundaries on '.'
+
+    Returns a non-empty list.
+    """
+    text = (task_description or "").strip()
+    if not text:
+        return [""]
+
+    if "|" in text:
+        parts = [p.strip() for p in text.split("|")]
+    elif "\n" in text:
+        parts = [p.strip() for p in text.splitlines()]
+    elif ";" in text:
+        parts = [p.strip() for p in text.split(";")]
+    else:
+        # Split on sentence boundaries. Keep punctuation with the preceding step
+        # by splitting on whitespace *after* a period.
+        parts = [p.strip() for p in re.split(r"(?<=\.)\s+", text)]
+
+    parts = [p for p in parts if p]
+    return parts if parts else [text]
+
+
+def _set_policy_task_description(policy: Policy, task_description: str) -> None:
+    """Best-effort update of the policy's language instruction (if supported)."""
+    if hasattr(policy, "task_description"):
+        setattr(policy, "task_description", task_description)
+
+
 def run_inference(args):
     img_size = list(args.image_size)
 
@@ -521,36 +670,70 @@ def run_inference(args):
         print(f"Episode {ep_idx}")
         print(f"{'='*60}")
 
-        policy.reset()
         descriptions, initial_obs = task_env.reset()
         print(f"  Descriptions: {descriptions}")
+
+        # Pick the language instruction source:
+        # - prefer explicit --task_description
+        # - otherwise fall back to RLBench's sampled description
+        episode_task_description = args.task_description
+        if episode_task_description is None:
+            episode_task_description = descriptions[0] if descriptions else ""
+
+        # Multi-instruction support:
+        # If the task description contains multiple sentences/lines, we execute them
+        # sequentially for `--max_steps` steps each, without resetting the simulator.
+        task_steps = _split_task_description_into_steps(episode_task_description)
+        if len(task_steps) > 1:
+            print(f"  Task steps ({len(task_steps)}): {task_steps}")
 
         observations = [initial_obs]
         total_reward = 0.0
         success = False
 
-        for step in range(args.max_steps):
-            action = policy.predict(observations[-1])
+        global_step = 0
+        for step_idx, step_task in enumerate(task_steps):
+            _set_policy_task_description(policy, step_task)
+            policy.reset()
 
-            # action[:7] = absolute EEF target pose (delta→absolute already
-            # converted inside LeRobotPolicy.predict),  action[7] = gripper
-            try:
-                obs, reward, terminate = task_env.step(action)
-            except Exception as e:
-                print(f"  Step {step}: action failed ({e}), stopping episode.")
-                break
+            if len(task_steps) > 1:
+                print(f"\n  --- Instruction {step_idx + 1}/{len(task_steps)} ---")
+                print(f"  {step_task}")
 
-            observations.append(obs)
-            total_reward += reward
+            for phase_step in range(args.max_steps):
+                action = policy.predict(observations[-1])
 
-            if reward > 0:
-                success = True
+                # action[:7] = absolute EEF target pose (delta→absolute already
+                # converted inside LeRobotPolicy.predict),  action[7] = gripper
+                try:
+                    obs, reward, terminate = task_env.step(action)
+                except Exception as e:
+                    print(
+                        f"  Step {global_step} (phase_step={phase_step}): action failed ({e}), stopping episode."
+                    )
+                    terminate = True
+                    reward = 0.0
+                    obs = None
+
+                if obs is not None:
+                    observations.append(obs)
+                total_reward += float(reward)
+
+                if reward > 0:
+                    success = True
+
+                if terminate or success:
+                    print(
+                        f"  Step {global_step}: task {'succeeded' if success else 'terminated'}!"
+                    )
+                    break
+
+                if ((global_step + 1) % 20) == 0:
+                    print(f"  Step {global_step}: reward={total_reward:.2f}")
+                global_step += 1
+
             if terminate or success:
-                print(f"  Step {step}: task {'succeeded' if success else 'terminated'}!")
                 break
-
-            if (step + 1) % 20 == 0:
-                print(f"  Step {step}: reward={total_reward:.2f}")
 
         print(f"  Episode {ep_idx} done — {len(observations)} observations, "
               f"total_reward={total_reward:.2f}, success={success}")
@@ -577,20 +760,23 @@ def parse_args():
                    help="Task variation index (default: 0).")
     p.add_argument("--episodes", type=int, default=1,
                    help="Number of episodes to run.")
-    p.add_argument("--max_steps", type=int, default=300,
+    p.add_argument("--max_steps", type=int, default=100,
                    help="Max steps per episode before stopping.")
 
     p.add_argument("--policy", type=str, default="dummy",
                    choices=["dummy", "random", "lerobot"],
                    help="Which policy to use (default: dummy = stay in place).")
     p.add_argument("--checkpoint", type=str, default=None,
-                   help="Path to LeRobot pretrained_model dir (required if --policy lerobot).")
+                   help="Path to a LeRobot run dir / checkpoint dir / pretrained_model dir (required if --policy lerobot).")
     p.add_argument("--dataset_root", type=str, default=None,
                    help="Path to LeRobot dataset root (has meta/ data/ dirs). "
                         "Required for --policy lerobot to get feature spec + stats.")
     p.add_argument("--task_description", type=str, default=None,
-                   help="Natural-language task description for the policy "
-                        "(e.g. 'Pick up cup 1.').")
+                    help=(
+                        "Natural-language task description for the policy. "
+                        "If you provide multiple sentences/lines (e.g. 'Pick up paper. Release paper, then place paper in trash bin'), "
+                        "the script executes them sequentially for --max_steps steps each, without resetting the simulator."
+                    ))
     p.add_argument("--device", type=str, default=None,
                    help="Torch device for policy inference (default: auto).")
 

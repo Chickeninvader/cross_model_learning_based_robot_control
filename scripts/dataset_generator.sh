@@ -1,18 +1,20 @@
-RLBENCH_ROOT=/workspace/external/RLBench/rlbench
+RLBENCH_ROOT=/workspace/external/RLBench
 OUT_ROOT=/workspace/datasets/rlbench
 PY=python
+
+export PYTHONPATH="/workspace/external/RLBench:/workspace/external/lerobot/src:${PYTHONPATH:-}"
 
 cd $RLBENCH_ROOT
 
 # All available tasks
-all_tasks=($(ls tasks | grep '\.py$' | grep -v __init__ | sed 's/\.py$//'))
+all_tasks=($(ls rlbench/tasks | grep '\.py$' | grep -v __init__ | sed 's/\.py$//'))
 
 mkdir -p "$OUT_ROOT"
 
 missing=()
 
 for t in "${all_tasks[@]}"; do
-  episode_file="$OUT_ROOT/$t/variation0/episodes/episode_0/low_dim_obs.pkl"
+  episode_file="$OUT_ROOT/$t/variation0/episodes/episode0/low_dim_obs.pkl"
 
   if [ ! -f "$episode_file" ]; then
     echo "Task $t is incomplete or missing."
@@ -29,7 +31,7 @@ echo "--------------------------------------"
 if [ ${#missing[@]} -gt 0 ]; then
   echo "Running dataset generator with 8 processes..."
 
-  $PY dataset_generator.py \
+  $PY -m rlbench.dataset_generator \
     --tasks "${missing[@]}" \
     --episodes_per_task 1 \
     --variations 1 \
