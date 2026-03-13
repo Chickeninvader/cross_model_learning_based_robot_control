@@ -13,9 +13,9 @@ set -euo pipefail
 #   BATCH_SIZE=64 NUM_STEPS=20000 bash scripts/train_smolvla_1gpu.sh put_rubbish_in_bin_all
 #
 # Environment variable overrides:
-#   DATASET_ID, DATASET_ROOT, OUTPUT_DIR, JOB_NAME, POLICY_PATH, POLICY_DEVICE,
+#   DATASET_ID, DATASET_ROOT, OUTPUT_DIR, POLICY_PATH, POLICY_DEVICE,
 #   BATCH_SIZE, NUM_STEPS, SAVE_FREQ, LOG_FREQ, NUM_PROCESSES, NUM_WORKERS,
-#   MIXED_PRECISION, VIDEO_BACKEND, WANDB_ENABLE
+#   MIXED_PRECISION, VIDEO_BACKEND, WANDB_ENABLE, RENAME_MAP
 # ---------------------------------------------------------------------------
 
 DATASET_ID="${DATASET_ID:-${1:-}}"
@@ -34,7 +34,6 @@ if [[ $# -ge 1 && "${1:-}" == "--" ]]; then shift; fi
 EXTRA_TRAIN_ARGS=("$@")
 
 OUTPUT_DIR="${OUTPUT_DIR:-output/lerobot/smolvla_${DATASET_ID}_$(date +%Y%m%d_%H%M%S)}"
-JOB_NAME="${JOB_NAME:-smolvla_${DATASET_ID}}"
 
 POLICY_PATH="${POLICY_PATH:-lerobot/smolvla_base}"
 POLICY_DEVICE="${POLICY_DEVICE:-cuda}"
@@ -52,7 +51,20 @@ MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
 # If decoding is slow/broken on your node, try: VIDEO_BACKEND=torchvision_av
 VIDEO_BACKEND="${VIDEO_BACKEND:-pyav}"
 
+# Configure Hugging Face cache locations (use project `models/hf_cache` by default).
+# These can be overridden by exporting HF_HOME / TRANSFORMERS_CACHE / HF_DATASETS_CACHE
+# / HUGGINGFACE_HUB_CACHE in the environment prior to running this script.
+export HF_HOME="${HF_HOME:-models/hf_cache}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_HOME}/hub}"
+mkdir -p "${HF_HOME}" "${TRANSFORMERS_CACHE}" "${HF_DATASETS_CACHE}" "${HUGGINGFACE_HUB_CACHE}"
+
 WANDB_ENABLE="${WANDB_ENABLE:-false}"
+
+# Map dataset visual keys to policy visual keys when they differ.
+# Default maps RLBench-style cameras to SmolVLA camera slots.
+RENAME_MAP="${RENAME_MAP:-{\"observation.images.front_rgb\":\"observation.images.camera1\",\"observation.images.wrist_rgb\":\"observation.images.camera2\"}}"
 
 echo "=========================================="
 echo " SmolVLA Training"
@@ -67,6 +79,7 @@ echo "  NUM_WORKERS      : ${NUM_WORKERS}"
 echo "  MIXED_PRECISION  : ${MIXED_PRECISION}"
 echo "  VIDEO_BACKEND    : ${VIDEO_BACKEND}"
 echo "  WANDB_ENABLE     : ${WANDB_ENABLE}"
+echo "  RENAME_MAP       : ${RENAME_MAP}"
 if [[ ${#EXTRA_TRAIN_ARGS[@]} -gt 0 ]]; then
   echo "  EXTRA_TRAIN_ARGS : ${EXTRA_TRAIN_ARGS[*]}"
 fi
@@ -89,8 +102,8 @@ accelerate launch \
   --dataset.repo_id="${DATASET_ID}" \
   --dataset.root="${DATASET_ROOT}" \
   --dataset.video_backend="${VIDEO_BACKEND}" \
+  --rename_map="${RENAME_MAP}" \
   --wandb.enable="${WANDB_ENABLE}" \
-  --job_name="${JOB_NAME}" \
   "${EXTRA_TRAIN_ARGS[@]}"
 
 echo "Saved outputs to: ${OUTPUT_DIR}"

@@ -33,6 +33,15 @@ LOG_FREQ="${LOG_FREQ:-1}"
 NUM_PROCESSES="${NUM_PROCESSES:-1}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 
+# Configure Hugging Face cache locations (use project `models/hf_cache` by default).
+# These can be overridden by exporting HF_HOME / TRANSFORMERS_CACHE / HF_DATASETS_CACHE
+# / HUGGINGFACE_HUB_CACHE in the environment prior to running this script.
+export HF_HOME="${HF_HOME:-models/hf_cache}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_HOME}/hub}"
+mkdir -p "${HF_HOME}" "${TRANSFORMERS_CACHE}" "${HF_DATASETS_CACHE}" "${HUGGINGFACE_HUB_CACHE}"
+
 # Policy tuning toggles
 TUNE_DIFFUSION_MODEL="${TUNE_DIFFUSION_MODEL:-false}"
 TUNE_PROJECTOR="${TUNE_PROJECTOR:-true}"
