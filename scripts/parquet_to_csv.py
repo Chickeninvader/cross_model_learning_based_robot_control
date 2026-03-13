@@ -9,8 +9,11 @@ Usage
 -----
     python scripts/parquet_to_csv.py --task stack_cups --lerobot-root datasets/lerobot --output-dir output/csv
 
-The script will process all variations found for the task (e.g., stack_cups_variation0, 
-stack_cups_variation1, etc.) and convert:
+The script will process all variations found for the task (e.g., stack_cups_variation0,
+stack_cups_variation1, etc.). If no per-variation folders exist, it falls back to a
+merged dataset folder (e.g., stack_cups_all).
+
+It converts:
     - data/chunk-*/file-*.parquet
     - meta/episodes/chunk-*/file-*.parquet
     - meta/tasks.parquet
@@ -134,7 +137,10 @@ def main():
         "--task",
         type=str,
         required=True,
-        help="Task name (e.g., 'stack_cups'). Will process all variations found.",
+        help=(
+            "Base task name (e.g., 'stack_cups'). Will process all <task>_variation* datasets found. "
+            "If none exist, will process <task>_all if present."
+        ),
     )
     parser.add_argument(
         "--lerobot-root",
@@ -157,23 +163,33 @@ def main():
     
     args = parser.parse_args()
     
-    # Find all variation directories for this task
+    # Find all per-variation directories for this task
     task_pattern = f"{args.task}_variation*"
-    variation_dirs = sorted(args.lerobot_root.glob(task_pattern))
-    
+    variation_dirs = sorted(d for d in args.lerobot_root.glob(task_pattern) if d.is_dir())
+
+    # If no variations exist, fall back to a merged dataset folder (<task>_all)
+    # or to an exact dataset folder name (<task>) if the user passed it.
+    merged_dir = args.lerobot_root / f"{args.task}_all"
+    exact_dir = args.lerobot_root / args.task
+    if not variation_dirs and merged_dir.is_dir():
+        variation_dirs = [merged_dir]
+    elif not variation_dirs and exact_dir.is_dir():
+        variation_dirs = [exact_dir]
+
     if not variation_dirs:
-        print(f"[ERROR] No variations found for task '{args.task}' in {args.lerobot_root}")
+        print(f"[ERROR] No datasets found for task '{args.task}' in {args.lerobot_root}")
         print(f"        Looking for pattern: {task_pattern}")
+        print(f"        Or merged dataset:  {args.task}_all")
         return 1
     
-    # Filter by specific variation if requested
+    # Filter by specific variation if requested (only applies to <task>_variationN)
     if args.variation is not None:
-        variation_dirs = [
-            d for d in variation_dirs
-            if d.name == f"{args.task}_variation{args.variation}"
-        ]
+        requested = f"{args.task}_variation{args.variation}"
+        variation_dirs = [d for d in variation_dirs if d.name == requested]
         if not variation_dirs:
             print(f"[ERROR] Variation {args.variation} not found for task '{args.task}'")
+            if merged_dir.is_dir():
+                print(f"        Note: a merged dataset exists at {merged_dir.name} (no variations).")
             return 1
     
     print(f"[INFO] Found {len(variation_dirs)} variation(s) for task '{args.task}':")
@@ -184,7 +200,16 @@ def main():
     # Process each variation
     total_files = 0
     for variation_dir in variation_dirs:
-        variation_name = variation_dir.name.replace(f"{args.task}_", "")
+        # Keep existing output layout: output/<task>/<variation>/...
+        # For merged datasets (<task>_all), use variation name "all".
+        if variation_dir.name == f"{args.task}_all":
+            variation_name = "all"
+        elif variation_dir.name == args.task:
+            variation_name = "merged"
+        else:
+            variation_name = variation_dir.name.replace(f"{args.task}_", "")
+            if not variation_name:
+                variation_name = "merged"
         print(f"[INFO] Processing {variation_name}...")
         
         n_files = process_variation(

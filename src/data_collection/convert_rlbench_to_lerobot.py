@@ -287,7 +287,7 @@ def convert(
             "data/file_index": 0,
             "dataset_from_index": global_index,
             "dataset_to_index": global_index + n_frames,
-            "tasks": np.array([desc, task_short_name, validity_label], dtype=object),
+            "tasks": np.array([desc], dtype=object),
             "length": n_frames,
             "meta/episodes/chunk_index": 0,
             "meta/episodes/file_index": 0,
@@ -556,8 +556,11 @@ def merge_all_variations(
     """Merge all ``<task_name>_variation*`` datasets under *input_root*
     into a single combined dataset.
 
-    Each episode's video is **copied** (not re-encoded or concatenated) with
-    a re-indexed filename so that every episode has its own video file.
+    Output videos are stored as **a single MP4 per camera key**:
+        ``videos/<video_key>/chunk-000/file-000.mp4``
+
+    Each episode row in ``meta/episodes/...`` points into that video file via
+    ``from_timestamp`` / ``to_timestamp``.
 
     Parameters
     ----------
@@ -579,6 +582,84 @@ def merge_all_variations(
     """
     if output_root is None:
         output_root = input_root
+
+    def _concat_videos_ffmpeg(
+        input_videos: List[str],
+        output_path: str,
+        *,
+        fps: int,
+        codec: str = VIDEO_CODEC,
+        pix_fmt: str = PIX_FMT,
+    ) -> str:
+        """Concatenate multiple MP4 files into one.
+
+        Tries a fast remux (`-c copy`) first. If that fails, falls back to
+        re-encoding with the requested codec/pix-fmt.
+        """
+        import subprocess
+        import tempfile
+
+        if not input_videos:
+            raise ValueError("No input videos provided for concatenation")
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        # Build concat-demuxer list file.
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            list_path = f.name
+            for p in input_videos:
+                f.write(f"file '{os.path.abspath(p)}'\n")
+
+        try:
+            # 1) Preferred: remux (no re-encode)
+            cmd_copy = [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                list_path,
+                "-an",
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                output_path,
+            ]
+            try:
+                subprocess.run(cmd_copy, check=True, capture_output=True)
+                return output_path
+            except subprocess.CalledProcessError:
+                # 2) Fallback: re-encode to enforce consistency
+                cmd_reencode = [
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    list_path,
+                    "-an",
+                    "-c:v",
+                    codec,
+                    "-pix_fmt",
+                    pix_fmt,
+                    "-r",
+                    str(fps),
+                    "-movflags",
+                    "+faststart",
+                    output_path,
+                ]
+                subprocess.run(cmd_reencode, check=True, capture_output=True)
+                return output_path
+        finally:
+            try:
+                os.unlink(list_path)
+            except OSError:
+                pass
 
     # Discover variation directories
     pattern = re.compile(rf"^{re.escape(task_name)}_variation(\d+)$")
@@ -603,7 +684,6 @@ def merge_all_variations(
     # -- Collect data from each per-variation dataset ------------------------
     all_data_rows: List[pd.DataFrame] = []
     all_episode_meta: List[dict] = []
-    video_copy_ops: List[dict] = []
     all_task_strings: List[str] = []
     all_task_string_set: set = set()
 
@@ -611,6 +691,9 @@ def merge_all_variations(
     fps = ref_info["fps"]
     features = ref_info["features"]
     camera_keys = [k for k, v in features.items() if v.get("dtype") == "video"]
+
+    # For merged videos: one file per camera; collect per-episode inputs in order.
+    cam_to_video_inputs: Dict[str, List[str]] = {k: [] for k in camera_keys}
 
     global_episode_idx = 0
     global_frame_idx = 0
@@ -620,6 +703,10 @@ def merge_all_variations(
     for var_name in variations:
         ds_dir = os.path.join(input_root, var_name)
         info = _load_json(os.path.join(ds_dir, "meta", "info.json"))
+        if int(info.get("fps", fps)) != int(fps):
+            raise ValueError(
+                f"All variations must use the same fps. Expected {fps}, got {info.get('fps')} in {ds_dir}"
+            )
         tasks_df = pd.read_parquet(os.path.join(ds_dir, "meta", "tasks.parquet"))
         episodes_df = pd.read_parquet(
             os.path.join(ds_dir, "meta", "episodes", "chunk-000", "file-000.parquet")
@@ -646,11 +733,11 @@ def merge_all_variations(
         df["index"] = df["index"] + frame_offset
         all_data_rows.append(df)
 
-        # Re-index episodes and schedule video copies
+        # Re-index episodes and collect per-episode video files for concat
+        episodes_df = episodes_df.sort_values("episode_index")
         for _, ep_row in episodes_df.iterrows():
             old_ep_idx = int(ep_row["episode_index"])
             new_ep_idx = old_ep_idx + ep_offset
-            new_file_idx = new_ep_idx
             chunk_idx = 0
 
             length = int(ep_row["length"])
@@ -660,6 +747,11 @@ def merge_all_variations(
                 - int(episodes_df.iloc[0]["dataset_from_index"])
             )
             new_to = new_from + length
+
+            # For the single merged video file, every episode points to file_index=0
+            # and uses timestamps to select its segment.
+            video_from_ts = new_from / fps
+            video_to_ts = new_to / fps
 
             ep_meta: Dict[str, Any] = {
                 "episode_index": new_ep_idx,
@@ -672,29 +764,36 @@ def merge_all_variations(
                 "meta/episodes/file_index": 0,
             }
             if "tasks" in ep_row.index:
-                ep_meta["tasks"] = ep_row["tasks"]
+                # Normalize to LeRobot-style: a single-element list/array of task strings.
+                # Older exports stored extra strings like task-name/validity; keep only the first.
+                tasks_val = ep_row["tasks"]
+                first_task = None
+                try:
+                    if tasks_val is not None and len(tasks_val) > 0:
+                        first_task = tasks_val[0]
+                except Exception:
+                    first_task = None
+                if first_task is not None:
+                    ep_meta["tasks"] = np.array([str(first_task)], dtype=object)
 
             for cam_key in camera_keys:
                 old_chunk = int(ep_row.get(f"videos/{cam_key}/chunk_index", 0))
                 old_file = int(ep_row.get(f"videos/{cam_key}/file_index", old_ep_idx))
                 ep_meta[f"videos/{cam_key}/chunk_index"] = chunk_idx
-                ep_meta[f"videos/{cam_key}/file_index"] = new_file_idx
-                ep_meta[f"videos/{cam_key}/from_timestamp"] = float(
-                    ep_row.get(f"videos/{cam_key}/from_timestamp", 0.0)
+                ep_meta[f"videos/{cam_key}/file_index"] = 0
+                ep_meta[f"videos/{cam_key}/from_timestamp"] = float(video_from_ts)
+                ep_meta[f"videos/{cam_key}/to_timestamp"] = float(video_to_ts)
+
+                src_video = os.path.join(
+                    ds_dir,
+                    "videos",
+                    cam_key,
+                    f"chunk-{old_chunk:03d}",
+                    f"file-{old_file:03d}.mp4",
                 )
-                ep_meta[f"videos/{cam_key}/to_timestamp"] = float(
-                    ep_row.get(f"videos/{cam_key}/to_timestamp", length / fps)
-                )
-                video_copy_ops.append({
-                    "src": os.path.join(
-                        ds_dir, "videos", cam_key,
-                        f"chunk-{old_chunk:03d}", f"file-{old_file:03d}.mp4",
-                    ),
-                    "dst": os.path.join(
-                        out_dir, "videos", cam_key,
-                        f"chunk-{chunk_idx:03d}", f"file-{new_file_idx:03d}.mp4",
-                    ),
-                })
+                if not os.path.exists(src_video):
+                    raise FileNotFoundError(f"Missing expected source video: {src_video}")
+                cam_to_video_inputs[cam_key].append(src_video)
 
             # Copy per-episode stats
             for col in ep_row.index:
@@ -741,11 +840,17 @@ def merge_all_variations(
 
     merged_data["index"] = np.arange(len(merged_data), dtype=np.int64)
 
-    # -- Copy video files ----------------------------------------------------
-    print(f"[MERGE] Copying {len(video_copy_ops)} video files ...")
-    for op in video_copy_ops:
-        os.makedirs(os.path.dirname(op["dst"]), exist_ok=True)
-        shutil.copy2(op["src"], op["dst"])
+    # -- Build single video per camera --------------------------------------
+    print(f"[MERGE] Building single video per camera (file-000.mp4) ...")
+    for cam_key in camera_keys:
+        out_video = os.path.join(
+            out_dir,
+            "videos",
+            cam_key,
+            "chunk-000",
+            "file-000.mp4",
+        )
+        _concat_videos_ffmpeg(cam_to_video_inputs[cam_key], out_video, fps=fps)
 
     # -- Write data parquet --------------------------------------------------
     data_dir = os.path.join(out_dir, "data", "chunk-000")
@@ -817,9 +922,11 @@ def parse_args():
     )
     p.add_argument("--task_name", type=str, required=True,
                    help="RLBench task name, e.g. stack_cups")
-    p.add_argument("--variation", type=int,
-                   help="Variation number. If omitted, processes ALL variations "
-                        "and merges them into <task_name>_all.")
+    p.add_argument(
+        "--variation",
+        type=int,
+        help="Variation number. If omitted, processes ALL variations (one dataset per variation).",
+    )
     p.add_argument("--rlbench_root", type=str, default="datasets/rlbench",
                    help="Root directory containing RLBench datasets")
     p.add_argument("--output_root", type=str, default="datasets/lerobot",
@@ -830,15 +937,25 @@ def parse_args():
                    help="Episode index inside the RLBench variation directory")
     p.add_argument("--use_context_prompt", action="store_true",
                    help="Use ConceptGraphs-style context in task descriptions")
-    p.add_argument("--no_merge", action="store_true",
-                   help="When processing all variations, skip the merge step "
-                        "(only produce per-variation datasets).")
+    p.add_argument(
+        "--merge",
+        action="store_true",
+        help="When processing ALL variations (no --variation), also merge them into <task_name>_all. "
+             "Merged dataset stores a single video per camera as videos/<key>/chunk-000/file-000.mp4.",
+    )
+    p.add_argument(
+        "--no_merge",
+        action="store_true",
+        help="DEPRECATED: no-merge is now the default; kept for backward compatibility.",
+    )
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     if args.variation is not None:
+        if getattr(args, "merge", False):
+            raise SystemExit("--merge cannot be used together with --variation")
         # --- Single variation mode ---
         convert(
             task_name=args.task_name,
@@ -868,8 +985,11 @@ if __name__ == "__main__":
             use_context_prompt=args.use_context_prompt,
         )
 
-    # Merge all per-variation datasets into one
-    if not args.no_merge:
+    if getattr(args, "merge", False) and getattr(args, "no_merge", False):
+        raise SystemExit("--merge and --no_merge are mutually exclusive")
+
+    # Merge all per-variation datasets into one (opt-in)
+    if getattr(args, "merge", False):
         merge_all_variations(
             task_name=args.task_name,
             input_root=args.output_root,

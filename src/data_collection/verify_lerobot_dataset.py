@@ -335,36 +335,72 @@ def check_video_frame_counts(dataset_dir, info):
     ep_meta_path = os.path.join(dataset_dir, "meta", "episodes", "chunk-000", "file-000.parquet")
     ep_df = pd.read_parquet(ep_meta_path)
 
+    fps = float(info.get("fps", 0.0) or 0.0)
+    if fps <= 0:
+        print("  [WARN] Invalid fps in info.json — skipping timestamp sanity checks")
+
     for cam_key in ["observation.images.front_rgb", "observation.images.wrist_rgb"]:
+        # Group by the referenced video file, so merged datasets (single file)
+        # and per-episode datasets (one file per episode) both validate.
+        refs_by_video: dict[str, list[tuple[int, int, float, float]]] = {}
+
         for _, ep_row in ep_df.iterrows():
             ep_idx = int(ep_row["episode_index"])
             chunk_idx = int(ep_row.get(f"videos/{cam_key}/chunk_index", 0))
             file_idx = int(ep_row.get(f"videos/{cam_key}/file_index", ep_idx))
-            expected_len = int(ep_row["length"])
+            length = int(ep_row["length"])
+            from_ts = float(ep_row.get(f"videos/{cam_key}/from_timestamp", 0.0))
+            to_ts = float(ep_row.get(f"videos/{cam_key}/to_timestamp", length / fps if fps > 0 else 0.0))
+
+            if fps > 0:
+                expected_dur = length / fps
+                actual_dur = to_ts - from_ts
+                if abs(actual_dur - expected_dur) > 1e-3:
+                    print(
+                        f"  [FAIL] {cam_key} ep{ep_idx}: duration {actual_dur:.6f}s != expected {expected_dur:.6f}s"
+                    )
+                    ok = False
 
             vid_path = os.path.join(
-                dataset_dir, "videos", cam_key,
-                f"chunk-{chunk_idx:03d}", f"file-{file_idx:03d}.mp4"
+                dataset_dir,
+                "videos",
+                cam_key,
+                f"chunk-{chunk_idx:03d}",
+                f"file-{file_idx:03d}.mp4",
             )
+            refs_by_video.setdefault(vid_path, []).append((ep_idx, length, from_ts, to_ts))
+
+        for vid_path, refs in refs_by_video.items():
             if not os.path.exists(vid_path):
                 print(f"  [FAIL] Missing video: {vid_path}")
                 ok = False
                 continue
 
+            expected_total = int(sum(r[1] for r in refs))
+
             # Count frames via ffprobe
             cmd = [
-                ffprobe, "-v", "error",
+                ffprobe,
+                "-v",
+                "error",
                 "-count_frames",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=nb_read_frames",
-                "-of", "csv=p=0",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=nb_read_frames",
+                "-of",
+                "csv=p=0",
                 vid_path,
             ]
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
                 n_vid_frames = int(result.stdout.strip())
-                if n_vid_frames != expected_len:
-                    print(f"  [FAIL] {cam_key} ep{ep_idx}: video has {n_vid_frames} frames, expected {expected_len}")
+                if n_vid_frames != expected_total:
+                    ep_ids = ",".join(str(r[0]) for r in refs[:5]) + ("..." if len(refs) > 5 else "")
+                    print(
+                        f"  [FAIL] {cam_key}: {os.path.basename(vid_path)} has {n_vid_frames} frames, expected {expected_total} "
+                        f"(referenced by episodes {ep_ids})"
+                    )
                     ok = False
             except Exception as e:
                 print(f"  [WARN] Could not count frames for {vid_path}: {e}")

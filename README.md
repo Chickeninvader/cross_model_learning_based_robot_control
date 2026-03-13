@@ -112,11 +112,10 @@ python src/data_collection/convert_rlbench_to_lerobot.py \
     --fps 20
 ```
 
-### Convert All Variations + Merge
+### Convert All Variations
 
 When `--variation` is omitted, the script converts **every** variation found
-under `datasets/rlbench/<task_name>/` and then automatically **merges** them
-into a single `<task_name>_all` dataset:
+under `datasets/rlbench/<task_name>/` and writes **one dataset per variation**:
 
 ```bash
 python src/data_collection/convert_rlbench_to_lerobot.py \
@@ -126,30 +125,56 @@ python src/data_collection/convert_rlbench_to_lerobot.py \
     --fps 20
 ```
 
-This produces:
+This produces (per-variation only):
 
 ```
 datasets/lerobot/
 ├── put_rubbish_in_bin_variation0/   # per-variation dataset
 ├── put_rubbish_in_bin_variation1/
 ├── …
+```
+
+### Convert All Variations + Merge (opt-in)
+
+Add `--merge` to also produce a single merged dataset `<task_name>_all`.
+In the merged dataset, each camera is stored as a **single video file**:
+`videos/<video_key>/chunk-000/file-000.mp4`, with episode segments defined by
+`from_timestamp` / `to_timestamp` in `meta/episodes/...`.
+
+```bash
+python src/data_collection/convert_rlbench_to_lerobot.py \
+    --task_name put_rubbish_in_bin \
+    --rlbench_root datasets/rlbench \
+    --output_root datasets/lerobot \
+    --fps 20 \
+    --merge
+```
+
+This produces:
+
+```
+datasets/lerobot/
+├── put_rubbish_in_bin_variation0/
+├── put_rubbish_in_bin_variation1/
+├── …
 └── put_rubbish_in_bin_all/          # merged dataset (all variations)
 ```
 
-Use `--no_merge` to skip the merge step and only produce per-variation datasets.
+`--no_merge` is kept for backward compatibility (no-merge is now the default).
 
 #### Arguments
 
 | Argument | Default | Description |
 |---|---|---|
 | `--task_name` | *(required)* | RLBench task name, e.g. `stack_cups` |
-| `--variation` | *(all)* | Variation number. Omit to process all and merge. |
+| `--variation` | *(all)* | Variation number. Omit to process all variations. |
 | `--rlbench_root` | `datasets/rlbench` | Root directory of RLBench datasets |
 | `--output_root` | `datasets/lerobot` | Root directory for output LeRobot datasets |
 | `--fps` | `20` | Frames per second for output videos |
 | `--episode` | `0` | Episode index inside the RLBench variation directory |
 | `--use_context_prompt` | `false` | Prepend ConceptGraphs context to task descriptions |
-| `--no_merge` | `false` | Skip auto-merge when processing all variations |
+| `--merge` | `false` | Merge all variations into `<task_name>_all` |
+| `--no_merge` | `false` | *(deprecated)* kept for backward compatibility |
 
 ### LeRobot Dataset Structure (Output)
 

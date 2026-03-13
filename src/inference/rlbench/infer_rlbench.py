@@ -9,8 +9,8 @@ The script:
   1. Launches RLBench in headless mode.
   2. Resets the requested task + variation.
   3. Runs a policy (dummy / random / LeRobot) for N steps.
-  4. Records every observation (all cameras + low-dim) exactly like
-     dataset_generator.py so the output can be fed back into the pipeline.
+    4. Records every observation (front + wrist cameras + low-dim) so the
+         output can be fed back into the pipeline.
 
 Usage (dummy / random actions):
     python src/inference/rlbench/infer_rlbench.py \
@@ -54,7 +54,7 @@ _project_root = Path(__file__).parent.parent.parent.parent
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from src.utils.rlbench_utils import delta_action_to_absolute
+from src.utils.rlbench_utils import delta_action_to_absolute, images_to_video
 from PIL import Image
 
 # ---------------------------------------------------------------------------
@@ -348,16 +348,11 @@ def save_observations(observations: list, save_dir: str):
         <save_dir>/
             front_rgb/0.png, 1.png, …
             wrist_rgb/…
-            front_depth/…   (float→RGB encoded)
-            front_mask/…    (uint8)
-            … (all 5 cameras × 3 modalities)
+            front_rgb.mp4, wrist_rgb.mp4
             low_dim_obs.pkl
     """
 
     cam_specs = [
-        ("left_shoulder",  LEFT_SHOULDER_RGB_FOLDER,  LEFT_SHOULDER_DEPTH_FOLDER,  LEFT_SHOULDER_MASK_FOLDER),
-        ("right_shoulder", RIGHT_SHOULDER_RGB_FOLDER, RIGHT_SHOULDER_DEPTH_FOLDER, RIGHT_SHOULDER_MASK_FOLDER),
-        ("overhead",       OVERHEAD_RGB_FOLDER,       OVERHEAD_DEPTH_FOLDER,       OVERHEAD_MASK_FOLDER),
         ("wrist",          WRIST_RGB_FOLDER,          WRIST_DEPTH_FOLDER,          WRIST_MASK_FOLDER),
         ("front",          FRONT_RGB_FOLDER,          FRONT_DEPTH_FOLDER,          FRONT_MASK_FOLDER),
     ]
@@ -403,6 +398,30 @@ def save_observations(observations: list, save_dir: str):
     with open(os.path.join(save_dir, LOW_DIM_PICKLE), "wb") as f:
         pickle.dump(observations, f)
 
+    # Encode quick preview videos (RGB only) for front + wrist.
+    # Uses the same ffmpeg-based helper as the RLBench→LeRobot converter.
+    n_frames = len(observations)
+    if n_frames > 0:
+        frame_start, frame_end = 0, n_frames - 1
+        video_fps = 10
+        video_codec = "libopenh264"
+        video_pix_fmt = "yuv420p"
+        for cam_name, rgb_folder, _, _ in cam_specs:
+            rgb_dir = os.path.join(save_dir, rgb_folder)
+            video_out = os.path.join(save_dir, f"{rgb_folder}.mp4")
+            try:
+                images_to_video(
+                    rgb_dir,
+                    video_out,
+                    frame_start=frame_start,
+                    frame_end=frame_end,
+                    fps=video_fps,
+                    codec=video_codec,
+                    pix_fmt=video_pix_fmt,
+                )
+            except Exception as exc:  # nosec: B110
+                print(f"  Warning: failed to create video for {rgb_folder}: {exc}")
+
     print(f"  Saved {len(observations)} observations → {save_dir}")
 
 
@@ -434,39 +453,28 @@ def build_policy(args) -> Policy:
 def run_inference(args):
     img_size = list(args.image_size)
 
-    # ---- Observation config (record everything) ----
+    # ---- Observation config (front + wrist cameras only) ----
     obs_config = ObservationConfig()
-    obs_config.set_all(True)
-    obs_config.right_shoulder_camera.image_size = img_size
-    obs_config.left_shoulder_camera.image_size = img_size
-    obs_config.overhead_camera.image_size = img_size
-    obs_config.wrist_camera.image_size = img_size
-    obs_config.front_camera.image_size = img_size
+    obs_config.set_all_high_dim(False)
+    obs_config.set_all_low_dim(True)
 
-    obs_config.right_shoulder_camera.depth_in_meters = False
-    obs_config.left_shoulder_camera.depth_in_meters = False
-    obs_config.overhead_camera.depth_in_meters = False
-    obs_config.wrist_camera.depth_in_meters = False
-    obs_config.front_camera.depth_in_meters = False
-
-    obs_config.left_shoulder_camera.masks_as_one_channel = False
-    obs_config.right_shoulder_camera.masks_as_one_channel = False
-    obs_config.overhead_camera.masks_as_one_channel = False
-    obs_config.wrist_camera.masks_as_one_channel = False
-    obs_config.front_camera.masks_as_one_channel = False
+    for cam in [obs_config.wrist_camera, obs_config.front_camera]:
+        # RGB-only recording (matches convert_rlbench_to_lerobot.py expectations)
+        cam.set_all(False)
+        cam.rgb = True
+        cam.depth = False
+        cam.mask = False
+        cam.point_cloud = False
+        cam.image_size = img_size
+        cam.depth_in_meters = False
+        cam.masks_as_one_channel = False
 
     if args.renderer == "opengl3":
-        for cam in [obs_config.right_shoulder_camera,
-                    obs_config.left_shoulder_camera,
-                    obs_config.overhead_camera,
-                    obs_config.wrist_camera,
+        for cam in [obs_config.wrist_camera,
                     obs_config.front_camera]:
             cam.render_mode = RenderMode.OPENGL3
     elif args.renderer == "opengl":
-        for cam in [obs_config.right_shoulder_camera,
-                    obs_config.left_shoulder_camera,
-                    obs_config.overhead_camera,
-                    obs_config.wrist_camera,
+        for cam in [obs_config.wrist_camera,
                     obs_config.front_camera]:
             cam.render_mode = RenderMode.OPENGL
 
@@ -569,7 +577,7 @@ def parse_args():
                    help="Task variation index (default: 0).")
     p.add_argument("--episodes", type=int, default=1,
                    help="Number of episodes to run.")
-    p.add_argument("--max_steps", type=int, default=100,
+    p.add_argument("--max_steps", type=int, default=300,
                    help="Max steps per episode before stopping.")
 
     p.add_argument("--policy", type=str, default="dummy",
