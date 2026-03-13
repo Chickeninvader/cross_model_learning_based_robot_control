@@ -599,6 +599,32 @@ def _set_policy_task_description(policy: Policy, task_description: str) -> None:
         setattr(policy, "task_description", task_description)
 
 
+def _eef_pose_change(prev_obs: Observation, curr_obs: Observation) -> tuple[float, float]:
+    """Return (position_delta_m, rotation_delta_rad) between two RLBench observations."""
+    prev_pose = np.asarray(prev_obs.gripper_pose, dtype=np.float64).reshape(-1)
+    curr_pose = np.asarray(curr_obs.gripper_pose, dtype=np.float64).reshape(-1)
+    if prev_pose.shape[0] < 7 or curr_pose.shape[0] < 7:
+        raise ValueError("Expected gripper_pose to have 7 elements (xyz + quat).")
+
+    pos_delta = float(np.linalg.norm(curr_pose[:3] - prev_pose[:3]))
+
+    q_prev = prev_pose[3:7]
+    q_curr = curr_pose[3:7]
+    q_prev_norm = np.linalg.norm(q_prev)
+    q_curr_norm = np.linalg.norm(q_curr)
+    if q_prev_norm < 1e-12 or q_curr_norm < 1e-12:
+        rot_delta = 0.0
+    else:
+        q_prev = q_prev / q_prev_norm
+        q_curr = q_curr / q_curr_norm
+        dot = float(np.dot(q_prev, q_curr))
+        dot = abs(dot)  # q and -q represent the same rotation
+        dot = max(-1.0, min(1.0, dot))
+        rot_delta = float(2.0 * np.arccos(dot))
+
+    return pos_delta, rot_delta
+
+
 def run_inference(args):
     img_size = list(args.image_size)
 
@@ -692,15 +718,20 @@ def run_inference(args):
         success = False
 
         global_step = 0
+        terminate = False
+        stall_eps_rot_rad = float(np.deg2rad(args.stall_eps_rot_deg))
         for step_idx, step_task in enumerate(task_steps):
             _set_policy_task_description(policy, step_task)
             policy.reset()
+
+            stall_count = 0
 
             if len(task_steps) > 1:
                 print(f"\n  --- Instruction {step_idx + 1}/{len(task_steps)} ---")
                 print(f"  {step_task}")
 
             for phase_step in range(args.max_steps):
+                step_id = global_step
                 action = policy.predict(observations[-1])
 
                 # action[:7] = absolute EEF target pose (delta→absolute already
@@ -709,7 +740,7 @@ def run_inference(args):
                     obs, reward, terminate = task_env.step(action)
                 except Exception as e:
                     print(
-                        f"  Step {global_step} (phase_step={phase_step}): action failed ({e}), stopping episode."
+                        f"  Step {step_id} (phase_step={phase_step}): action failed ({e}), stopping episode."
                     )
                     terminate = True
                     reward = 0.0
@@ -724,12 +755,46 @@ def run_inference(args):
 
                 if terminate or success:
                     print(
-                        f"  Step {global_step}: task {'succeeded' if success else 'terminated'}!"
+                        f"  Step {step_id}: task {'succeeded' if success else 'terminated'}!"
                     )
+                    global_step += 1
                     break
 
-                if ((global_step + 1) % 20) == 0:
-                    print(f"  Step {global_step}: reward={total_reward:.2f}")
+                # Stall heuristic: if EEF pose doesn't change for N steps,
+                # assume the current instruction is complete and move on.
+                if obs is not None and args.stall_steps > 0 and len(observations) >= 2:
+                    try:
+                        pos_delta, rot_delta = _eef_pose_change(observations[-2], observations[-1])
+                    except Exception:
+                        pos_delta, rot_delta = float("inf"), float("inf")
+
+                    if pos_delta < args.stall_eps_pos and rot_delta < stall_eps_rot_rad:
+                        stall_count += 1
+                    else:
+                        stall_count = 0
+
+                    if stall_count >= args.stall_steps:
+                        rot_deg = float(np.rad2deg(rot_delta))
+                        if step_idx < (len(task_steps) - 1):
+                            print(
+                                "  Stall detected "
+                                f"(Δpos={pos_delta:.6f} m, Δrot={rot_deg:.3f} deg) "
+                                f"for {stall_count} steps — advancing to next instruction."
+                            )
+                            global_step += 1
+                            break
+                        else:
+                            print(
+                                "  Stall detected "
+                                f"(Δpos={pos_delta:.6f} m, Δrot={rot_deg:.3f} deg) "
+                                f"for {stall_count} steps — stopping episode."
+                            )
+                            terminate = True
+                            global_step += 1
+                            break
+
+                if ((step_id + 1) % 20) == 0:
+                    print(f"  Step {step_id}: reward={total_reward:.2f}")
                 global_step += 1
 
             if terminate or success:
@@ -779,6 +844,17 @@ def parse_args():
                     ))
     p.add_argument("--device", type=str, default=None,
                    help="Torch device for policy inference (default: auto).")
+
+    p.add_argument("--stall_steps", type=int, default=0,
+                   help=(
+                        "Stall heuristic (0 disables). If > 0, consider the current instruction complete when the EEF pose "
+                        "change stays below thresholds for this many consecutive steps. For multi-instruction prompts, this advances "
+                        "to the next instruction; for the last instruction it stops the episode."
+                   ))
+    p.add_argument("--stall_eps_pos", type=float, default=0.0005,
+                   help="Position change threshold in meters for stall detection (default: 5e-4).")
+    p.add_argument("--stall_eps_rot_deg", type=float, default=1.0,
+                   help="Rotation change threshold in degrees for stall detection (default: 1.0).")
 
     p.add_argument("--image_size", nargs=2, type=int, default=[256, 256],
                    help="Image resolution (H W).")

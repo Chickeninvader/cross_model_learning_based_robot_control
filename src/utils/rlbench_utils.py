@@ -267,7 +267,7 @@ def compute_episode_boundaries(
     episodes = []
     for i in range(len(transitions)):
         start = boundaries[i]
-        end = boundaries[i + 1] - 1       # inclusive last frame of this segment
+        end = min(boundaries[i + 1] + 1, last_frame)       
         # begin_sg = relationship state of the segment (before the transition)
         begin_sg = transitions[i]["from_rels"]
         # end_sg = relationship state after the transition (the goal)
