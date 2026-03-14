@@ -9,9 +9,16 @@ Usage
 -----
     python scripts/parquet_to_csv.py --task stack_cups --lerobot-root datasets/lerobot --output-dir output/csv
 
-The script will process all variations found for the task (e.g., stack_cups_variation0,
-stack_cups_variation1, etc.). If no per-variation folders exist, it falls back to a
-merged dataset folder (e.g., stack_cups_all).
+The script expects the merged dataset layout produced by
+`src/data_collection/convert_rlbench_to_lerobot.py`:
+
+    datasets/lerobot/<task>_eef/
+    datasets/lerobot/<task>_joint/
+
+By default it processes both (EEF + joint). Use `--action_space` to export only one.
+
+Backward-compatibility: if the new folders are not found, it will fall back to
+older layouts like `<task>_variation*` or `<task>_all` when present.
 
 It converts:
     - data/chunk-*/file-*.parquet
@@ -21,7 +28,7 @@ It converts:
 Output structure:
     output/csv/
     └── stack_cups/
-        ├── variation0/
+        ├── eef/
         │   ├── data/
         │   │   └── chunk-000/
         │   │       └── file-000.csv
@@ -30,7 +37,7 @@ Output structure:
         │       │   └── chunk-000/
         │       │       └── file-000.csv
         │       └── tasks.csv
-        └── variation1/
+        └── joint/
             └── ...
 """
 
@@ -57,7 +64,7 @@ def find_parquet_files(root_dir: Path) -> list[Path]:
     return sorted(root_dir.rglob("*.parquet"))
 
 
-def convert_parquet_to_csv(parquet_path: Path, output_path: Path) -> None:
+def convert_parquet_to_csv(parquet_path: Path, output_path: Path, *, display_root: Path | None = None) -> None:
     """Convert a single parquet file to CSV.
     
     Parameters
@@ -75,27 +82,34 @@ def convert_parquet_to_csv(parquet_path: Path, output_path: Path) -> None:
     
     # Save as CSV
     df.to_csv(output_path, index=False)
-    print(f"  ✓ {parquet_path.relative_to(parquet_path.parents[3])} -> {output_path.name}")
+    if display_root is not None:
+        try:
+            src_disp = parquet_path.relative_to(display_root)
+        except Exception:
+            src_disp = parquet_path
+    else:
+        src_disp = parquet_path
+    print(f"  ✓ {src_disp} -> {output_path}")
 
 
-def process_variation(
-    variation_dir: Path,
+def process_dataset(
+    dataset_dir: Path,
     output_dir: Path,
     task_name: str,
-    variation: str,
+    dataset_tag: str,
 ) -> int:
-    """Process all parquet files in a variation directory.
+    """Process all parquet files in a dataset directory.
     
     Parameters
     ----------
-    variation_dir : Path
-        Path to variation directory (e.g., datasets/lerobot/stack_cups_variation0).
+    dataset_dir : Path
+        Path to a LeRobot dataset directory (e.g., datasets/lerobot/stack_cups_eef).
     output_dir : Path
         Root output directory for CSV files.
     task_name : str
         Task name (e.g., "stack_cups").
-    variation : str
-        Variation name (e.g., "variation0").
+    dataset_tag : str
+        Output tag under `output_dir/<task_name>/...` (e.g., "eef" or "joint").
         
     Returns
     -------
@@ -104,27 +118,27 @@ def process_variation(
     """
     # Find all parquet files (excluding videos)
     parquet_files = [
-        f for f in find_parquet_files(variation_dir)
+        f for f in find_parquet_files(dataset_dir)
         if "videos" not in f.parts  # Skip video metadata if any
     ]
     
     if not parquet_files:
-        print(f"  [WARN] No parquet files found in {variation_dir}")
+        print(f"  [WARN] No parquet files found in {dataset_dir}")
         return 0
     
-    print(f"  [INFO] Found {len(parquet_files)} parquet files in {variation}")
+    print(f"  [INFO] Found {len(parquet_files)} parquet files in {dataset_tag}")
     
     # Convert each parquet file
     for parquet_path in parquet_files:
-        # Compute relative path from variation directory
-        rel_path = parquet_path.relative_to(variation_dir)
+        # Compute relative path from dataset directory
+        rel_path = parquet_path.relative_to(dataset_dir)
         
         # Create corresponding CSV path
         csv_rel_path = rel_path.with_suffix(".csv")
-        csv_output_path = output_dir / task_name / variation / csv_rel_path
+        csv_output_path = output_dir / task_name / dataset_tag / csv_rel_path
         
         # Convert
-        convert_parquet_to_csv(parquet_path, csv_output_path)
+        convert_parquet_to_csv(parquet_path, csv_output_path, display_root=dataset_dir)
     
     return len(parquet_files)
 
@@ -138,8 +152,7 @@ def main():
         type=str,
         required=True,
         help=(
-            "Base task name (e.g., 'stack_cups'). Will process all <task>_variation* datasets found. "
-            "If none exist, will process <task>_all if present."
+            "Base task name (e.g., 'stack_cups'). Will process <task>_eef and/or <task>_joint under --lerobot-root."
         ),
     )
     parser.add_argument(
@@ -155,68 +168,81 @@ def main():
         help="Output directory for CSV files (default: scripts/parquet_to_csv).",
     )
     parser.add_argument(
+        "--action_space",
+        type=str,
+        default="both",
+        choices=["eef", "joint", "both"],
+        help="Which dataset(s) to convert (default: both).",
+    )
+    parser.add_argument(
         "--variation",
         type=int,
         default=None,
-        help="Process only a specific variation number (optional).",
+        help="DEPRECATED: variation datasets are no longer produced; kept for backward compatibility.",
     )
     
     args = parser.parse_args()
-    
-    # Find all per-variation directories for this task
-    task_pattern = f"{args.task}_variation*"
-    variation_dirs = sorted(d for d in args.lerobot_root.glob(task_pattern) if d.is_dir())
 
-    # If no variations exist, fall back to a merged dataset folder (<task>_all)
-    # or to an exact dataset folder name (<task>) if the user passed it.
-    merged_dir = args.lerobot_root / f"{args.task}_all"
-    exact_dir = args.lerobot_root / args.task
-    if not variation_dirs and merged_dir.is_dir():
-        variation_dirs = [merged_dir]
-    elif not variation_dirs and exact_dir.is_dir():
-        variation_dirs = [exact_dir]
-
-    if not variation_dirs:
-        print(f"[ERROR] No datasets found for task '{args.task}' in {args.lerobot_root}")
-        print(f"        Looking for pattern: {task_pattern}")
-        print(f"        Or merged dataset:  {args.task}_all")
-        return 1
-    
-    # Filter by specific variation if requested (only applies to <task>_variationN)
     if args.variation is not None:
-        requested = f"{args.task}_variation{args.variation}"
-        variation_dirs = [d for d in variation_dirs if d.name == requested]
-        if not variation_dirs:
-            print(f"[ERROR] Variation {args.variation} not found for task '{args.task}'")
-            if merged_dir.is_dir():
-                print(f"        Note: a merged dataset exists at {merged_dir.name} (no variations).")
-            return 1
+        print("[WARN] --variation is deprecated and ignored for <task>_eef/<task>_joint datasets.")
     
-    print(f"[INFO] Found {len(variation_dirs)} variation(s) for task '{args.task}':")
-    for vdir in variation_dirs:
-        print(f"       - {vdir.name}")
+    dataset_dirs: list[Path] = []
+
+    # New layout: <task>_eef and <task>_joint
+    eef_dir = args.lerobot_root / f"{args.task}_eef"
+    joint_dir = args.lerobot_root / f"{args.task}_joint"
+    if args.action_space in {"eef", "both"} and eef_dir.is_dir():
+        dataset_dirs.append(eef_dir)
+    if args.action_space in {"joint", "both"} and joint_dir.is_dir():
+        dataset_dirs.append(joint_dir)
+
+    # Backward compatibility: older layouts
+    if not dataset_dirs:
+        variation_dirs = sorted(args.lerobot_root.glob(f"{args.task}_variation*"))
+        variation_dirs = [d for d in variation_dirs if d.is_dir()]
+        if variation_dirs:
+            dataset_dirs = variation_dirs
+
+    if not dataset_dirs:
+        merged_dir = args.lerobot_root / f"{args.task}_all"
+        if merged_dir.is_dir():
+            dataset_dirs = [merged_dir]
+
+    if not dataset_dirs:
+        exact_dir = args.lerobot_root / args.task
+        if exact_dir.is_dir():
+            dataset_dirs = [exact_dir]
+
+    if not dataset_dirs:
+        print(f"[ERROR] No datasets found for task '{args.task}' under {args.lerobot_root}")
+        print(f"        Expected: {eef_dir} and/or {joint_dir}")
+        return 1
+
+    print(f"[INFO] Found {len(dataset_dirs)} dataset(s) for task '{args.task}':")
+    for d in dataset_dirs:
+        print(f"       - {d.name}")
     print()
     
-    # Process each variation
+    # Process each dataset
     total_files = 0
-    for variation_dir in variation_dirs:
-        # Keep existing output layout: output/<task>/<variation>/...
-        # For merged datasets (<task>_all), use variation name "all".
-        if variation_dir.name == f"{args.task}_all":
-            variation_name = "all"
-        elif variation_dir.name == args.task:
-            variation_name = "merged"
+    for dataset_dir in dataset_dirs:
+        # New scheme: eef/joint tag from suffix
+        if dataset_dir.name.endswith("_eef"):
+            tag = "eef"
+        elif dataset_dir.name.endswith("_joint"):
+            tag = "joint"
+        elif dataset_dir.name == f"{args.task}_all":
+            tag = "all"
         else:
-            variation_name = variation_dir.name.replace(f"{args.task}_", "")
-            if not variation_name:
-                variation_name = "merged"
-        print(f"[INFO] Processing {variation_name}...")
+            tag = dataset_dir.name.replace(f"{args.task}_", "") or "merged"
+
+        print(f"[INFO] Processing {tag}...")
         
-        n_files = process_variation(
-            variation_dir,
+        n_files = process_dataset(
+            dataset_dir,
             args.output_dir,
             args.task,
-            variation_name,
+            tag,
         )
         total_files += n_files
         print()

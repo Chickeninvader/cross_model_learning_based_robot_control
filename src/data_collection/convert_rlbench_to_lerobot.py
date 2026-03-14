@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-Convert an RLBench dataset (one variation of one task) into LeRobot v3 format
-**compatible with the GR00T (N1.5) policy**.
+Convert RLBench variations into **LeRobot v3 datasets** in two action spaces:
+
+- **EEF dataset**: `observation.state` + `action` (delta EEF)
+- **Joint dataset**: `observation.joint_state` + `action` (joint velocity)
+
+The CLI produces merged outputs (no per-variation folders) named:
+
+- `datasets/lerobot/<task_name>_eef/`
+- `datasets/lerobot/<task_name>_joint/`
 
 Key differences from the original converter
 --------------------------------------------
@@ -22,7 +29,6 @@ Usage
 -----
     python src/data_collection/convert_rlbench_to_lerobot.py \\
         --task_name stack_cups \\
-        --variation 0 \\
         --rlbench_root datasets/rlbench \\
         --output_root datasets/lerobot \\
         --fps 10
@@ -35,14 +41,16 @@ The script reads:
         <task_name>_scene_graph.json
         object_color_map.json
 
-And writes a LeRobot-v3 / GR00T-compatible dataset to:
-    datasets/lerobot/<task_name>_variation<num>/
+And writes merged LeRobot-v3 datasets to:
+    datasets/lerobot/<task_name>_eef/
+    datasets/lerobot/<task_name>_joint/
 """
 
 import argparse
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -55,17 +63,17 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 import re
-import shutil
 
 from src.utils.rlbench_utils import (
     build_episode_stats_groot,
-    compute_eef_actions,
     compute_delta_eef_actions,
+    compute_joint_velocity_actions,
     compute_episode_boundaries,
     compute_feature_stats_groot,
     compute_image_stats_placeholder,
     compute_bool_stats_groot,
     extract_eef_state,
+    extract_joint_state,
     find_transitions,
     images_to_video,
     load_rlbench_demo,
@@ -99,8 +107,9 @@ def convert(
     fps: int = 10,
     episode_index_in_rlbench: int = 0,
     use_context_prompt: bool = False,
+    action_space: str = "eef",
 ):
-    """Convert one RLBench variation into GR00T-compatible LeRobot v3 format.
+    """Convert one RLBench variation into a LeRobot v3 dataset.
 
     Parameters
     ----------
@@ -119,6 +128,10 @@ def convert(
     use_context_prompt : bool
         If True, prepend the full ConceptGraphs-style scene context to each
         task description.  Default False (concise imperative only).
+    action_space : str
+        Which control/action space to export:
+          - "eef"   : observation.state + action (delta EEF)  [x y z qx qy qz qw gripper]
+          - "joint" : observation.joint_state + action (joint velocity) [q0..q6 gripper]
     """
     # -- Paths ---------------------------------------------------------------
     var_dir = os.path.join(rlbench_root, task_name, f"variation{variation}")
@@ -158,10 +171,26 @@ def convert(
         print(f"       Episode {_ei}: frames {_ep['start_frame']}-{_ep['end_frame']} "
               f"({_ep['end_frame'] - _ep['start_frame'] + 1} frames)")
 
-    # Pre-compute ALL EEF states for the full observation list
-    all_states = np.stack([extract_eef_state(o) for o in observations], axis=0)  # (n_obs, 8)
-    # NOTE: Delta actions are computed per-episode below (not globally),
-    # because global deltas would be wrong at episode boundaries.
+    action_space = (action_space or "eef").strip().lower()
+    if action_space not in {"eef", "joint"}:
+        raise ValueError(f"Unknown action_space: {action_space}. Expected 'eef' or 'joint'.")
+
+    # Pre-compute ALL states for the full observation list
+    if action_space == "eef":
+        state_feature_name = "observation.state"
+        all_states = np.stack([extract_eef_state(o) for o in observations], axis=0)  # (n_obs, 8)
+
+        def _compute_actions(obs_slice: list) -> np.ndarray:
+            return compute_delta_eef_actions(obs_slice)
+    else:
+        state_feature_name = "observation.joint_state"
+        all_states = np.stack([extract_joint_state(o) for o in observations], axis=0)  # (n_obs, 8)
+
+        def _compute_actions(obs_slice: list) -> np.ndarray:
+            return compute_joint_velocity_actions(obs_slice, fps=fps)
+
+    # NOTE: actions are computed per-episode below (not globally),
+    # because relative actions would be wrong at episode boundaries.
 
     objects_meta = scene_graph.get("objects", {})
 
@@ -216,9 +245,9 @@ def convert(
 
         ep_states = all_states[obs_start : obs_end + 1]
 
-        # Compute delta actions WITHIN this episode only (not globally)
+        # Compute actions WITHIN this episode only (not globally)
         ep_obs_slice = observations[obs_start : obs_end + 1]
-        ep_actions = compute_delta_eef_actions(ep_obs_slice)  # (n_obs_frames, 8)
+        ep_actions = _compute_actions(ep_obs_slice)  # (n_obs_frames, 8)
 
         # Safety: if episode boundary extends past obs range, pad/trim
         if n_obs_frames < n_frames:
@@ -234,7 +263,8 @@ def convert(
               f"n_frames={n_frames}, padded={max(0, n_frames - n_obs_frames)}")
         if n_obs_frames > 0:
             print(f"    gripper[first]={ep_states[0, 7]:.1f}, gripper[last]={ep_states[min(n_obs_frames, n_frames)-1, 7]:.1f}")
-            print(f"    action delta_pos range: {ep_actions[:, :3].min(0)} to {ep_actions[:, :3].max(0)}")
+            a_label = "delta_pos" if action_space == "eef" else "joint_vel"
+            print(f"    action {a_label} range: {ep_actions[:, :3].min(0)} to {ep_actions[:, :3].max(0)}")
 
         # -- Create videos (RGB only, no mask) -------------------------------
         chunk_idx = 0
@@ -265,8 +295,8 @@ def convert(
         validity_indices = np.full(n_frames, validity_idx, dtype=np.int64)
 
         for i in range(n_frames):
-            parquet_rows.append({
-                "observation.state": ep_states[i].tolist(),
+            row = {
+                state_feature_name: ep_states[i].tolist(),
                 "action": ep_actions[i].tolist(),
                 "timestamp": float(timestamps[i]),
                 "annotation.human.action.task_description": int(task_desc_indices[i]),
@@ -277,7 +307,8 @@ def convert(
                 "index": int(global_indices[i]),
                 "next.reward": float(rewards[i]),
                 "next.done": bool(done_flags[i]),
-            })
+            }
+            parquet_rows.append(row)
 
         # -- Episode metadata row --------------------------------------------
         ep_duration = n_frames / fps
@@ -316,6 +347,8 @@ def convert(
             validity_indices=validity_indices,
             camera_names=camera_names,
             n_camera_frames=[n_frames] * len(camera_names),
+            state_feature_name=state_feature_name,
+            action_feature_name="action",
         )
         ep_meta.update(ep_stats)
         episode_meta_rows.append(ep_meta)
@@ -389,17 +422,21 @@ def convert(
             },
         }
 
-    # State / action motor names (EEF)
-    state_motor_names = [
-        "eef_x", "eef_y", "eef_z",
-        "eef_qx", "eef_qy", "eef_qz", "eef_qw",
-        "gripper_open",
-    ]
-    action_motor_names = [
-        "delta_eef_x", "delta_eef_y", "delta_eef_z",
-        "delta_eef_qx", "delta_eef_qy", "delta_eef_qz", "delta_eef_qw",
-        "gripper_open",
-    ]
+    # State / action motor names
+    if action_space == "eef":
+        state_motor_names = [
+            "eef_x", "eef_y", "eef_z",
+            "eef_qx", "eef_qy", "eef_qz", "eef_qw",
+            "gripper_open",
+        ]
+        action_motor_names = [
+            "delta_eef_x", "delta_eef_y", "delta_eef_z",
+            "delta_eef_qx", "delta_eef_qy", "delta_eef_qz", "delta_eef_qw",
+            "gripper_open",
+        ]
+    else:
+        state_motor_names = [f"joint_{i}" for i in range(7)] + ["gripper_open"]
+        action_motor_names = [f"joint_vel_{i}" for i in range(7)] + ["gripper_open"]
 
     info = {
         "codebase_version": "v3.0",
@@ -413,7 +450,7 @@ def convert(
         "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
         "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
         "features": {
-            "observation.state": {
+            state_feature_name: {
                 "dtype": "float32",
                 "shape": [8],
                 "names": state_motor_names,
@@ -488,17 +525,9 @@ def convert(
     # =======================================================================
     # Write meta/stats.json  (global stats -- GR00T format)
     # =======================================================================
-    cat_states_list = []
-    cat_actions_list = []
-    for ep in episodes:
-        s = max(0, ep["start_frame"])
-        e = min(n_obs, ep["end_frame"] + 1)
-        cat_states_list.append(all_states[s:e])
-        cat_actions_list.append(compute_delta_eef_actions(observations[s:e]))
-    cat_states = np.concatenate(cat_states_list, axis=0)
-    cat_actions = np.concatenate(cat_actions_list, axis=0)
-
     # Rebuild global arrays from parquet data for exact consistency
+    all_state_arr = np.stack([r[state_feature_name] for r in parquet_rows], axis=0).astype(np.float64)
+    all_action_arr = np.stack([r["action"] for r in parquet_rows], axis=0).astype(np.float64)
     all_timestamps = np.array([r["timestamp"] for r in parquet_rows], dtype=np.float64)
     all_task_idx = np.array([r["task_index"] for r in parquet_rows], dtype=np.float64)
     all_ep_idx = np.array([r["episode_index"] for r in parquet_rows], dtype=np.float64)
@@ -511,8 +540,8 @@ def convert(
 
     stats: Dict[str, Any] = {}
     stats_map = {
-        "observation.state": cat_states.astype(np.float64),
-        "action": cat_actions.astype(np.float64),
+        state_feature_name: all_state_arr,
+        "action": all_action_arr,
         "timestamp": all_timestamps.reshape(-1, 1),
         "annotation.human.action.task_description": all_desc_idx.reshape(-1, 1),
         "task_index": all_task_idx.reshape(-1, 1),
@@ -537,7 +566,7 @@ def convert(
         json.dump(stats, f, indent=4)
     print(f"[INFO] Wrote {stats_path}")
 
-    print(f"\n[DONE] GR00T-compatible dataset '{dataset_name}' written to {out_dir}")
+    print(f"\n[DONE] Dataset '{dataset_name}' (action_space={action_space}) written to {out_dir}")
     print(f"       {n_episodes} episodes, {total_frames} total frames, {fps} fps")
     print(f"       Tasks: {all_task_strings}")
     return out_dir
@@ -886,19 +915,33 @@ def merge_all_variations(
 
     # -- Write meta/stats.json -----------------------------------------------
     stats: Dict[str, Any] = {}
-    for feat_name in ["observation.state", "action"]:
-        arr = np.stack(merged_data[feat_name].values).astype(np.float64)
+    for feat_name, feat_spec in (ref_info.get("features") or {}).items():
+        dtype = (feat_spec or {}).get("dtype")
+        if dtype == "video":
+            stats[feat_name] = compute_image_stats_placeholder(total_frames)
+            continue
+
+        if feat_name not in merged_data.columns:
+            continue
+
+        if dtype == "bool":
+            stats[feat_name] = compute_bool_stats_groot(merged_data[feat_name].values)
+            continue
+
+        shape = (feat_spec or {}).get("shape", [1])
+        is_vector = False
+        try:
+            if isinstance(shape, list) and len(shape) > 0 and int(shape[0]) > 1:
+                is_vector = True
+        except Exception:
+            is_vector = False
+
+        if is_vector:
+            arr = np.stack(merged_data[feat_name].values).astype(np.float64)
+        else:
+            arr = merged_data[feat_name].values.astype(np.float64).reshape(-1, 1)
         stats[feat_name] = compute_feature_stats_groot(arr)
-    for col in [
-        "timestamp", "annotation.human.action.task_description", "task_index",
-        "annotation.human.action.task_name", "annotation.human.validity",
-        "episode_index", "index", "next.reward",
-    ]:
-        arr = merged_data[col].values.astype(np.float64).reshape(-1, 1)
-        stats[col] = compute_feature_stats_groot(arr)
-    stats["next.done"] = compute_bool_stats_groot(merged_data["next.done"].values)
-    for cam_key in camera_keys:
-        stats[cam_key] = compute_image_stats_placeholder(total_frames)
+
     with open(os.path.join(meta_dir, "stats.json"), "w") as f:
         json.dump(stats, f, indent=4)
 
@@ -918,14 +961,17 @@ def _load_json(path: str) -> dict:
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Convert an RLBench variation dataset to GR00T-compatible LeRobot v3 format."
+        description=(
+            "Convert RLBench variations to LeRobot v3 and output merged datasets without per-variation folders. "
+            "Produces <task>_eef and/or <task>_joint under --output_root."
+        )
     )
     p.add_argument("--task_name", type=str, required=True,
                    help="RLBench task name, e.g. stack_cups")
     p.add_argument(
         "--variation",
         type=int,
-        help="Variation number. If omitted, processes ALL variations (one dataset per variation).",
+        help="Variation number. If omitted, processes ALL variations.",
     )
     p.add_argument("--rlbench_root", type=str, default="datasets/rlbench",
                    help="Root directory containing RLBench datasets")
@@ -938,60 +984,64 @@ def parse_args():
     p.add_argument("--use_context_prompt", action="store_true",
                    help="Use ConceptGraphs-style context in task descriptions")
     p.add_argument(
-        "--merge",
-        action="store_true",
-        help="When processing ALL variations (no --variation), also merge them into <task_name>_all. "
-             "Merged dataset stores a single video per camera as videos/<key>/chunk-000/file-000.mp4.",
-    )
-    p.add_argument(
-        "--no_merge",
-        action="store_true",
-        help="DEPRECATED: no-merge is now the default; kept for backward compatibility.",
+        "--action_space",
+        type=str,
+        default="both",
+        choices=["eef", "joint", "both"],
+        help="Which dataset(s) to create (default: both).",
     )
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.variation is not None:
-        if getattr(args, "merge", False):
-            raise SystemExit("--merge cannot be used together with --variation")
-        # --- Single variation mode ---
-        convert(
-            task_name=args.task_name,
-            variation=args.variation,
-            rlbench_root=args.rlbench_root,
-            output_root=args.output_root,
-            fps=args.fps,
-            episode_index_in_rlbench=args.episode,
-            use_context_prompt=args.use_context_prompt,
-        )
-        exit(0)
 
-    # --- All-variations mode: convert each, then merge ----------------------
     task_dir = os.path.join(args.rlbench_root, args.task_name)
-    variations = [d for d in os.listdir(task_dir) if d.startswith("variation")]
-    variations = sorted(variations, key=lambda x: int(x.replace("variation", "")))
-    print(f"[INFO] Found variations: {variations}")
-    for var in variations:
-        var_num = int(var.replace("variation", ""))
-        convert(
-            task_name=args.task_name,
-            variation=var_num,
-            rlbench_root=args.rlbench_root,
-            output_root=args.output_root,
-            fps=args.fps,
-            episode_index_in_rlbench=args.episode,
-            use_context_prompt=args.use_context_prompt,
-        )
+    if not os.path.isdir(task_dir):
+        raise SystemExit(f"Task directory not found: {task_dir}")
 
-    if getattr(args, "merge", False) and getattr(args, "no_merge", False):
-        raise SystemExit("--merge and --no_merge are mutually exclusive")
+    if args.variation is not None:
+        variation_nums = [int(args.variation)]
+    else:
+        variations = [d for d in os.listdir(task_dir) if d.startswith("variation")]
+        variations = sorted(variations, key=lambda x: int(x.replace("variation", "")))
+        variation_nums = [int(v.replace("variation", "")) for v in variations]
 
-    # Merge all per-variation datasets into one (opt-in)
-    if getattr(args, "merge", False):
-        merge_all_variations(
-            task_name=args.task_name,
-            input_root=args.output_root,
-            output_root=args.output_root,
-        )
+    if not variation_nums:
+        raise SystemExit(f"No variations found under: {task_dir}")
+
+    action_spaces = ["eef", "joint"] if args.action_space == "both" else [args.action_space]
+
+    os.makedirs(args.output_root, exist_ok=True)
+
+    print(f"[INFO] Variations to process: {variation_nums}")
+    print(f"[INFO] Action spaces to export: {action_spaces}")
+
+    for action_space in action_spaces:
+        final_name = f"{args.task_name}_{action_space}"
+        print(f"\n{'='*60}")
+        print(f"[EXPORT] Building merged dataset: {final_name}")
+        print(f"{'='*60}")
+
+        with tempfile.TemporaryDirectory(
+            prefix=f".{args.task_name}_{action_space}_tmp_",
+            dir=args.output_root,
+        ) as tmp_root:
+            for var_num in variation_nums:
+                convert(
+                    task_name=args.task_name,
+                    variation=var_num,
+                    rlbench_root=args.rlbench_root,
+                    output_root=tmp_root,
+                    fps=args.fps,
+                    episode_index_in_rlbench=args.episode,
+                    use_context_prompt=args.use_context_prompt,
+                    action_space=action_space,
+                )
+
+            merge_all_variations(
+                task_name=args.task_name,
+                input_root=tmp_root,
+                output_root=args.output_root,
+                output_name=final_name,
+            )

@@ -61,6 +61,22 @@ def extract_eef_state(obs) -> np.ndarray:
     return np.append(pose, grip)
 
 
+def extract_joint_state(obs) -> np.ndarray:
+    """Return joint state as float32 array of shape (8,).
+
+    [joint_0..joint_6, gripper_open]
+    """
+    joint_positions = getattr(obs, "joint_positions", None)
+    if joint_positions is None:
+        raise AttributeError("Observation is missing 'joint_positions'.")
+    joints = np.asarray(joint_positions, dtype=np.float32).reshape(-1)
+    if joints.shape[0] != 7:
+        raise ValueError(f"Expected joint_positions to have 7 elements, got {joints.shape[0]}")
+
+    grip = np.float32(getattr(obs, "gripper_open", 0.0))
+    return np.append(joints, grip)
+
+
 def compute_eef_actions(observations: list) -> np.ndarray:
     """Compute actions for every timestep.
 
@@ -73,6 +89,34 @@ def compute_eef_actions(observations: list) -> np.ndarray:
     actions[:-1] = states[1:]
     actions[-1] = states[-1]
     return actions
+
+
+def compute_joint_velocity_actions(observations: list, fps: float) -> np.ndarray:
+    """Compute joint-velocity *commands* for every timestep from joint positions.
+
+    vel[t] = (q[t+1] - q[t]) * fps
+    vel[-1] = 0
+    gripper command follows the same convention as delta EEF actions:
+      action[t, 7] = gripper_open[t+1]  (absolute)
+      action[-1,7] = gripper_open[-1]
+
+    Returns shape (T, 8) float32:
+        [joint_vel_0..joint_vel_6, gripper_open]
+    """
+    states = np.stack([extract_joint_state(o) for o in observations], axis=0)  # (T, 8)
+    T = states.shape[0]
+    actions = np.zeros_like(states, dtype=np.float32)
+    if T == 0:
+        return actions
+
+    dt_fps = np.float32(fps)
+    actions[:-1, :7] = (states[1:, :7] - states[:-1, :7]) * dt_fps
+    actions[-1, :7] = 0.0
+
+    actions[:-1, 7] = states[1:, 7]
+    actions[-1, 7] = states[-1, 7]
+
+    return actions.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +575,9 @@ def build_episode_stats_groot(
     validity_indices: np.ndarray,
     camera_names: List[str],
     n_camera_frames: List[int],
+    *,
+    state_feature_name: str = "observation.state",
+    action_feature_name: str = "action",
 ) -> dict:
     """Return a flat dict of per-episode statistics matching GR00T format.
 
@@ -540,8 +587,8 @@ def build_episode_stats_groot(
     d: Dict[str, Any] = {}
 
     feature_map = {
-        "observation.state": states,
-        "action": actions,
+        state_feature_name: states,
+        action_feature_name: actions,
         "timestamp": timestamps.reshape(-1, 1).astype(np.float64),
         "episode_index": episode_indices.reshape(-1, 1).astype(np.float64),
         "index": global_indices.reshape(-1, 1).astype(np.float64),

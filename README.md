@@ -121,10 +121,18 @@ python src/data_collection/convert_rlbench_to_lerobot.py \
     --fps 20
 ```
 
+This produces merged datasets (even for a single variation):
+
+```
+datasets/lerobot/
+├── stack_cups_eef/
+└── stack_cups_joint/
+```
+
 ### Convert All Variations
 
 When `--variation` is omitted, the script converts **every** variation found
-under `datasets/rlbench/<task_name>/` and writes **one dataset per variation**:
+under `datasets/rlbench/<task_name>/`, merges them, and writes **two datasets**:
 
 ```bash
 python src/data_collection/convert_rlbench_to_lerobot.py \
@@ -134,42 +142,37 @@ python src/data_collection/convert_rlbench_to_lerobot.py \
     --fps 20
 ```
 
-This produces (per-variation only):
+This produces:
 
 ```
 datasets/lerobot/
-├── put_rubbish_in_bin_variation0/   # per-variation dataset
-├── put_rubbish_in_bin_variation1/
-├── …
+├── put_rubbish_in_bin_eef/          # merged EEF-action dataset (all variations)
+└── put_rubbish_in_bin_joint/        # merged joint-velocity dataset (all variations)
 ```
 
-### Convert All Variations + Merge (opt-in)
+The converter uses a temporary directory for intermediate per-variation exports and removes it at the end, so you should not see `*_variation*` folders in `datasets/lerobot/`.
 
-Add `--merge` to also produce a single merged dataset `<task_name>_all`.
-In the merged dataset, each camera is stored as a **single video file**:
-`videos/<video_key>/chunk-000/file-000.mp4`, with episode segments defined by
-`from_timestamp` / `to_timestamp` in `meta/episodes/...`.
+### Export only one action space
+
+By default the script exports **both** datasets. You can export only one:
 
 ```bash
+# EEF delta actions only
 python src/data_collection/convert_rlbench_to_lerobot.py \
     --task_name put_rubbish_in_bin \
     --rlbench_root datasets/rlbench \
     --output_root datasets/lerobot \
     --fps 20 \
-    --merge
-```
+    --action_space eef
 
-This produces:
-
+# Joint velocity actions only
+python src/data_collection/convert_rlbench_to_lerobot.py \
+    --task_name put_rubbish_in_bin \
+    --rlbench_root datasets/rlbench \
+    --output_root datasets/lerobot \
+    --fps 20 \
+    --action_space joint
 ```
-datasets/lerobot/
-├── put_rubbish_in_bin_variation0/
-├── put_rubbish_in_bin_variation1/
-├── …
-└── put_rubbish_in_bin_all/          # merged dataset (all variations)
-```
-
-`--no_merge` is kept for backward compatibility (no-merge is now the default).
 
 #### Arguments
 
@@ -182,13 +185,12 @@ datasets/lerobot/
 | `--fps` | `20` | Frames per second for output videos |
 | `--episode` | `0` | Episode index inside the RLBench variation directory |
 | `--use_context_prompt` | `false` | Prepend ConceptGraphs context to task descriptions |
-| `--merge` | `false` | Merge all variations into `<task_name>_all` |
-| `--no_merge` | `false` | *(deprecated)* kept for backward compatibility |
+| `--action_space` | `both` | Export `eef`, `joint`, or `both` datasets |
 
 ### LeRobot Dataset Structure (Output)
 
 ```
-datasets/lerobot/<task_name>_variation<num>/
+datasets/lerobot/<task_name>_<eef|joint>/
 ├── meta/
 │   ├── info.json              # Dataset metadata, features, splits
 │   ├── stats.json             # Global min/max/mean/std/q01/q99
@@ -198,24 +200,19 @@ datasets/lerobot/<task_name>_variation<num>/
 │           └── file-000.parquet   # Per-episode metadata and stats
 ├── data/
 │   └── chunk-000/
-│       └── file-000.parquet   # Per-frame data
-└── videos/
-    ├── observation.images.front_rgb/
-    │   └── chunk-000/
-    │       ├── file-000.mp4   # Episode 0 front camera
-    │       └── file-001.mp4   # Episode 1 front camera
-    └── observation.images.wrist_rgb/
-        └── chunk-000/
-            ├── file-000.mp4
-            └── file-001.mp4
+│       └── file-000.parquet       # Per-frame data
+└── videos/                        # One MP4 per camera (merged)
+    ├── observation.images.front_rgb/chunk-000/file-000.mp4
+    └── observation.images.wrist_rgb/chunk-000/file-000.mp4
 ```
 
 **Data columns:**
 
 | Column | Type | Description |
 |---|---|---|
-| `observation.state` | float32[8] | EEF pose (x,y,z,qx,qy,qz,qw) + gripper_open |
-| `action` | float32[8] | Delta EEF action + gripper_open |
+| `observation.state` | float32[8] | *(EEF dataset only)* EEF pose (x,y,z,qx,qy,qz,qw) + gripper_open |
+| `observation.joint_state` | float32[8] | *(Joint dataset only)* Joint positions (q0..q6) + gripper_open |
+| `action` | float32[8] | EEF dataset: delta-EEF action; Joint dataset: joint velocity command |
 | `episode_index` | int64 | Episode this frame belongs to |
 | `timestamp` | float64 | Time in seconds from episode start |
 | `next.done` | bool | True on the last frame of each episode |
@@ -236,11 +233,11 @@ For example, if the scene graph transitions from "no relationships" →
 
 ```bash
 CUDA_VISIBLE_DEVICES="" python3 external/lerobot/src/lerobot/scripts/lerobot_dataset_viz.py \
-    --repo-id local/<task_name>_variation<num> \
-    --root datasets/lerobot/<task_name>_variation<num> \
+    --repo-id local/<task_name>_eef \
+    --root datasets/lerobot/<task_name>_eef \
     --episode-index 0 \
     --save 1 \
-    --output-dir datasets/lerobot/<task_name>_variation<num>/output \
+    --output-dir datasets/lerobot/<task_name>_eef/output \
     --batch-size 16 --num-workers 0 --tolerance-s 1e-4
 ```
 
@@ -248,7 +245,7 @@ Download the `.rrd` files and open with [Rerun](https://rerun.io/):
 
 ```bash
 pip install rerun-sdk
-rerun local_stack_cups_variation1_episode_0.rrd
+rerun local_stack_cups_eef_episode_0.rrd
 ```
 
 ---
@@ -340,14 +337,14 @@ in `scripts/train_groot_1gpu_smoke.sh`).
 
 ```bash
 # Single variation
-bash scripts/train_groot_1gpu_smoke.sh stack_cups_variation1
+bash scripts/train_groot_1gpu_smoke.sh stack_cups_eef
 
 # All variations (merged dataset)
-bash scripts/train_groot_1gpu_smoke.sh put_rubbish_in_bin_all datasets/lerobot/put_rubbish_in_bin_all
+bash scripts/train_groot_1gpu_smoke.sh put_rubbish_in_bin_eef datasets/lerobot/put_rubbish_in_bin_eef
 
 # Absolute path on HPC
-bash scripts/train_groot_1gpu_smoke.sh put_rubbish_in_bin_all \
-    /scratch/kpham34/cross_model_learning_based_robot_control/datasets/lerobot/put_rubbish_in_bin_all
+bash scripts/train_groot_1gpu_smoke.sh put_rubbish_in_bin_eef \
+    /scratch/kpham34/cross_model_learning_based_robot_control/datasets/lerobot/put_rubbish_in_bin_eef
 ```
 
 The first positional argument is the dataset ID, the second (optional) is the
@@ -357,7 +354,7 @@ All parameters can be overridden via environment variables:
 
 ```bash
 BATCH_SIZE=4 NUM_STEPS=1000 SAVE_FREQ=100 LOG_FREQ=10 NUM_PROCESSES=2 \
-    bash scripts/train_groot_1gpu_smoke.sh put_rubbish_in_bin_all
+    bash scripts/train_groot_1gpu_smoke.sh put_rubbish_in_bin_eef
 ```
 
 ### Troubleshooting (Sol-specific)
@@ -394,10 +391,12 @@ export PYTHONPATH="$(pwd)/external/RLBench:$(pwd)/external/lerobot/src:${PYTHONP
 
 The script expects an **EEF-pose action mode** for LeRobot policies (they output delta-EEF actions which are converted to absolute EEF targets for RLBench).
 
-- Use: `--action_mode ee_planning` (recommended) or `--action_mode ee_ik`
-- Avoid: `--action_mode joint_velocity` with `--policy lerobot`
+- For EEF-action checkpoints (trained on `<task>_eef`): use `--action_mode ee_planning` (recommended) or `--action_mode ee_ik`.
+- For joint-action checkpoints (trained on `<task>_joint`): use `--action_mode joint_velocity`.
 
 Multi-instruction support: you can pass multiple ordered instructions in `--task_description` (separated by sentences, newlines, `;`, or `|`). The script will execute them **sequentially**, running each instruction for `--max_steps` steps, and continuing from the current simulator state.
+
+Optional stall heuristic: if the end-effector pose stops changing (EEF position change < `--stall_eps_pos` and rotation change < `--stall_eps_rot_deg`) for `--stall_steps` consecutive steps, the script will automatically advance to the next instruction (or stop the episode if it was the last instruction).
 
 Example:
 
@@ -410,6 +409,7 @@ python src/inference/rlbench/infer_rlbench.py \
     --checkpoint output/lerobot/smolvla_put_rubbish_in_bin_all_20260312_183353 \
     --dataset_root datasets/lerobot_without_prompt/put_rubbish_in_bin_all \
     --task_description "Pick up paper. Release paper, then place paper in trash bin" \
+    --stall_steps 25 --stall_eps_pos 0.001 --stall_eps_rot_deg 2.0 \
     --device cuda \
     --save_path output/rlbench_inference/smolvla_multi_instruction
 ```
