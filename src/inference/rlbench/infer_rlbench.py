@@ -1,9 +1,16 @@
 """
 Run inference in the RLBench simulator.
 
-Uses an EEF-pose action mode (EndEffectorPoseViaPlanning + Discrete gripper)
-so the 8-D action vector [x, y, z, qx, qy, qz, qw, gripper] matches the
-LeRobot dataset format produced by convert_rlbench_to_lerobot.py.
+Supports two RLBench action modes that map to LeRobot-style 8-D actions:
+
+- EEF modes (`ee_planning` / `ee_ik`):
+    action = [x, y, z, qx, qy, qz, qw, gripper] (absolute target pose)
+- Joint mode (`joint_velocity`):
+    action = [dq0..dq6, gripper] (joint velocity command)
+
+For `--policy lerobot`, the interpretation depends on `--action_mode`:
+- EEF modes: model outputs delta-EEF which is converted to absolute.
+- Joint mode: model outputs joint velocities directly.
 
 The script:
   1. Launches RLBench in headless mode.
@@ -23,16 +30,16 @@ python src/inference/rlbench/infer_rlbench.py \
     --task stack_cups --variation 0 \
     --action_mode ee_planning \
     --policy lerobot \
-    --checkpoint output/lerobot/groot_smoke_stack_cups_variation1_20260303_182119/checkpoints/last/pretrained_model \
-    --dataset_root datasets/lerobot/stack_cups_variation1 \
+    --checkpoint output/lerobot/groot_smoke_stack_cups_eef_20260303_182119/checkpoints/last/pretrained_model \
+    --dataset_root datasets/lerobot/stack_cups_eef \
     --task_description "Pick up cup 1."
 
 Usage (LeRobot checkpoint — e.g. GROOT):
     python src/inference/rlbench/infer_rlbench.py \
         --task stack_cups --variation 0 \
         --policy lerobot \
-        --checkpoint output/lerobot/groot_smoke_stack_cups_variation1_20260303_182119/checkpoints/last/pretrained_model \
-        --dataset_root datasets/lerobot/stack_cups_variation1 \
+        --checkpoint output/lerobot/groot_smoke_stack_cups_eef_20260303_182119/checkpoints/last/pretrained_model \
+        --dataset_root datasets/lerobot/stack_cups_eef \
         --task_description "Pick up cup 1."
 
 Usage (LeRobot checkpoint — e.g. SmolVLA):
@@ -48,9 +55,9 @@ Usage (LeRobot checkpoint — e.g. SmolVLA):
 import argparse
 import json
 import os
-import pickle
 import re
 import sys
+import tempfile
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
 from copy import copy
@@ -64,15 +71,19 @@ _project_root = Path(__file__).parent.parent.parent.parent
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from src.utils.rlbench_utils import delta_action_to_absolute, images_to_video
-from PIL import Image
+from src.utils.rlbench_infer_utils import (
+    eef_pose_change,
+    set_policy_task_description,
+    split_task_description_into_steps,
+)
+from src.utils.rlbench_rollout_io import save_observations
+from src.utils.rlbench_utils import delta_action_to_absolute
 
 # ---------------------------------------------------------------------------
 # RLBench imports
 # ---------------------------------------------------------------------------
 from pyrep.const import RenderMode
 
-import rlbench.backend.task as task_module
 from rlbench import ObservationConfig
 from rlbench.action_modes.action_mode import MoveArmThenGripper
 from rlbench.action_modes.arm_action_modes import (
@@ -81,16 +92,6 @@ from rlbench.action_modes.arm_action_modes import (
     JointVelocity,
 )
 from rlbench.action_modes.gripper_action_modes import Discrete
-from rlbench.backend import utils as rlbench_utils
-from rlbench.backend.const import (
-    IMAGE_FORMAT,
-    LEFT_SHOULDER_RGB_FOLDER, LEFT_SHOULDER_DEPTH_FOLDER, LEFT_SHOULDER_MASK_FOLDER,
-    RIGHT_SHOULDER_RGB_FOLDER, RIGHT_SHOULDER_DEPTH_FOLDER, RIGHT_SHOULDER_MASK_FOLDER,
-    OVERHEAD_RGB_FOLDER, OVERHEAD_DEPTH_FOLDER, OVERHEAD_MASK_FOLDER,
-    WRIST_RGB_FOLDER, WRIST_DEPTH_FOLDER, WRIST_MASK_FOLDER,
-    FRONT_RGB_FOLDER, FRONT_DEPTH_FOLDER, FRONT_MASK_FOLDER,
-    LOW_DIM_PICKLE, DEPTH_SCALE,
-)
 from rlbench.backend.observation import Observation
 from rlbench.backend.utils import task_file_to_task_class
 from rlbench.environment import Environment
@@ -109,81 +110,17 @@ class Policy(ABC):
 
     @abstractmethod
     def predict(self, obs: Observation) -> np.ndarray:
-        """Return an 8-D action: [x, y, z, qx, qy, qz, qw, gripper].
+                """Return an 8-D action.
 
-        The first 7 values are an *absolute* target EEF pose in world frame.
-        The last value is the gripper command (>0.5 → open, <0.5 → close).
-        """
+                Interpretation depends on the RLBench `--action_mode`:
 
+                - `ee_planning` / `ee_ik`:
+                    [x, y, z, qx, qy, qz, qw, gripper]  (absolute target EEF pose)
+                - `joint_velocity`:
+                    [dq0, dq1, dq2, dq3, dq4, dq5, dq6, gripper]  (joint velocity command)
 
-class DummyPolicy(Policy):
-    """Repeat the current EEF pose (robot stays still, gripper open).
-
-    Works with EEF action modes (ee_planning / ee_ik).
-    """
-
-    def reset(self):
-        pass
-
-    def predict(self, obs: Observation) -> np.ndarray:
-        pose = obs.gripper_pose.copy()          # (7,) xyz + quat
-        gripper = np.array([1.0])               # open
-        return np.concatenate([pose, gripper])
-
-
-class JointVelocityDummyPolicy(Policy):
-    """Zero joint velocities (robot stays still, gripper open).
-
-    Works with the joint_velocity action mode.  Action dim = 8
-    (7 joint velocities + 1 gripper).
-    """
-
-    def reset(self):
-        pass
-
-    def predict(self, obs: Observation) -> np.ndarray:
-        return np.random.rand(8)   # 7 joints + gripper open
-
-
-class RandomPolicy(Policy):
-    """Apply small random perturbations around the current EEF pose.
-
-    Works with EEF action modes (ee_planning / ee_ik).
-    """
-
-    def __init__(self, pos_std: float = 0.005, rot_std: float = 0.01):
-        self.pos_std = pos_std
-        self.rot_std = rot_std
-
-    def reset(self):
-        pass
-
-    def predict(self, obs: Observation) -> np.ndarray:
-        pose = obs.gripper_pose.copy()
-        pose[:3] += np.random.normal(0, self.pos_std, size=3)
-        # Slightly perturb quaternion and re-normalise
-        pose[3:] += np.random.normal(0, self.rot_std, size=4)
-        pose[3:] /= np.linalg.norm(pose[3:])
-        gripper = np.array([float(np.random.random() > 0.5)])
-        return np.concatenate([pose, gripper])
-
-
-class JointVelocityRandomPolicy(Policy):
-    """Random small joint velocity commands.
-
-    Works with the joint_velocity action mode.
-    """
-
-    def __init__(self, vel_std: float = 0.1):
-        self.vel_std = vel_std
-
-    def reset(self):
-        pass
-
-    def predict(self, obs: Observation) -> np.ndarray:
-        arm = np.random.normal(0.0, self.vel_std, size=7)
-        gripper = np.array([1.0])  # open
-        return np.concatenate([arm, gripper])
+                The last value is the gripper command (>0.5 → open, <0.5 → close).
+                """
 
 
 class LeRobotPolicy(Policy):
@@ -198,6 +135,7 @@ class LeRobotPolicy(Policy):
         checkpoint_path: str,
         dataset_root: str,
         task_description: str = "",
+        action_mode: str = "ee_planning",
         rename_map: dict[str, str] | None = None,
         device: str | None = None,
     ):
@@ -209,6 +147,7 @@ class LeRobotPolicy(Policy):
 
         self.checkpoint_path = self._resolve_pretrained_model_dir(checkpoint_path)
         self.task_description = task_description
+        self.action_mode = action_mode
         self._prepare_obs = prepare_observation_for_inference
 
         # ---- resolve device ----
@@ -228,7 +167,7 @@ class LeRobotPolicy(Policy):
         self.ds_features = ds_meta.features
 
         # ---- load policy config from checkpoint ----
-        policy_cfg = PreTrainedConfig.from_pretrained(self.checkpoint_path)
+        policy_cfg = self._load_policy_config_compat(PreTrainedConfig, self.checkpoint_path)
         policy_cfg.pretrained_path = self.checkpoint_path
         policy_cfg.device = str(self.device)
 
@@ -251,10 +190,16 @@ class LeRobotPolicy(Policy):
             print(f"  rename_map     : {self.rename_map}")
 
         # ---- build pre/post processor pipelines ----
+        # Some checkpoints persist a `device_processor` step with `device: "cuda"`.
+        # On CPU-only runs, pipeline construction fails before we can post-adjust
+        # step devices. Override at load time so construction is always safe.
+        device_step_override = {"device": str(self.device)}
         self.preprocessor, self.postprocessor = make_pre_post_processors(
             policy_cfg,
             pretrained_path=self.checkpoint_path,
             dataset_stats=ds_meta.stats,
+            preprocessor_overrides={"device_processor": device_step_override},
+            postprocessor_overrides={"device_processor": device_step_override},
         )
 
         # Ensure the loaded processor pipelines follow the requested device.
@@ -283,8 +228,19 @@ class LeRobotPolicy(Policy):
                 "No image keys found to fetch from RLBench. "
                 "Expected dataset features to include observation.images.* or at least front_rgb/wrist_rgb."
             )
-        # The state key is always "observation.state"
-        self.state_key = "observation.state"
+
+        # Low-dim state keys: provide whatever the dataset declares.
+        # Some joint-space datasets store joints in `observation.state` (SmolVLA convention),
+        # while older exports used `observation.joint_state`.
+        self.state_keys: list[str] = []
+        for k in ["observation.state", "observation.joint_state"]:
+            if k in self.ds_features:
+                self.state_keys.append(k)
+        if not self.state_keys:
+            raise RuntimeError(
+                "No supported low-dim state keys found in dataset features. "
+                "Expected observation.state and/or observation.joint_state."
+            )
 
     def reset(self):
         """Reset internal action-chunk cache in the policy (if present)."""
@@ -355,6 +311,54 @@ class LeRobotPolicy(Policy):
         return None
 
     @staticmethod
+    def _load_policy_config_compat(PreTrainedConfig, checkpoint_path: str):
+        """Load policy config and gracefully handle stale unknown keys.
+
+        Some checkpoints were exported with keys that are no longer present in
+        the current LeRobot config dataclass (e.g., `compile_model`, `compile_mode`).
+        In that case, strip only invalid keys reported by the parser and retry.
+        """
+        try:
+            return PreTrainedConfig.from_pretrained(checkpoint_path)
+        except Exception as exc:
+            cfg_path = Path(checkpoint_path) / "config.json"
+            if not cfg_path.is_file():
+                raise
+
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+
+            invalid_keys = [key for key in re.findall(r"`([^`]+)`", str(exc)) if key in cfg]
+            if not invalid_keys:
+                raise
+
+            patched_cfg = dict(cfg)
+            removed_keys: list[str] = []
+            for key in invalid_keys:
+                if key in patched_cfg:
+                    patched_cfg.pop(key)
+                    removed_keys.append(key)
+
+            if not removed_keys:
+                raise
+
+            with tempfile.TemporaryDirectory(prefix="lerobot_cfg_compat_") as tmp_dir:
+                tmp_cfg_path = Path(tmp_dir) / "config.json"
+                with open(tmp_cfg_path, "w", encoding="utf-8") as f:
+                    json.dump(patched_cfg, f)
+
+                try:
+                    policy_cfg = PreTrainedConfig.from_pretrained(tmp_dir)
+                except Exception:
+                    raise exc
+
+            print(
+                "[LeRobotPolicy] Warning: removed unsupported config keys "
+                f"{removed_keys} while loading {cfg_path}."
+            )
+            return policy_cfg
+
+    @staticmethod
     def _force_device_in_pipeline(pipeline, device: torch.device) -> None:
         steps = getattr(pipeline, "steps", [])
         for step in steps:
@@ -373,18 +377,59 @@ class LeRobotPolicy(Policy):
         """Convert an RLBench Observation to the flat dict that LeRobot expects.
 
         Keys produced (matching the dataset info.json):
-            observation.state         – (8,) float32  [x y z qx qy qz qw gripper]
+            observation.state         – (8,) float32  [EEF pose + gripper] OR [joint positions + gripper]
+            observation.joint_state   – (8,) float32  [joint_0..joint_6 gripper] (backward-compatible; if present in dataset)
             observation.images.<cam>  – (H, W, 3) uint8  (only cameras the policy needs)
         """
-        # state: EEF pose (7) + gripper open flag (1)
-        state = np.concatenate([
-            obs.gripper_pose.astype(np.float32),            # (7,)
-            np.array([float(obs.gripper_open)], dtype=np.float32),  # (1,)
-        ])
+        obs_dict: dict = {}
 
-        obs_dict: dict = {
-            self.state_key: state,
-        }
+        if "observation.state" in self.state_keys:
+            # Some datasets use `observation.state` for EEF pose; others (e.g., our
+            # joint-space RLBench exports) use it for joint positions. Infer which
+            # one the dataset expects based on the feature's motor names.
+            state_spec = self.ds_features.get("observation.state", {})
+            motor_names = state_spec.get("names") or []
+            motor_names = [str(n) for n in motor_names]
+            state_is_joint = any(n.startswith("joint_") for n in motor_names[:7])
+
+            if state_is_joint:
+                joint_pos = getattr(obs, "joint_positions", None)
+                if joint_pos is None:
+                    raise RuntimeError(
+                        "Dataset expects joint positions in observation.state but RLBench observation has no joint_positions."
+                    )
+                joint_pos = np.asarray(joint_pos, dtype=np.float32).reshape(-1)
+                if joint_pos.shape[0] < 7:
+                    raise RuntimeError(
+                        f"Expected joint_positions to have 7 values, got shape {joint_pos.shape}."
+                    )
+                state = np.concatenate([
+                    joint_pos[:7],
+                    np.array([float(obs.gripper_open)], dtype=np.float32),
+                ])
+            else:
+                state = np.concatenate([
+                    np.asarray(obs.gripper_pose, dtype=np.float32).reshape(-1)[:7],
+                    np.array([float(obs.gripper_open)], dtype=np.float32),
+                ])
+            obs_dict["observation.state"] = state
+
+        if "observation.joint_state" in self.state_keys:
+            joint_pos = getattr(obs, "joint_positions", None)
+            if joint_pos is None:
+                raise RuntimeError(
+                    "Dataset expects observation.joint_state but RLBench observation has no joint_positions."
+                )
+            joint_pos = np.asarray(joint_pos, dtype=np.float32).reshape(-1)
+            if joint_pos.shape[0] < 7:
+                raise RuntimeError(
+                    f"Expected joint_positions to have 7 values, got shape {joint_pos.shape}."
+                )
+            joint_state = np.concatenate([
+                joint_pos[:7],
+                np.array([float(obs.gripper_open)], dtype=np.float32),
+            ])
+            obs_dict["observation.joint_state"] = joint_state
 
         # Map LeRobot image key → RLBench attribute name
         # e.g. "observation.images.front_rgb" → obs.front_rgb
@@ -434,108 +479,20 @@ class LeRobotPolicy(Policy):
             action_tensor = self.postprocessor(action_tensor)
 
         # action_tensor: (1, action_dim) or (action_dim,)
-        delta_action = action_tensor.squeeze(0).cpu().numpy().astype(np.float64)
+        action_vec = action_tensor.squeeze(0).cpu().numpy().astype(np.float64).reshape(-1)
+        if action_vec.shape[0] != 8:
+            raise RuntimeError(f"Expected policy to output an 8-D action, got shape {action_vec.shape}.")
 
-        # Convert delta action → absolute target pose for the RLBench controller
+        # joint_velocity mode: policy outputs joint velocity commands directly.
+        if self.action_mode == "joint_velocity":
+            return action_vec
+
+        # EEF modes: policy outputs delta EEF actions; convert to absolute pose.
         current_state = np.concatenate([
-            obs.gripper_pose.astype(np.float64),              # (7,)
-            np.array([float(obs.gripper_open)], dtype=np.float64),  # (1,)
+            np.asarray(obs.gripper_pose, dtype=np.float64).reshape(-1)[:7],
+            np.array([float(obs.gripper_open)], dtype=np.float64),
         ])
-        action = delta_action_to_absolute(delta_action, current_state)
-        return action
-
-
-# ===================================================================
-# Observation recording  (mirrors dataset_generator.save_demo)
-# ===================================================================
-
-def _mkdirs(*dirs):
-    for d in dirs:
-        os.makedirs(d, exist_ok=True)
-
-
-def save_observations(observations: list, save_dir: str):
-    """Save a list of Observation objects in the RLBench convention.
-
-    Produces:
-        <save_dir>/
-            front_rgb/0.png, 1.png, …
-            wrist_rgb/…
-            front_rgb.mp4, wrist_rgb.mp4
-            low_dim_obs.pkl
-    """
-
-    cam_specs = [
-        ("wrist",          WRIST_RGB_FOLDER,          WRIST_DEPTH_FOLDER,          WRIST_MASK_FOLDER),
-        ("front",          FRONT_RGB_FOLDER,          FRONT_DEPTH_FOLDER,          FRONT_MASK_FOLDER),
-    ]
-
-    # Create all directories up-front
-    all_dirs = []
-    for _, rgb_d, depth_d, mask_d in cam_specs:
-        all_dirs.extend([
-            os.path.join(save_dir, rgb_d),
-            os.path.join(save_dir, depth_d),
-            os.path.join(save_dir, mask_d),
-        ])
-    _mkdirs(*all_dirs)
-
-    for i, obs in enumerate(observations):
-        for cam_name, rgb_folder, depth_folder, mask_folder in cam_specs:
-            rgb_data   = getattr(obs, f"{cam_name}_rgb", None)
-            depth_data = getattr(obs, f"{cam_name}_depth", None)
-            mask_data  = getattr(obs, f"{cam_name}_mask", None)
-
-            if rgb_data is not None:
-                Image.fromarray(rgb_data).save(
-                    os.path.join(save_dir, rgb_folder, IMAGE_FORMAT % i))
-
-            if depth_data is not None:
-                depth_img = rlbench_utils.float_array_to_rgb_image(
-                    depth_data, scale_factor=DEPTH_SCALE)
-                depth_img.save(
-                    os.path.join(save_dir, depth_folder, IMAGE_FORMAT % i))
-
-            if mask_data is not None:
-                mask_img = Image.fromarray(
-                    (mask_data * 255).astype(np.uint8))
-                mask_img.save(
-                    os.path.join(save_dir, mask_folder, IMAGE_FORMAT % i))
-
-        # Null out images before pickling (same pattern as dataset_generator)
-        for cam_name, _, _, _ in cam_specs:
-            for attr_suffix in ("_rgb", "_depth", "_point_cloud", "_mask"):
-                setattr(obs, f"{cam_name}{attr_suffix}", None)
-
-    # Pickle the low-dim data
-    with open(os.path.join(save_dir, LOW_DIM_PICKLE), "wb") as f:
-        pickle.dump(observations, f)
-
-    # Encode quick preview videos (RGB only) for front + wrist.
-    # Uses the same ffmpeg-based helper as the RLBench→LeRobot converter.
-    n_frames = len(observations)
-    if n_frames > 0:
-        frame_start, frame_end = 0, n_frames - 1
-        video_fps = 10
-        video_codec = "libopenh264"
-        video_pix_fmt = "yuv420p"
-        for cam_name, rgb_folder, _, _ in cam_specs:
-            rgb_dir = os.path.join(save_dir, rgb_folder)
-            video_out = os.path.join(save_dir, f"{rgb_folder}.mp4")
-            try:
-                images_to_video(
-                    rgb_dir,
-                    video_out,
-                    frame_start=frame_start,
-                    frame_end=frame_end,
-                    fps=video_fps,
-                    codec=video_codec,
-                    pix_fmt=video_pix_fmt,
-                )
-            except Exception as exc:  # nosec: B110
-                print(f"  Warning: failed to create video for {rgb_folder}: {exc}")
-
-    print(f"  Saved {len(observations)} observations → {save_dir}")
+        return delta_action_to_absolute(action_vec, current_state)
 
 
 # ===================================================================
@@ -543,87 +500,17 @@ def save_observations(observations: list, save_dir: str):
 # ===================================================================
 
 def build_policy(args) -> Policy:
-    is_jv = (args.action_mode == "joint_velocity")
-    if args.policy == "dummy":
-        return JointVelocityDummyPolicy() if is_jv else DummyPolicy()
-    elif args.policy == "random":
-        return JointVelocityRandomPolicy() if is_jv else RandomPolicy()
-    elif args.policy == "lerobot":
-        if not args.checkpoint:
-            raise ValueError("--checkpoint is required for --policy lerobot")
-        if not args.dataset_root:
-            raise ValueError("--dataset_root is required for --policy lerobot")
-        return LeRobotPolicy(
-            checkpoint_path=args.checkpoint,
-            dataset_root=args.dataset_root,
-            task_description=args.task_description or "",
-            device=args.device,
-        )
-    else:
-        raise ValueError(f"Unknown policy: {args.policy}")
-
-
-def _split_task_description_into_steps(task_description: str) -> list[str]:
-    """Split a single task_description string into ordered instruction steps.
-
-    Supported delimiters (highest priority first):
-      - explicit: '|'  (e.g. "Pick up.|Place.")
-      - newlines
-      - semicolons
-      - sentence boundaries on '.'
-
-    Returns a non-empty list.
-    """
-    text = (task_description or "").strip()
-    if not text:
-        return [""]
-
-    if "|" in text:
-        parts = [p.strip() for p in text.split("|")]
-    elif "\n" in text:
-        parts = [p.strip() for p in text.splitlines()]
-    elif ";" in text:
-        parts = [p.strip() for p in text.split(";")]
-    else:
-        # Split on sentence boundaries. Keep punctuation with the preceding step
-        # by splitting on whitespace *after* a period.
-        parts = [p.strip() for p in re.split(r"(?<=\.)\s+", text)]
-
-    parts = [p for p in parts if p]
-    return parts if parts else [text]
-
-
-def _set_policy_task_description(policy: Policy, task_description: str) -> None:
-    """Best-effort update of the policy's language instruction (if supported)."""
-    if hasattr(policy, "task_description"):
-        setattr(policy, "task_description", task_description)
-
-
-def _eef_pose_change(prev_obs: Observation, curr_obs: Observation) -> tuple[float, float]:
-    """Return (position_delta_m, rotation_delta_rad) between two RLBench observations."""
-    prev_pose = np.asarray(prev_obs.gripper_pose, dtype=np.float64).reshape(-1)
-    curr_pose = np.asarray(curr_obs.gripper_pose, dtype=np.float64).reshape(-1)
-    if prev_pose.shape[0] < 7 or curr_pose.shape[0] < 7:
-        raise ValueError("Expected gripper_pose to have 7 elements (xyz + quat).")
-
-    pos_delta = float(np.linalg.norm(curr_pose[:3] - prev_pose[:3]))
-
-    q_prev = prev_pose[3:7]
-    q_curr = curr_pose[3:7]
-    q_prev_norm = np.linalg.norm(q_prev)
-    q_curr_norm = np.linalg.norm(q_curr)
-    if q_prev_norm < 1e-12 or q_curr_norm < 1e-12:
-        rot_delta = 0.0
-    else:
-        q_prev = q_prev / q_prev_norm
-        q_curr = q_curr / q_curr_norm
-        dot = float(np.dot(q_prev, q_curr))
-        dot = abs(dot)  # q and -q represent the same rotation
-        dot = max(-1.0, min(1.0, dot))
-        rot_delta = float(2.0 * np.arccos(dot))
-
-    return pos_delta, rot_delta
-
+    if not args.checkpoint:
+        raise ValueError("--checkpoint is required for --policy lerobot")
+    if not args.dataset_root:
+        raise ValueError("--dataset_root is required for --policy lerobot")
+    return LeRobotPolicy(
+        checkpoint_path=args.checkpoint,
+        dataset_root=args.dataset_root,
+        task_description=args.task_description or "",
+        action_mode=args.action_mode,
+        device=args.device,
+    )
 
 def run_inference(args):
     img_size = list(args.image_size)
@@ -709,7 +596,7 @@ def run_inference(args):
         # Multi-instruction support:
         # If the task description contains multiple sentences/lines, we execute them
         # sequentially for `--max_steps` steps each, without resetting the simulator.
-        task_steps = _split_task_description_into_steps(episode_task_description)
+        task_steps = split_task_description_into_steps(episode_task_description)
         if len(task_steps) > 1:
             print(f"  Task steps ({len(task_steps)}): {task_steps}")
 
@@ -721,7 +608,7 @@ def run_inference(args):
         terminate = False
         stall_eps_rot_rad = float(np.deg2rad(args.stall_eps_rot_deg))
         for step_idx, step_task in enumerate(task_steps):
-            _set_policy_task_description(policy, step_task)
+            set_policy_task_description(policy, step_task)
             policy.reset()
 
             stall_count = 0
@@ -764,7 +651,7 @@ def run_inference(args):
                 # assume the current instruction is complete and move on.
                 if obs is not None and args.stall_steps > 0 and len(observations) >= 2:
                     try:
-                        pos_delta, rot_delta = _eef_pose_change(observations[-2], observations[-1])
+                        pos_delta, rot_delta = eef_pose_change(observations[-2], observations[-1])
                     except Exception:
                         pos_delta, rot_delta = float("inf"), float("inf")
 

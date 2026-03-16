@@ -210,8 +210,7 @@ datasets/lerobot/<task_name>_<eef|joint>/
 
 | Column | Type | Description |
 |---|---|---|
-| `observation.state` | float32[8] | *(EEF dataset only)* EEF pose (x,y,z,qx,qy,qz,qw) + gripper_open |
-| `observation.joint_state` | float32[8] | *(Joint dataset only)* Joint positions (q0..q6) + gripper_open |
+| `observation.state` | float32[8] | EEF dataset: EEF pose (x,y,z,qx,qy,qz,qw) + gripper_open; Joint dataset: joint positions (q0..q6) + gripper_open *(older exports used `observation.joint_state`)* |
 | `action` | float32[8] | EEF dataset: delta-EEF action; Joint dataset: joint velocity command |
 | `episode_index` | int64 | Episode this frame belongs to |
 | `timestamp` | float64 | Time in seconds from episode start |
@@ -463,4 +462,41 @@ For each episode, the script writes:
 ├── low_dim_obs.pkl
 ├── front_rgb.mp4        # if ffmpeg available
 └── wrist_rgb.mp4        # if ffmpeg available
+```
+
+### Planner-vs-policy evaluation (put_rubbish_in_bin)
+
+Use [src/inference/rlbench/eval_put_rubbish_in_bin.py](src/inference/rlbench/eval_put_rubbish_in_bin.py) to compare your trained policy against the RLBench default planner over multiple deterministic runs.
+
+- Planner rollout is generated with the same live-demo mechanism used by `rlbench.dataset_generator`.
+- Policy rollout starts from the same initial state via `reset_to_demo(...)`.
+- Metrics are phase-aware using gripper transitions:
+    - **Phase 1 (pick):** close transition, grasp success, L2 (EEF/joint).
+    - **Phase 2 (release/place):** release transition, final success, trajectory/final L2.
+
+Example (10 runs):
+
+```bash
+python src/inference/rlbench/eval_put_rubbish_in_bin.py \
+        --task put_rubbish_in_bin --variation 0 \
+        --runs 1 --seed 0 \
+        --max_steps 150 \
+        --action_mode joint_velocity --renderer opengl3 \
+        --checkpoint output/lerobot/smolvla_put_rubbish_in_bin_all_20260312_183353 \
+        --dataset_root datasets/lerobot_without_prompt/put_rubbish_in_bin_all \
+        --task_description "Pick up paper. Release paper, then place paper in trash bin." \
+        --save_path output/rlbench_eval/put_rubbish_in_bin
+```
+
+Main outputs:
+
+```
+output/rlbench_eval/put_rubbish_in_bin/
+├── run_000/
+│   ├── planner/episodes/episode0/      # RLBench default demo save format + rollout sidecars
+│   ├── policy/episodes/episode0/       # policy rollout save format + rollout sidecars
+│   └── metrics.json
+├── per_run_metrics.json
+├── per_run_metrics.csv
+└── summary.json
 ```

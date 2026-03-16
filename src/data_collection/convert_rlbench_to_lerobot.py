@@ -3,7 +3,7 @@
 Convert RLBench variations into **LeRobot v3 datasets** in two action spaces:
 
 - **EEF dataset**: `observation.state` + `action` (delta EEF)
-- **Joint dataset**: `observation.joint_state` + `action` (joint velocity)
+- **Joint dataset**: `observation.state` + `action` (joint velocity)
 
 The CLI produces merged outputs (no per-variation folders) named:
 
@@ -131,7 +131,7 @@ def convert(
     action_space : str
         Which control/action space to export:
           - "eef"   : observation.state + action (delta EEF)  [x y z qx qy qz qw gripper]
-          - "joint" : observation.joint_state + action (joint velocity) [q0..q6 gripper]
+            - "joint" : observation.state + action (joint velocity) [q0..q6 gripper]
     """
     # -- Paths ---------------------------------------------------------------
     var_dir = os.path.join(rlbench_root, task_name, f"variation{variation}")
@@ -183,7 +183,10 @@ def convert(
         def _compute_actions(obs_slice: list) -> np.ndarray:
             return compute_delta_eef_actions(obs_slice)
     else:
-        state_feature_name = "observation.joint_state"
+        # NOTE: SmolVLA training in LeRobot expects the low-dim state key to be
+        # exactly `observation.state`. For joint-space datasets we therefore
+        # store joint positions under `observation.state`.
+        state_feature_name = "observation.state"
         all_states = np.stack([extract_joint_state(o) for o in observations], axis=0)  # (n_obs, 8)
 
         def _compute_actions(obs_slice: list) -> np.ndarray:
