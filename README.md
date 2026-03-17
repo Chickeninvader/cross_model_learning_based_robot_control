@@ -479,7 +479,7 @@ Example (10 runs):
 ```bash
 python src/inference/rlbench/eval_put_rubbish_in_bin.py \
         --task put_rubbish_in_bin --variation 0 \
-        --runs 1 --seed 0 \
+        --runs 10 --seed 0 \
         --max_steps 150 \
         --action_mode joint_velocity --renderer opengl3 \
         --checkpoint output/lerobot/smolvla_put_rubbish_in_bin_all_20260312_183353 \
@@ -500,3 +500,29 @@ output/rlbench_eval/put_rubbish_in_bin/
 ├── per_run_metrics.csv
 └── summary.json
 ```
+
+### Batch summary across all runs (no re-inference)
+
+If you already have evaluation folders (for example `policy_state/varX_seedY`) and want a single report across **all runs**:
+
+```bash
+bash src/inference/rlbench/eval_put_rubbish_in_bin_batch.sh --summarize_only
+```
+
+This runs aggregate-only mode in `eval_put_rubbish_in_bin.py` and writes:
+
+```
+output/rlbench_eval/put_rubbish_in_bin/
+├── detailed_summary.json   # aggregate report
+└── detailed_runs.csv       # one row per eval dir (with run-mean + overall episode metrics)
+├── overall_metrics.csv     # one row per policy x action combination
+```
+
+In `detailed_summary.json`:
+
+- `comparison.overall` reports metrics across **all runs and all episodes**.
+- `episode_success_rate_mean` is the mean of per-run success rates.
+- `episode_success_rate_overall` is pooled success over all episode rows.
+- `joint_l2_overall` / `pos_l2_overall` / `rot_deg_overall` are pooled means over all episode rows.
+- `by_policy_state`, `by_policy`, and `by_state` include the same run-mean + pooled-overall metrics.
+- `overall_metrics.csv` is a compact table for each policy/action/episode combination (e.g. `smolvla + joint_velocity + episode 0`), where each metric is averaged over that episode index across all runs.

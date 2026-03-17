@@ -21,6 +21,8 @@ from copy import deepcopy
 import csv
 import json
 import os
+import random
+import re
 import sys
 from pathlib import Path
 
@@ -119,6 +121,353 @@ def _write_csv(path: str, rows: list[dict]) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
+
+
+def _parse_bool(value: object) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "t"}
+
+
+def _parse_float(value: object) -> float | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = float(text)
+    except ValueError:
+        return None
+    if np.isnan(parsed):
+        return None
+    return float(parsed)
+
+
+def _parse_int(value: object) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _std_or_none(values: list[float | None]) -> float | None:
+    clean = [float(v) for v in values if v is not None and not np.isnan(float(v))]
+    if not clean:
+        return None
+    return float(np.std(np.asarray(clean, dtype=np.float64)))
+
+
+def aggregate_batch_results(aggregate_root: str, task_name: str = "put_rubbish_in_bin") -> dict:
+    """Aggregate already-generated batch outputs without rerunning inference."""
+    root = Path(aggregate_root)
+    if not root.exists():
+        raise FileNotFoundError(f"Aggregate root does not exist: {aggregate_root}")
+
+    run_summaries: list[dict] = []
+    run_rows: list[dict] = []
+    episode_rows: list[dict] = []
+
+    policy_state_dirs = sorted([p for p in root.iterdir() if p.is_dir()])
+    var_seed_re = re.compile(r"^var(-?\d+)_seed(-?\d+)$")
+
+    for policy_state_dir in policy_state_dirs:
+        name = policy_state_dir.name
+        if "_" not in name:
+            continue
+        policy, state = name.rsplit("_", 1)
+
+        for eval_dir in sorted([p for p in policy_state_dir.iterdir() if p.is_dir()]):
+            match = var_seed_re.match(eval_dir.name)
+            if match is None:
+                continue
+            variation = int(match.group(1))
+            seed = int(match.group(2))
+
+            csv_path = eval_dir / "per_run_metrics.csv"
+            if not csv_path.exists():
+                continue
+
+            with open(csv_path, "r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                rows = list(reader)
+
+            per_run_episode_rows: dict[int, list[dict]] = {}
+            for row in rows:
+                success = _parse_bool(row.get("policy_success", False))
+                row_joint = _parse_float(row.get("joint_l2"))
+                row_pos = _parse_float(row.get("pos_l2"))
+                row_rot = _parse_float(row.get("rot_deg"))
+                row_eef = _parse_float(row.get("eef_l2"))
+                run_index = _parse_int(row.get("run_index"))
+                if run_index is None:
+                    # Fallback for legacy CSVs without run_index.
+                    run_index = 0
+
+                enriched_episode = {
+                    "policy": policy,
+                    "state": state,
+                    "variation": variation,
+                    "seed": seed,
+                    "run_index": run_index,
+                    "episode_index": _parse_int(row.get("episode_index")),
+                    "instruction": row.get("instruction"),
+                    "policy_success": success,
+                    "joint_l2": row_joint,
+                    "pos_l2": row_pos,
+                    "rot_deg": row_rot,
+                    "eef_l2": row_eef,
+                    "eval_dir": str(eval_dir),
+                }
+                episode_rows.append(enriched_episode)
+                per_run_episode_rows.setdefault(run_index, []).append(enriched_episode)
+
+            eval_run_metrics: list[dict] = []
+            for run_index, run_eps in sorted(per_run_episode_rows.items(), key=lambda kv: kv[0]):
+                run_episode_successes = [float(bool(ep.get("policy_success", False))) for ep in run_eps]
+                run_joint_l2 = [ep.get("joint_l2") for ep in run_eps]
+                run_pos_l2 = [ep.get("pos_l2") for ep in run_eps]
+                run_rot_deg = [ep.get("rot_deg") for ep in run_eps]
+                run_eef_l2 = [ep.get("eef_l2") for ep in run_eps]
+                all_success = (
+                    float(all(v > 0.5 for v in run_episode_successes))
+                    if run_episode_successes
+                    else None
+                )
+                metric = {
+                    "policy": policy,
+                    "state": state,
+                    "variation": variation,
+                    "seed": seed,
+                    "run_index": run_index,
+                    "num_episodes": len(run_eps),
+                    "episode_success_rate": _mean_or_none(run_episode_successes),
+                    "all_episode_success_rate": all_success,
+                    "joint_l2_mean": _mean_or_none(run_joint_l2),
+                    "pos_l2_mean": _mean_or_none(run_pos_l2),
+                    "rot_deg_mean": _mean_or_none(run_rot_deg),
+                    "eef_l2_mean": _mean_or_none(run_eef_l2),
+                    "eval_dir": str(eval_dir),
+                }
+                eval_run_metrics.append(metric)
+                run_rows.append(metric)
+
+            run_summaries.append(
+                {
+                    "policy": policy,
+                    "state": state,
+                    "variation": variation,
+                    "seed": seed,
+                    "num_runs": len(eval_run_metrics),
+                    "num_episodes": len(rows),
+                    "episode_success_rate_mean": _mean_or_none(
+                        [r.get("episode_success_rate") for r in eval_run_metrics]
+                    ),
+                    "episode_success_rate_overall": _mean_or_none(
+                        [float(bool(ep.get("policy_success", False))) for ep in episode_rows if ep["eval_dir"] == str(eval_dir)]
+                    ),
+                    "all_episode_success_rate_mean": _mean_or_none(
+                        [r.get("all_episode_success_rate") for r in eval_run_metrics]
+                    ),
+                    "joint_l2_mean": _mean_or_none([r.get("joint_l2_mean") for r in eval_run_metrics]),
+                    "joint_l2_overall": _mean_or_none(
+                        [ep.get("joint_l2") for ep in episode_rows if ep["eval_dir"] == str(eval_dir)]
+                    ),
+                    "pos_l2_mean": _mean_or_none([r.get("pos_l2_mean") for r in eval_run_metrics]),
+                    "pos_l2_overall": _mean_or_none(
+                        [ep.get("pos_l2") for ep in episode_rows if ep["eval_dir"] == str(eval_dir)]
+                    ),
+                    "rot_deg_mean": _mean_or_none([r.get("rot_deg_mean") for r in eval_run_metrics]),
+                    "rot_deg_overall": _mean_or_none(
+                        [ep.get("rot_deg") for ep in episode_rows if ep["eval_dir"] == str(eval_dir)]
+                    ),
+                    "eval_dir": str(eval_dir),
+                }
+            )
+
+    def _group_runs(key: str) -> list[dict]:
+        groups: dict[str, list[dict]] = {}
+        for row in run_rows:
+            groups.setdefault(str(row[key]), []).append(row)
+
+        summaries: list[dict] = []
+        for group_key, rows in groups.items():
+            group_eval_dirs = {str(r["eval_dir"]) for r in rows}
+            group_episodes = [ep for ep in episode_rows if str(ep[key]) == group_key]
+            summaries.append(
+                {
+                    key: group_key,
+                    "num_eval_dirs": len(group_eval_dirs),
+                    "num_runs": len(rows),
+                    "num_episodes": len(group_episodes),
+                    "episode_success_rate_mean": _mean_or_none([r.get("episode_success_rate") for r in rows]),
+                    "episode_success_rate_std": _std_or_none([r.get("episode_success_rate") for r in rows]),
+                    "episode_success_rate_overall": _mean_or_none(
+                        [float(bool(ep.get("policy_success", False))) for ep in group_episodes]
+                    ),
+                    "all_episode_success_rate_mean": _mean_or_none(
+                        [r.get("all_episode_success_rate") for r in rows]
+                    ),
+                    "joint_l2_mean": _mean_or_none([r.get("joint_l2_mean") for r in rows]),
+                    "joint_l2_overall": _mean_or_none([ep.get("joint_l2") for ep in group_episodes]),
+                    "pos_l2_mean": _mean_or_none([r.get("pos_l2_mean") for r in rows]),
+                    "pos_l2_overall": _mean_or_none([ep.get("pos_l2") for ep in group_episodes]),
+                    "rot_deg_mean": _mean_or_none([r.get("rot_deg_mean") for r in rows]),
+                    "rot_deg_overall": _mean_or_none([ep.get("rot_deg") for ep in group_episodes]),
+                }
+            )
+        summaries.sort(
+            key=lambda r: (
+                -(r.get("all_episode_success_rate_mean") or -1.0),
+                r.get("joint_l2_mean") if r.get("joint_l2_mean") is not None else float("inf"),
+            )
+        )
+        return summaries
+
+    pair_groups: dict[tuple[str, str], list[dict]] = {}
+    for row in run_rows:
+        pair_groups.setdefault((str(row["policy"]), str(row["state"])), []).append(row)
+
+    by_policy_state: list[dict] = []
+    for (policy, state), rows in pair_groups.items():
+        group_eval_dirs = {str(r["eval_dir"]) for r in rows}
+        group_episodes = [
+            ep
+            for ep in episode_rows
+            if str(ep["policy"]) == policy and str(ep["state"]) == state
+        ]
+        by_policy_state.append(
+            {
+                "policy": policy,
+                "state": state,
+                "num_eval_dirs": len(group_eval_dirs),
+                "num_runs": len(rows),
+                "num_episodes": len(group_episodes),
+                "episode_success_rate_mean": _mean_or_none([r.get("episode_success_rate") for r in rows]),
+                "episode_success_rate_std": _std_or_none([r.get("episode_success_rate") for r in rows]),
+                "episode_success_rate_overall": _mean_or_none(
+                    [float(bool(ep.get("policy_success", False))) for ep in group_episodes]
+                ),
+                "all_episode_success_rate_mean": _mean_or_none(
+                    [r.get("all_episode_success_rate") for r in rows]
+                ),
+                "joint_l2_mean": _mean_or_none([r.get("joint_l2_mean") for r in rows]),
+                "joint_l2_overall": _mean_or_none([ep.get("joint_l2") for ep in group_episodes]),
+                "pos_l2_mean": _mean_or_none([r.get("pos_l2_mean") for r in rows]),
+                "pos_l2_overall": _mean_or_none([ep.get("pos_l2") for ep in group_episodes]),
+                "rot_deg_mean": _mean_or_none([r.get("rot_deg_mean") for r in rows]),
+                "rot_deg_overall": _mean_or_none([ep.get("rot_deg") for ep in group_episodes]),
+            }
+        )
+    by_policy_state.sort(
+        key=lambda r: (
+            -(r.get("all_episode_success_rate_mean") or -1.0),
+            r.get("joint_l2_mean") if r.get("joint_l2_mean") is not None else float("inf"),
+        )
+    )
+
+    # Convenience table for "policy x action x episode" reporting.
+    # In this benchmark pipeline:
+    #   eef   -> ee_planning
+    #   joint -> joint_velocity
+    action_mode_map = {
+        "eef": "ee_planning",
+        "joint": "joint_velocity",
+    }
+    combo_episode_groups: dict[tuple[str, str, int], list[dict]] = {}
+    for ep in episode_rows:
+        ep_idx = ep.get("episode_index")
+        if ep_idx is None:
+            continue
+        key = (str(ep.get("policy")), str(ep.get("state")), int(ep_idx))
+        combo_episode_groups.setdefault(key, []).append(ep)
+
+    overall_metrics_rows: list[dict] = []
+    for (policy, state, episode_index), rows in sorted(
+        combo_episode_groups.items(),
+        key=lambda item: (item[0][0], item[0][1], item[0][2]),
+    ):
+        run_keys = {
+            (
+                int(_parse_int(r.get("variation")) or 0),
+                int(_parse_int(r.get("seed")) or 0),
+                int(_parse_int(r.get("run_index")) or 0),
+            )
+            for r in rows
+        }
+        eval_dirs = {str(r.get("eval_dir")) for r in rows}
+        overall_metrics_rows.append(
+            {
+                "policy": policy,
+                "state": state,
+                "action_mode": action_mode_map.get(state, "unknown"),
+                "episode_index": episode_index,
+                "num_eval_dirs": len(eval_dirs),
+                "num_runs": len(run_keys),
+                "num_episode_rows": len(rows),
+                "episode_success_rate": _mean_or_none(
+                    [float(bool(ep.get("policy_success", False))) for ep in rows]
+                ),
+                "joint_l2_mean": _mean_or_none([ep.get("joint_l2") for ep in rows]),
+                "pos_l2_mean": _mean_or_none([ep.get("pos_l2") for ep in rows]),
+                "rot_deg_mean": _mean_or_none([ep.get("rot_deg") for ep in rows]),
+                "eef_l2_mean": _mean_or_none([ep.get("eef_l2") for ep in rows]),
+            }
+        )
+
+    overall = {
+        "num_eval_dirs": len(run_summaries),
+        "num_runs": len(run_rows),
+        "num_episodes": len(episode_rows),
+        "episode_success_rate_mean": _mean_or_none([r.get("episode_success_rate") for r in run_rows]),
+        "episode_success_rate_std": _std_or_none([r.get("episode_success_rate") for r in run_rows]),
+        "episode_success_rate_overall": _mean_or_none(
+            [float(bool(ep.get("policy_success", False))) for ep in episode_rows]
+        ),
+        "all_episode_success_rate_mean": _mean_or_none(
+            [r.get("all_episode_success_rate") for r in run_rows]
+        ),
+        "joint_l2_mean": _mean_or_none([r.get("joint_l2_mean") for r in run_rows]),
+        "joint_l2_overall": _mean_or_none([ep.get("joint_l2") for ep in episode_rows]),
+        "pos_l2_mean": _mean_or_none([r.get("pos_l2_mean") for r in run_rows]),
+        "pos_l2_overall": _mean_or_none([ep.get("pos_l2") for ep in episode_rows]),
+        "rot_deg_mean": _mean_or_none([r.get("rot_deg_mean") for r in run_rows]),
+        "rot_deg_overall": _mean_or_none([ep.get("rot_deg") for ep in episode_rows]),
+        "eef_l2_mean": _mean_or_none([r.get("eef_l2_mean") for r in run_rows]),
+        "eef_l2_overall": _mean_or_none([ep.get("eef_l2") for ep in episode_rows]),
+    }
+
+    return {
+        "task": task_name,
+        "aggregate_root": str(root),
+        "num_eval_dirs": len(run_summaries),
+        "num_runs": len(run_rows),
+        "num_episode_rows": len(episode_rows),
+        "run_details": sorted(
+            run_summaries,
+            key=lambda r: (str(r["policy"]), str(r["state"]), int(r["variation"]), int(r["seed"])),
+        ),
+        "per_run_details": sorted(
+            run_rows,
+            key=lambda r: (
+                str(r["policy"]),
+                str(r["state"]),
+                int(r["variation"]),
+                int(r["seed"]),
+                int(r["run_index"]),
+            ),
+        ),
+        "comparison": {
+            "overall": overall,
+            "by_policy_state": by_policy_state,
+            "by_policy": _group_runs("policy"),
+            "by_state": _group_runs("state"),
+        },
+        "overall_metrics_rows": overall_metrics_rows,
+    }
 
 
 def _instruction_steps(task_description: str) -> list[str]:
@@ -227,6 +576,11 @@ def _save_episode_outputs(
 
 
 def run_evaluation(args: argparse.Namespace) -> None:
+    if not args.checkpoint:
+        raise ValueError("--checkpoint is required unless --aggregate_only is used.")
+    if not args.dataset_root:
+        raise ValueError("--dataset_root is required unless --aggregate_only is used.")
+
     os.makedirs(args.save_path, exist_ok=True)
 
     obs_config = _build_obs_config(list(args.image_size), args.renderer)
@@ -261,6 +615,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
 
         for run_idx in range(args.runs):
             run_seed = args.seed + run_idx
+            random.seed(run_seed)
             np.random.seed(run_seed)
             torch.manual_seed(run_seed)
             if torch.cuda.is_available():
@@ -278,7 +633,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
             )
 
             # Reset to exactly the same initial state sampled for planner rollout.
-            descriptions, initial_obs = task_env.reset_to_demo(planner_demo)
+            descriptions, _initial_obs = task_env.reset_to_demo(planner_demo)
             task_description = args.task_description
             if task_description is None:
                 task_description = descriptions[0] if descriptions else ""
@@ -298,13 +653,11 @@ def run_evaluation(args: argparse.Namespace) -> None:
             ranges = _segment_ranges(boundaries, n_segments, last_expert_idx)
 
             initial_state = capture_task_env_state(task_env)
-            policy_start_states: list[dict] = [initial_state]
-            for ep_idx in range(1, n_segments):
-                boundary_idx = boundaries[ep_idx - 1]
-                snap = planner_state_snaps[boundary_idx] if boundary_idx < len(planner_state_snaps) else None
-                if snap is None:
-                    snap = policy_start_states[-1]
-                policy_start_states.append(snap)
+            # RLBench demo callback does not provide a snapshot for the very first
+            # observation, so fill it from reset_to_demo() state.
+            if planner_state_snaps:
+                if planner_state_snaps[0] is None:
+                    planner_state_snaps[0] = initial_state
 
             episode_metrics: list[dict] = []
 
@@ -349,10 +702,14 @@ def run_evaluation(args: argparse.Namespace) -> None:
                     },
                 )
 
-                if ep_idx == 0:
-                    policy_start_obs = initial_obs
-                else:
-                    policy_start_obs = restore_task_env_state(task_env, policy_start_states[ep_idx])
+                # Always restore from planner-aligned state for every episode
+                # (including episode 0) to keep planner/policy start states matched.
+                policy_start_state = (
+                    planner_state_snaps[seg_start] if seg_start < len(planner_state_snaps) else None
+                )
+                if policy_start_state is None:
+                    policy_start_state = initial_state
+                policy_start_obs = restore_task_env_state(task_env, policy_start_state)
 
                 policy_rollout = rollout_policy(
                     task_env,
@@ -496,8 +853,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max_steps", type=int, default=150)
 
-    parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--dataset_root", type=str, required=True)
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--dataset_root", type=str, default=None)
     parser.add_argument(
         "--task_description",
         type=str,
@@ -517,9 +874,68 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arm_max_acceleration", type=float, default=4.0)
     parser.add_argument("--planner_max_attempts", type=int, default=10)
     parser.add_argument("--save_path", type=str, default="output/rlbench_eval/put_rubbish_in_bin")
+    parser.add_argument(
+        "--aggregate_only",
+        action="store_true",
+        help="Skip RLBench evaluation and only aggregate existing outputs under --aggregate_root.",
+    )
+    parser.add_argument(
+        "--aggregate_root",
+        type=str,
+        default=None,
+        help="Root containing policy/state evaluation folders to aggregate.",
+    )
+    parser.add_argument(
+        "--aggregate_output_json",
+        type=str,
+        default=None,
+        help="Where to write aggregate JSON report (default: <aggregate_root>/detailed_summary.json).",
+    )
+    parser.add_argument(
+        "--aggregate_output_csv",
+        type=str,
+        default=None,
+        help="Where to write aggregate per-run CSV report (default: <aggregate_root>/detailed_runs.csv).",
+    )
+    parser.add_argument(
+        "--aggregate_output_overall_csv",
+        type=str,
+        default=None,
+        help=(
+            "Where to write aggregate policy/action CSV report "
+            "(default: <aggregate_root>/overall_metrics.csv)."
+        ),
+    )
 
     return parser.parse_args()
 
 
 if __name__ == "__main__":
-    run_evaluation(parse_args())
+    parsed_args = parse_args()
+    if parsed_args.aggregate_only:
+        aggregate_root = parsed_args.aggregate_root or parsed_args.save_path
+        payload = aggregate_batch_results(aggregate_root, task_name=parsed_args.task)
+
+        output_json = parsed_args.aggregate_output_json
+        if output_json is None:
+            output_json = str(Path(aggregate_root) / "detailed_summary.json")
+        _write_json(output_json, payload)
+
+        output_csv = parsed_args.aggregate_output_csv
+        if output_csv is None:
+            output_csv = str(Path(aggregate_root) / "detailed_runs.csv")
+        _write_csv(output_csv, payload.get("run_details", []))
+
+        output_overall_csv = parsed_args.aggregate_output_overall_csv
+        if output_overall_csv is None:
+            output_overall_csv = str(Path(aggregate_root) / "overall_metrics.csv")
+        _write_csv(output_overall_csv, payload.get("overall_metrics_rows", []))
+
+        print("\nAggregate-only summary complete.")
+        print(f"Aggregate root: {aggregate_root}")
+        print(f"Detailed JSON : {output_json}")
+        print(f"Detailed CSV  : {output_csv}")
+        print(f"Overall CSV   : {output_overall_csv}")
+        print(json.dumps(payload.get("comparison", {}), indent=2))
+    else:
+        run_evaluation(parsed_args)
