@@ -356,6 +356,42 @@ BATCH_SIZE=4 NUM_STEPS=1000 SAVE_FREQ=100 LOG_FREQ=10 NUM_PROCESSES=2 \
     bash scripts/train_groot_1gpu_smoke.sh put_rubbish_in_bin_eef
 ```
 
+### 6. Transfer only the latest checkpoint for each run
+
+If you train on ASU Sol and want to copy only `checkpoints/last` for each run
+to your local machine, use:
+
+```bash
+bash scripts/transfer_lerobot_last_checkpoints.sh
+```
+
+Default source/target paths in the script:
+
+- Remote host: `ngocbach@en4217548l`
+- Remote output: `/scratch/kpham34/cross_model_learning_based_robot_control/output/lerobot`
+- Local output: `~/Desktop/cross_model_learning_based_robot_control/output/lerobot`
+- State file: `~/Desktop/cross_model_learning_based_robot_control/output/lerobot/.transferred_last_checkpoints.tsv`
+
+What it does:
+
+- Traverses each run under remote `output/lerobot`.
+- Resolves `checkpoints/last` symlink to its real checkpoint directory (for
+  example `020000`).
+- Copies that resolved directory with `scp -r`.
+- Recreates local `checkpoints/last` symlink.
+- Records `(run_name, remote_checkpoint_path)` in a local state file.
+- Skips items that were already transferred in prior runs.
+
+You can override defaults via environment variables:
+
+```bash
+REMOTE_HOST="user@cluster" \
+REMOTE_OUTPUT_DIR="/scratch/.../output/lerobot" \
+LOCAL_OUTPUT_DIR="$HOME/Desktop/cross_model_learning_based_robot_control/output/lerobot" \
+STATE_FILE="$HOME/Desktop/cross_model_learning_based_robot_control/output/lerobot/.transferred_last_checkpoints.tsv" \
+bash scripts/transfer_lerobot_last_checkpoints.sh
+```
+
 ### Troubleshooting (Sol-specific)
 
 | Problem | Cause | Fix |
