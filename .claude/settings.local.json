@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /workspace/datasets -type f -name *.md)",
+      "Bash(ls /workspace/external/RLBench/rlbench/tasks/*.py)",
+      "Bash(xargs ls:*)",
+      "Bash(grep -E \"\\\\.\\(py|ipynb|sh\\)$\")",
+      "Bash(wc -l /workspace/src/utils/*.py)",
+      "Bash(du -sh /workspace/datasets/lerobot/*/)",
+      "Bash(find /workspace/datasets/lerobot -name *.mp4 -o -name *.avi -o -name *.webm -o -name *.mkv)",
+      "Bash(find /workspace/datasets/lerobot -name info.json -o -name meta* -name *.json -o -name *.parquet)"
+    ]
+  }
+}

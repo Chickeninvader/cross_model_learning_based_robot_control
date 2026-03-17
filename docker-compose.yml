@@ -9,14 +9,18 @@ services:
     container_name: rlbench
     runtime: nvidia
     environment:
-      - DISPLAY=${DISPLAY}
+      - DISPLAY=:99
       - XDG_RUNTIME_DIR=/tmp/runtime-root
+      - COPPELIASIM_ROOT=/root/CoppeliaSim
+      - QT_QPA_PLATFORM=xcb
       - QT_QPA_PLATFORM_PLUGIN_PATH=/root/CoppeliaSim
+      - QT_PLUGIN_PATH=
+      - LD_LIBRARY_PATH=/root/CoppeliaSim:/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+      - PYTHONPATH=/workspace/external/RLBench:/workspace/external/lerobot/src
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics
     volumes:
       - ./:/workspace:cached
-      - /tmp/.X11-unix:/tmp/.X11-unix
       - /tmp/runtime-root:/tmp/runtime-root
       - /etc/passwd:/etc/passwd:ro
       - /etc/group:/etc/group:ro
