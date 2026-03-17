@@ -63,6 +63,12 @@ bootstrap_existing_local() {
         # Fallback for already-copied runs that do not have a local `last` symlink.
         local_ckpt_root="$run_dir/checkpoints"
         [[ -d "$local_ckpt_root" ]] || continue
+        if [[ -d "$local_ckpt_root/last" ]]; then
+            resolved_target="${REMOTE_OUTPUT_DIR}/${run_name}/checkpoints/last"
+            if ! state_has "$run_name" "$resolved_target"; then
+                state_add "$run_name" "$resolved_target" "bootstrap-local"
+            fi
+        fi
         for ckpt_dir in "$local_ckpt_root"/*; do
             [[ -d "$ckpt_dir" ]] || continue
             ckpt_name="$(basename "$ckpt_dir")"
@@ -86,9 +92,15 @@ for run_dir in \"${REMOTE_OUTPUT_DIR}\"/*; do
     run_name=\"\$(basename \"\$run_dir\")\"
     [[ \"\$run_name\" == debug ]] && continue
     last_link=\"\$run_dir/checkpoints/last\"
-    [[ -L \"\$last_link\" ]] || continue
-    target=\"\$(readlink -f \"\$last_link\" || true)\"
-    [[ -n \"\$target\" && -d \"\$target\" ]] || continue
+    [[ -e \"\$last_link\" ]] || continue
+    if [[ -L \"\$last_link\" ]]; then
+        target=\"\$(readlink -f \"\$last_link\" || true)\"
+        [[ -n \"\$target\" && -d \"\$target\" ]] || continue
+    elif [[ -d \"\$last_link\" ]]; then
+        target=\"\$last_link\"
+    else
+        continue
+    fi
     printf \"%s\t%s\n\" \"\$run_name\" \"\$target\"
 done
 '"
@@ -106,7 +118,9 @@ transfer_one() {
     mkdir -p "$local_ckpt_root"
     log "Transferring $run_name ($local_ckpt_dirname)"
     scp -r "${REMOTE_HOST}:${remote_ckpt_path}" "$local_ckpt_root/"
-    ln -sfn "$local_ckpt_dirname" "$local_ckpt_root/last"
+    if [[ "$local_ckpt_dirname" != "last" ]]; then
+        ln -sfn "$local_ckpt_dirname" "$local_ckpt_root/last"
+    fi
     state_add "$run_name" "$remote_ckpt_path" "scp"
 }
 
