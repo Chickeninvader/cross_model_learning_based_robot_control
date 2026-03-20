@@ -500,9 +500,9 @@ For each episode, the script writes:
 └── wrist_rgb.mp4        # if ffmpeg available
 ```
 
-### Planner-vs-policy evaluation (put_rubbish_in_bin)
+### Planner-vs-policy evaluation
 
-Use [src/inference/rlbench/eval_put_rubbish_in_bin.py](src/inference/rlbench/eval_put_rubbish_in_bin.py) to compare your trained policy against the RLBench default planner over multiple deterministic runs.
+Use `src/inference/rlbench/eval.py` to compare your trained policy against the RLBench default planner over multiple deterministic runs.
 
 - Planner rollout is generated with the same live-demo mechanism used by `rlbench.dataset_generator`.
 - Policy rollout starts from the same initial state via `reset_to_demo(...)`.
@@ -513,7 +513,7 @@ Use [src/inference/rlbench/eval_put_rubbish_in_bin.py](src/inference/rlbench/eva
 Example (10 runs):
 
 ```bash
-python src/inference/rlbench/eval_put_rubbish_in_bin.py \
+python src/inference/rlbench/eval.py \
         --task put_rubbish_in_bin --variation 0 \
         --runs 10 --seed 0 \
         --max_steps 150 \
@@ -542,10 +542,10 @@ output/rlbench_eval/put_rubbish_in_bin/
 If you already have evaluation folders (for example `policy_state/varX_seedY`) and want a single report across **all runs**:
 
 ```bash
-bash src/inference/rlbench/eval_put_rubbish_in_bin_batch.sh --summarize_only
+bash src/inference/rlbench/eval.sh --summarize_only
 ```
 
-This runs aggregate-only mode in `eval_put_rubbish_in_bin.py` and writes:
+This runs aggregate-only mode in `eval.py` and writes:
 
 ```
 output/rlbench_eval/put_rubbish_in_bin/

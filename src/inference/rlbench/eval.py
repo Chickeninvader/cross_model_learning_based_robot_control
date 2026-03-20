@@ -1,17 +1,15 @@
-"""Evaluate a trained policy against the RLBench planner on put_rubbish_in_bin.
+"""Evaluate a trained policy against the RLBench planner (generic task).
 
-This script performs segmented evaluation for each run:
-1) Collect an expert planner rollout.
-2) Split task description into ordered instruction steps.
-3) Detect expert gripper state-change boundaries.
-4) Save planner rollouts as episode0..episodeN-1 based on those boundaries.
-5) For each instruction i, restore the simulator to expert boundary i-1 and
-    run policy for a fixed rollout horizon.
-6) Save policy rollouts as episode0..episodeN-1 and compare policy final state
-    against expert segment-end state.
+Segment count follows `datasets/rlbench/<task>/<task>_relationship_template.json`
+when available: each entry in ``transitions`` is one sub-episode (e.g. lamp_on has
+one transition → one episode; put_rubbish_in_bin has two → two episodes).
+Boundaries align to gripper changes that match each template transition
+(open/closed), not raw gripper-event count vs. instruction steps.
 
-Outputs are written under `--save_path`, including planner/policy rollouts,
-per-run metrics, a merged CSV, and a summary JSON.
+Fallback (no template or --no_relationship_template): segment count from
+instruction steps and first N-1 gripper changes (legacy).
+
+Outputs: planner/policy rollouts, per-run metrics, CSV, summary JSON.
 """
 
 from __future__ import annotations
@@ -47,7 +45,7 @@ from rlbench.action_modes.gripper_action_modes import Discrete
 from rlbench.backend.utils import task_file_to_task_class
 from rlbench.environment import Environment
 
-from src.inference.rlbench.infer_rlbench import LeRobotPolicy
+from src.utils.rlbench_policy import LeRobotPolicy
 from src.utils.rlbench_infer_utils import split_task_description_into_steps
 from src.utils.rlbench_eval_utils import (
     capture_task_env_state,
@@ -58,6 +56,13 @@ from src.utils.rlbench_eval_utils import (
 )
 from src.utils.rlbench_rollout_io import save_observations, save_rollout_sidecars
 from src.utils.rlbench_utils import extract_eef_state, extract_joint_state
+from src.utils.rlbench_eval_helpers import (
+    parse_bool,
+    parse_float,
+    parse_int,
+    mean_or_none,
+    std_or_none,
+)
 
 
 def _build_obs_config(image_size: list[int], renderer: str) -> ObservationConfig:
@@ -123,45 +128,7 @@ def _write_csv(path: str, rows: list[dict]) -> None:
             writer.writerow(row)
 
 
-def _parse_bool(value: object) -> bool:
-    return str(value).strip().lower() in {"1", "true", "yes", "y", "t"}
-
-
-def _parse_float(value: object) -> float | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        parsed = float(text)
-    except ValueError:
-        return None
-    if np.isnan(parsed):
-        return None
-    return float(parsed)
-
-
-def _parse_int(value: object) -> int | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        return int(text)
-    except ValueError:
-        return None
-
-
-def _std_or_none(values: list[float | None]) -> float | None:
-    clean = [float(v) for v in values if v is not None and not np.isnan(float(v))]
-    if not clean:
-        return None
-    return float(np.std(np.asarray(clean, dtype=np.float64)))
-
-
-def aggregate_batch_results(aggregate_root: str, task_name: str = "put_rubbish_in_bin") -> dict:
+def aggregate_batch_results(aggregate_root: str, task_name: str = "rlbench_task") -> dict:
     """Aggregate already-generated batch outputs without rerunning inference."""
     root = Path(aggregate_root)
     if not root.exists():
@@ -197,12 +164,12 @@ def aggregate_batch_results(aggregate_root: str, task_name: str = "put_rubbish_i
 
             per_run_episode_rows: dict[int, list[dict]] = {}
             for row in rows:
-                success = _parse_bool(row.get("policy_success", False))
-                row_joint = _parse_float(row.get("joint_l2"))
-                row_pos = _parse_float(row.get("pos_l2"))
-                row_rot = _parse_float(row.get("rot_deg"))
-                row_eef = _parse_float(row.get("eef_l2"))
-                run_index = _parse_int(row.get("run_index"))
+                success = parse_bool(row.get("policy_success", False))
+                row_joint = parse_float(row.get("joint_l2"))
+                row_pos = parse_float(row.get("pos_l2"))
+                row_rot = parse_float(row.get("rot_deg"))
+                row_eef = parse_float(row.get("eef_l2"))
+                run_index = parse_int(row.get("run_index"))
                 if run_index is None:
                     # Fallback for legacy CSVs without run_index.
                     run_index = 0
@@ -213,7 +180,7 @@ def aggregate_batch_results(aggregate_root: str, task_name: str = "put_rubbish_i
                     "variation": variation,
                     "seed": seed,
                     "run_index": run_index,
-                    "episode_index": _parse_int(row.get("episode_index")),
+                    "episode_index": parse_int(row.get("episode_index")),
                     "instruction": row.get("instruction"),
                     "policy_success": success,
                     "joint_l2": row_joint,
@@ -244,12 +211,12 @@ def aggregate_batch_results(aggregate_root: str, task_name: str = "put_rubbish_i
                     "seed": seed,
                     "run_index": run_index,
                     "num_episodes": len(run_eps),
-                    "episode_success_rate": _mean_or_none(run_episode_successes),
+                    "episode_success_rate": mean_or_none(run_episode_successes),
                     "all_episode_success_rate": all_success,
-                    "joint_l2_mean": _mean_or_none(run_joint_l2),
-                    "pos_l2_mean": _mean_or_none(run_pos_l2),
-                    "rot_deg_mean": _mean_or_none(run_rot_deg),
-                    "eef_l2_mean": _mean_or_none(run_eef_l2),
+                    "joint_l2_mean": mean_or_none(run_joint_l2),
+                    "pos_l2_mean": mean_or_none(run_pos_l2),
+                    "rot_deg_mean": mean_or_none(run_rot_deg),
+                    "eef_l2_mean": mean_or_none(run_eef_l2),
                     "eval_dir": str(eval_dir),
                 }
                 eval_run_metrics.append(metric)
@@ -304,7 +271,7 @@ def aggregate_batch_results(aggregate_root: str, task_name: str = "put_rubbish_i
                     "num_runs": len(rows),
                     "num_episodes": len(group_episodes),
                     "episode_success_rate_mean": _mean_or_none([r.get("episode_success_rate") for r in rows]),
-                    "episode_success_rate_std": _std_or_none([r.get("episode_success_rate") for r in rows]),
+                    "episode_success_rate_std": std_or_none([r.get("episode_success_rate") for r in rows]),
                     "episode_success_rate_overall": _mean_or_none(
                         [float(bool(ep.get("policy_success", False))) for ep in group_episodes]
                     ),
@@ -347,7 +314,7 @@ def aggregate_batch_results(aggregate_root: str, task_name: str = "put_rubbish_i
                 "num_runs": len(rows),
                 "num_episodes": len(group_episodes),
                 "episode_success_rate_mean": _mean_or_none([r.get("episode_success_rate") for r in rows]),
-                "episode_success_rate_std": _std_or_none([r.get("episode_success_rate") for r in rows]),
+                "episode_success_rate_std": std_or_none([r.get("episode_success_rate") for r in rows]),
                 "episode_success_rate_overall": _mean_or_none(
                     [float(bool(ep.get("policy_success", False))) for ep in group_episodes]
                 ),
@@ -392,9 +359,9 @@ def aggregate_batch_results(aggregate_root: str, task_name: str = "put_rubbish_i
     ):
         run_keys = {
             (
-                int(_parse_int(r.get("variation")) or 0),
-                int(_parse_int(r.get("seed")) or 0),
-                int(_parse_int(r.get("run_index")) or 0),
+                int(parse_int(r.get("variation")) or 0),
+                int(parse_int(r.get("seed")) or 0),
+                int(parse_int(r.get("run_index")) or 0),
             )
             for r in rows
         }
@@ -422,22 +389,22 @@ def aggregate_batch_results(aggregate_root: str, task_name: str = "put_rubbish_i
         "num_eval_dirs": len(run_summaries),
         "num_runs": len(run_rows),
         "num_episodes": len(episode_rows),
-        "episode_success_rate_mean": _mean_or_none([r.get("episode_success_rate") for r in run_rows]),
-        "episode_success_rate_std": _std_or_none([r.get("episode_success_rate") for r in run_rows]),
-        "episode_success_rate_overall": _mean_or_none(
+        "episode_success_rate_mean": mean_or_none([r.get("episode_success_rate") for r in run_rows]),
+        "episode_success_rate_std": std_or_none([r.get("episode_success_rate") for r in run_rows]),
+        "episode_success_rate_overall": mean_or_none(
             [float(bool(ep.get("policy_success", False))) for ep in episode_rows]
         ),
-        "all_episode_success_rate_mean": _mean_or_none(
+        "all_episode_success_rate_mean": mean_or_none(
             [r.get("all_episode_success_rate") for r in run_rows]
         ),
-        "joint_l2_mean": _mean_or_none([r.get("joint_l2_mean") for r in run_rows]),
-        "joint_l2_overall": _mean_or_none([ep.get("joint_l2") for ep in episode_rows]),
-        "pos_l2_mean": _mean_or_none([r.get("pos_l2_mean") for r in run_rows]),
-        "pos_l2_overall": _mean_or_none([ep.get("pos_l2") for ep in episode_rows]),
-        "rot_deg_mean": _mean_or_none([r.get("rot_deg_mean") for r in run_rows]),
-        "rot_deg_overall": _mean_or_none([ep.get("rot_deg") for ep in episode_rows]),
-        "eef_l2_mean": _mean_or_none([r.get("eef_l2_mean") for r in run_rows]),
-        "eef_l2_overall": _mean_or_none([ep.get("eef_l2") for ep in episode_rows]),
+        "joint_l2_mean": mean_or_none([r.get("joint_l2_mean") for r in run_rows]),
+        "joint_l2_overall": mean_or_none([ep.get("joint_l2") for ep in episode_rows]),
+        "pos_l2_mean": mean_or_none([r.get("pos_l2_mean") for r in run_rows]),
+        "pos_l2_overall": mean_or_none([ep.get("pos_l2") for ep in episode_rows]),
+        "rot_deg_mean": mean_or_none([r.get("rot_deg_mean") for r in run_rows]),
+        "rot_deg_overall": mean_or_none([ep.get("rot_deg") for ep in episode_rows]),
+        "eef_l2_mean": mean_or_none([r.get("eef_l2_mean") for r in run_rows]),
+        "eef_l2_overall": mean_or_none([ep.get("eef_l2") for ep in episode_rows]),
     }
 
     return {
@@ -506,6 +473,85 @@ def _segment_ranges(boundaries: list[int], n_segments: int, last_index: int) -> 
         ranges.append((start, end))
         start = end
     return ranges
+
+
+def _resolve_relationship_template_path(
+    task: str,
+    rlbench_root: str | Path,
+    explicit: str | None,
+) -> Path | None:
+    if explicit:
+        p = Path(explicit)
+        return p if p.is_file() else None
+    p = Path(rlbench_root) / task / f"{task}_relationship_template.json"
+    return p if p.is_file() else None
+
+
+def _load_relationship_transitions(template_path: Path) -> list[dict]:
+    with open(template_path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    transitions = data.get("transitions")
+    if not isinstance(transitions, list) or not transitions:
+        return []
+    return transitions
+
+
+def _segmentation_from_relationship_template(
+    observations: list,
+    transitions: list[dict],
+    last_index: int,
+    threshold: float = 0.5,
+) -> tuple[int, list[int]]:
+    """Number of segments = len(transitions). Boundaries end segment 0..n-2."""
+    n = len(transitions)
+    if n <= 1:
+        return max(1, n), []
+    gripper_open = [float(obs.gripper_open) > threshold for obs in observations]
+    boundaries: list[int] = []
+    search_from = 1
+    for i in range(n - 1):
+        t = transitions[i]
+        from_open = str(t.get("from_state", "")).lower() == "open"
+        to_open = str(t.get("to_state", "")).lower() == "open"
+        found: int | None = None
+        for idx in range(max(search_from, 1), len(observations)):
+            if gripper_open[idx - 1] == gripper_open[idx]:
+                continue
+            if gripper_open[idx - 1] == from_open and gripper_open[idx] == to_open:
+                found = idx
+                break
+        if found is None:
+            for idx in range(max(search_from, 1), len(observations)):
+                if gripper_open[idx - 1] != gripper_open[idx]:
+                    found = idx
+                    break
+        if found is None:
+            found = last_index
+        found = int(max(0, min(found, last_index)))
+        boundaries.append(found)
+        search_from = found + 1
+    return n, boundaries
+
+
+def _instructions_per_segment(
+    n_segments: int,
+    task_steps: list[str],
+    task_description: str,
+) -> list[str]:
+    td = (task_description or "").strip()
+    if n_segments <= 0:
+        return []
+    if n_segments == 1:
+        return [td if td else (task_steps[0] if task_steps else "")]
+    steps = [s.strip() for s in task_steps if s.strip()]
+    if len(steps) >= n_segments:
+        return steps[:n_segments]
+    if not steps:
+        return [td] * n_segments if td else [""] * n_segments
+    out = list(steps)
+    while len(out) < n_segments:
+        out.append(out[-1])
+    return out[:n_segments]
 
 
 def _quat_angle_deg(q_a: np.ndarray, q_b: np.ndarray) -> float:
@@ -599,6 +645,27 @@ def run_evaluation(args: argparse.Namespace) -> None:
     run_metrics: list[dict] = []
     run_rows: list[dict] = []
 
+    rlbench_root = Path(args.rlbench_root).resolve() if args.rlbench_root else (_project_root / "datasets" / "rlbench")
+    template_path = _resolve_relationship_template_path(
+        args.task, rlbench_root, args.relationship_template
+    )
+    template_transitions: list[dict] | None = None
+    if not getattr(args, "no_relationship_template", False) and template_path is not None:
+        template_transitions = _load_relationship_transitions(template_path)
+        if template_transitions:
+            print(
+                f"Segmentation from relationship template: {template_path} "
+                f"({len(template_transitions)} transition(s) → {len(template_transitions)} episode(s))"
+            )
+        else:
+            template_transitions = None
+    if template_transitions is None and not getattr(args, "no_relationship_template", False):
+        expected = rlbench_root / args.task / f"{args.task}_relationship_template.json"
+        print(
+            f"Warning: relationship template missing or empty ({expected}); "
+            "using instruction-step count + gripper boundaries."
+        )
+
     try:
         task_class = task_file_to_task_class(args.task)
         task_env = env.get_task(task_class)
@@ -639,17 +706,27 @@ def run_evaluation(args: argparse.Namespace) -> None:
                 task_description = descriptions[0] if descriptions else ""
 
             task_steps = _instruction_steps(task_description)
-            n_segments = len(task_steps)
             last_expert_idx = max(0, len(planner_obs) - 1)
-
             gripper_changes = _gripper_change_indices(planner_obs)
-            boundaries = _segment_boundaries(gripper_changes, n_segments, last_expert_idx)
-            if len(gripper_changes) < max(0, n_segments - 1):
-                print(
-                    "  Warning: expert gripper transitions fewer than task steps; "
-                    "reusing final expert state for remaining segments."
-                )
 
+            if template_transitions:
+                n_segments, boundaries = _segmentation_from_relationship_template(
+                    planner_obs, template_transitions, last_expert_idx
+                )
+                segmentation_source = "relationship_template"
+            else:
+                n_segments = max(1, len(task_steps))
+                boundaries = _segment_boundaries(gripper_changes, n_segments, last_expert_idx)
+                segmentation_source = "instruction_steps_gripper"
+                if len(gripper_changes) < max(0, n_segments - 1):
+                    print(
+                        "  Warning: expert gripper transitions fewer than task steps; "
+                        "reusing final expert state for remaining segments."
+                    )
+
+            segment_instructions = _instructions_per_segment(
+                n_segments, task_steps, task_description
+            )
             ranges = _segment_ranges(boundaries, n_segments, last_expert_idx)
 
             initial_state = capture_task_env_state(task_env)
@@ -661,7 +738,8 @@ def run_evaluation(args: argparse.Namespace) -> None:
 
             episode_metrics: list[dict] = []
 
-            for ep_idx, step_text in enumerate(task_steps):
+            for ep_idx in range(n_segments):
+                step_text = segment_instructions[ep_idx]
                 seg_start, seg_end = ranges[ep_idx]
                 print(f"  ep={ep_idx} instruction={step_text}")
 
@@ -784,6 +862,10 @@ def run_evaluation(args: argparse.Namespace) -> None:
                 "variation": args.variation,
                 "task_description": task_description,
                 "task_steps": task_steps,
+                "segment_instructions": segment_instructions,
+                "segmentation_source": segmentation_source,
+                "relationship_template_path": str(template_path) if template_path else None,
+                "num_template_transitions": len(template_transitions) if template_transitions else None,
                 "expert_gripper_change_indices": gripper_changes,
                 "segment_boundaries": boundaries,
                 "episode_metrics": episode_metrics,
@@ -829,6 +911,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
         "runs": args.runs,
         "seed": args.seed,
         "action_mode": args.action_mode,
+        "num_episodes": max_episodes,
         "num_instruction_episodes": max_episodes,
         "all_episode_success_rate": _mean_or_none(all_episode_success),
         "per_episode": per_episode_summary,
@@ -845,7 +928,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate trained policy vs RLBench planner for put_rubbish_in_bin."
+        description="Evaluate a trained policy vs RLBench planner for an RLBench task."
     )
     parser.add_argument("--task", type=str, default="put_rubbish_in_bin")
     parser.add_argument("--variation", type=int, default=0)
@@ -855,6 +938,23 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--dataset_root", type=str, default=None)
+    parser.add_argument(
+        "--rlbench_root",
+        type=str,
+        default=None,
+        help="Directory containing per-task folders (default: <repo>/datasets/rlbench).",
+    )
+    parser.add_argument(
+        "--relationship_template",
+        type=str,
+        default=None,
+        help="Explicit path to <task>_relationship_template.json (overrides rlbench_root lookup).",
+    )
+    parser.add_argument(
+        "--no_relationship_template",
+        action="store_true",
+        help="Ignore relationship template; use instruction steps + first gripper changes.",
+    )
     parser.add_argument(
         "--task_description",
         type=str,
@@ -873,7 +973,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arm_max_velocity", type=float, default=1.0)
     parser.add_argument("--arm_max_acceleration", type=float, default=4.0)
     parser.add_argument("--planner_max_attempts", type=int, default=10)
-    parser.add_argument("--save_path", type=str, default="output/rlbench_eval/put_rubbish_in_bin")
+    parser.add_argument("--save_path", type=str, default="output/rlbench_eval/default_task")
     parser.add_argument(
         "--aggregate_only",
         action="store_true",

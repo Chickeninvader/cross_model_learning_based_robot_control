@@ -23,7 +23,8 @@ RENDERER="opengl3"
 TASK_DESCRIPTION="Pick up paper. Release paper, then place paper in trash bin."
 
 CHECKPOINT_ROOT="${WORKSPACE_ROOT}/output/lerobot"
-DATASET_PARENT="${WORKSPACE_ROOT}/datasets/lerobot_without_prompt"
+DATASET_PARENT="${WORKSPACE_ROOT}/datasets/lerobot"
+RLBENCH_ROOT="${WORKSPACE_ROOT}/datasets/rlbench"
 LEGACY_SAVE_ROOT="${WORKSPACE_ROOT}/output/rlbench_eval/batch"
 SAVE_ROOT=""
 
@@ -48,6 +49,7 @@ Options:
   --task_description TEXT    Task description string
   --checkpoint_root PATH     Root of training outputs (default: ${CHECKPOINT_ROOT})
   --dataset_parent PATH      Parent of dataset roots (default: ${DATASET_PARENT})
+  --rlbench_root PATH        RLBench scene-graph templates (default: datasets/rlbench)
   --save_root PATH           Parent for eval outputs (default: output/rlbench_eval/<task>)
   --python BIN               Python executable (default: ${PYTHON_BIN})
   --device DEVICE            Optional torch device (e.g. cuda:0)
@@ -70,6 +72,7 @@ while [[ $# -gt 0 ]]; do
     --task_description) TASK_DESCRIPTION="$2"; shift 2 ;;
     --checkpoint_root) CHECKPOINT_ROOT="$2"; shift 2 ;;
     --dataset_parent) DATASET_PARENT="$2"; shift 2 ;;
+    --rlbench_root) RLBENCH_ROOT="$2"; shift 2 ;;
     --save_root) SAVE_ROOT="$2"; shift 2 ;;
     --python) PYTHON_BIN="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
@@ -107,7 +110,7 @@ mkdir -p "${SAVE_ROOT}"
 
 if [[ "${SUMMARIZE_ONLY}" -eq 1 ]]; then
   cmd=(
-    "${PYTHON_BIN}" "${WORKSPACE_ROOT}/src/inference/rlbench/eval_put_rubbish_in_bin.py"
+    "${PYTHON_BIN}" "${WORKSPACE_ROOT}/src/inference/rlbench/eval.py"
     --task "${TASK}"
     --aggregate_only
     --aggregate_root "${SAVE_ROOT}"
@@ -201,7 +204,6 @@ find_latest_training_dir() {
   )
 
   if [[ -z "${best_path}" ]]; then
-    echo "[ERROR] No matching training dir for policy=${policy}, state=${state}, task=${TASK}" >&2
     return 1
   fi
 
@@ -214,13 +216,17 @@ for policy in smolvla groot; do
   echo "Policy block: ${policy} (all ${RUNS} variation/seed pairs first)"
 
   for state in eef joint; do
-    action_mode="$(action_mode_for_state "${state}")"
-    checkpoint_dir="$(find_latest_training_dir "${policy}" "${state}")"
+    action_mode="$(action_mode_for_state "${state}")" || continue
     dataset_root="${DATASET_PARENT}/${TASK}_${state}"
 
+    if ! checkpoint_dir="$(find_latest_training_dir "${policy}" "${state}")"; then
+      echo "[WARN] No checkpoint for policy=${policy} state=${state} task=${TASK} under ${CHECKPOINT_ROOT}; skipping." >&2
+      continue
+    fi
+
     if [[ ! -d "${dataset_root}" ]]; then
-      echo "[ERROR] Dataset root not found: ${dataset_root}" >&2
-      exit 1
+      echo "[WARN] Dataset root not found: ${dataset_root}; skipping policy=${policy} state=${state}." >&2
+      continue
     fi
 
     echo
@@ -247,7 +253,7 @@ for policy in smolvla groot; do
       echo "save_path   : ${save_path}"
 
       cmd=(
-        "${PYTHON_BIN}" "${WORKSPACE_ROOT}/src/inference/rlbench/eval_put_rubbish_in_bin.py"
+        "${PYTHON_BIN}" "${WORKSPACE_ROOT}/src/inference/rlbench/eval.py"
         --task "${TASK}"
         --variation "${pair_variation}"
         --runs "1"
@@ -259,6 +265,7 @@ for policy in smolvla groot; do
         --dataset_root "${dataset_root}"
         --task_description "${TASK_DESCRIPTION}"
         --save_path "${save_path}"
+        --rlbench_root "${RLBENCH_ROOT}"
       )
 
       if [[ -n "${DEVICE}" ]]; then
