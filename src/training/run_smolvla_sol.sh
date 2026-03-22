@@ -34,6 +34,7 @@ DATASET_KIND="${DATASET_KIND:-}"
 DATASET_ID="${DATASET_ID:-}"
 DATASET_ROOT="${DATASET_ROOT:-}"
 EXTRA_TRAIN_ARGS=()
+DEBUG_MODE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -61,6 +62,10 @@ while [[ $# -gt 0 ]]; do
       TASK_NAME="$2"
       shift 2
       ;;
+    --debug)
+      DEBUG_MODE=1
+      shift
+      ;;
     --help|-h)
       echo "Usage: sbatch src/training/run_smolvla_sol.sh [-- <extra train args...>]"
       echo ""
@@ -70,12 +75,14 @@ while [[ $# -gt 0 ]]; do
       echo "  --dataset-id           Override dataset id (default: put_rubbish_in_bin_all)"
       echo "  --dataset-root         Override dataset path"
       echo "  --task-name            Override task prefix (default: put_rubbish_in_bin)"
+      echo "  --debug                Debug run (forces NUM_STEPS=2; keeps BATCH_SIZE unchanged)"
       echo "  --                     Forward remaining args to lerobot-train"
       echo ""
       echo "Examples:"
       echo "  sbatch src/training/run_smolvla_sol.sh"
       echo "  sbatch src/training/run_smolvla_sol.sh --dataset-kind eef"
       echo "  sbatch src/training/run_smolvla_sol.sh --dataset-kind joint"
+      echo "  sbatch src/training/run_smolvla_sol.sh --debug"
       echo "  sbatch src/training/run_smolvla_sol.sh -- --steps 5000"
       exit 0
       ;;
@@ -130,6 +137,11 @@ export NUM_PROCESSES="${NUM_PROCESSES:-1}"
 export NUM_WORKERS="${NUM_WORKERS:-8}"
 export WANDB_ENABLE="${WANDB_ENABLE:-true}"
 
+if [[ "${DEBUG_MODE}" -eq 1 ]]; then
+  # Debug mode only reduces step count; batch size remains unchanged.
+  export NUM_STEPS=2
+fi
+
 # Configure Hugging Face cache locations (use project models/hf_cache by default).
 export HF_HOME="${HF_HOME:-models/hf_cache}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
@@ -161,8 +173,12 @@ echo "MIXED_PRECISION  : ${MIXED_PRECISION}"
 echo "VIDEO_BACKEND    : ${VIDEO_BACKEND}"
 echo "WANDB_ENABLE     : ${WANDB_ENABLE}"
 echo "RENAME_MAP       : ${RENAME_MAP}"
+echo "DEBUG_MODE       : ${DEBUG_MODE}"
 if [[ ${#EXTRA_TRAIN_ARGS[@]} -gt 0 ]]; then
   echo "EXTRA_TRAIN_ARGS : ${EXTRA_TRAIN_ARGS[*]}"
+fi
+if [[ "${DEBUG_MODE}" -eq 1 ]]; then
+  echo "DEBUG_ESTIMATE   : ~20-60s for first step, ~2-8 min total to finish 2 steps"
 fi
 echo "============================="
 

@@ -34,6 +34,7 @@ TASK_NAME="${TASK_NAME:-put_rubbish_in_bin}"
 DATASET_KIND="${DATASET_KIND:-}"
 DATASET_ID="${DATASET_ID:-}"
 DATASET_ROOT="${DATASET_ROOT:-}"
+DEBUG_MODE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -59,6 +60,10 @@ while [[ $# -gt 0 ]]; do
       TASK_NAME="$2"
       shift 2
       ;;
+    --debug)
+      DEBUG_MODE=1
+      shift
+      ;;
     --help|-h)
       echo "Usage: sbatch src/training/run_groot_sol.sh"
       echo ""
@@ -68,12 +73,14 @@ while [[ $# -gt 0 ]]; do
       echo "  --dataset-id           Override dataset id (default: put_rubbish_in_bin_all)"
       echo "  --dataset-root         Override dataset path"
       echo "  --task-name            Override task prefix (default: put_rubbish_in_bin)"
+      echo "  --debug                Debug run (forces NUM_STEPS=2; keeps BATCH_SIZE unchanged)"
       echo ""
       echo "Examples:"
       echo "  sbatch src/training/run_groot_sol.sh"
       echo "  sbatch src/training/run_groot_sol.sh --dataset-kind eef"
       echo "  sbatch src/training/run_groot_sol.sh --dataset-kind joint"
       echo "  sbatch src/training/run_groot_sol.sh --dataset-id put_rubbish_in_bin_all"
+      echo "  sbatch src/training/run_groot_sol.sh --debug"
       exit 0
       ;;
     --)
@@ -118,6 +125,11 @@ export LOG_FREQ="${LOG_FREQ:-50}"
 export NUM_PROCESSES="${NUM_PROCESSES:-1}"
 export NUM_WORKERS="${NUM_WORKERS:-8}"
 
+if [[ "${DEBUG_MODE}" -eq 1 ]]; then
+  # Debug mode only reduces step count; batch size remains unchanged.
+  export NUM_STEPS=2
+fi
+
 # Policy tuning toggles.
 export TUNE_DIFFUSION_MODEL="${TUNE_DIFFUSION_MODEL:-false}"
 export TUNE_PROJECTOR="${TUNE_PROJECTOR:-true}"
@@ -154,6 +166,10 @@ echo "TUNE_DIFFUSION_MODEL : ${TUNE_DIFFUSION_MODEL}"
 echo "TUNE_PROJECTOR       : ${TUNE_PROJECTOR}"
 echo "TUNE_VISUAL          : ${TUNE_VISUAL}"
 echo "TUNE_LLM             : ${TUNE_LLM}"
+echo "DEBUG_MODE           : ${DEBUG_MODE}"
+if [[ "${DEBUG_MODE}" -eq 1 ]]; then
+  echo "DEBUG_ESTIMATE       : ~30-90s for first step, ~3-10 min total to finish 2 steps"
+fi
 echo "======================================"
 
 module load mamba/latest

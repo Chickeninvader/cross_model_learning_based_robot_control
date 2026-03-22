@@ -5,9 +5,11 @@ set -euo pipefail
 #   ./run_all_for_task.sh put_rubbish_in_bin
 #   ./run_all_for_task.sh put_rubbish_in_bin --debug
 #
-# Debug mode runs jobs directly (no sbatch) with very small settings:
-#   NUM_STEPS=1, BATCH_SIZE=2, SAVE_FREQ=1, LOG_FREQ=1, NUM_WORKERS=1
-# You can override these by exporting env vars before running this script.
+# Debug mode runs jobs directly (no sbatch) and forwards --debug to model scripts.
+# In debug mode:
+#   - NUM_STEPS is forced to 2 inside each run_*_sol.sh script
+#   - BATCH_SIZE is kept as normal default (64 unless you override env)
+#   - Typical timing is startup-dominated (see per-model estimate printed below)
 TASK_NAME=""
 DEBUG_MODE="false"
 
@@ -61,10 +63,14 @@ for MODEL in smolvla groot; do
       DEBUG_OUTPUT_DIR="output/lerobot/debug/${MODEL}_${DATASET_ID}_${DEBUG_TS}"
       DEBUG_JOB_NAME="debug_${MODEL}_${DATASET_ID}"
 
-      echo "[DEBUG] Running locally: $SCRIPT $MODE --dataset-id $DATASET_ID --dataset-root $DATASET_ROOT --task-name $TASK_NAME"
+      if [[ "${MODEL}" == "smolvla" ]]; then
+        echo "[DEBUG] Estimated timing (${MODEL}): ~20-60s first step, ~2-8 min total (2 steps)"
+      else
+        echo "[DEBUG] Estimated timing (${MODEL}): ~30-90s first step, ~3-10 min total (2 steps)"
+      fi
+      echo "[DEBUG] Running locally: $SCRIPT $MODE --dataset-id $DATASET_ID --dataset-root $DATASET_ROOT --task-name $TASK_NAME --debug"
       echo "[DEBUG] OUTPUT_DIR=${DEBUG_OUTPUT_DIR}"
-      NUM_STEPS="${NUM_STEPS:-1}" \
-      BATCH_SIZE="${BATCH_SIZE:-2}" \
+      BATCH_SIZE="${BATCH_SIZE:-64}" \
       SAVE_FREQ="${SAVE_FREQ:-1}" \
       LOG_FREQ="${LOG_FREQ:-1}" \
       NUM_WORKERS="${NUM_WORKERS:-1}" \
@@ -74,7 +80,8 @@ for MODEL in smolvla groot; do
       bash "$SCRIPT" "$MODE" \
         --dataset-id "$DATASET_ID" \
         --dataset-root "$DATASET_ROOT" \
-        --task-name "$TASK_NAME"
+        --task-name "$TASK_NAME" \
+        --debug
     else
       echo "Submitting: $SCRIPT $MODE --dataset-id $DATASET_ID --dataset-root $DATASET_ROOT --task-name $TASK_NAME"
       sbatch "$SCRIPT" "$MODE" \
