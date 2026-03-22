@@ -1,22 +1,12 @@
 """
-Scene-graph → natural-language task description utilities.
+Scene-graph -> task-description utilities.
 
-Converts RLBench scene-graph relationship transitions into language prompts
-suitable for VLA policies (GR00T, π0, etc.)  The format is inspired by:
+Task description format is intentionally simple and structured:
 
-* **ConceptGraphs** (Gu et al., ICRA 2024) — JSON node-list + system prompt
-* **DEFAULT_PROMPT** from `build_scenegraph_cfslam.py` — object-relation edges
+    object1 relation object2, object3 relation object4
 
-Only objects and spatial/functional relations that *change* between the
-beginning and end of an episode are described; static context is omitted so
-the instruction stays concise and action-oriented.
-
-Public API
-----------
-    scene_graph_transition_to_task(begin_rels, end_rels, objects_meta, task_name)
-        → str   (natural-language instruction)
-    format_scene_graph_context(objects_meta, relationships)
-        → str   (structured scene description for LLM context)
+Descriptions are generated from scene-graph transitions, prioritizing goal
+relationships (end state) that differ from the beginning state.
 """
 
 from __future__ import annotations
@@ -25,72 +15,67 @@ import json
 from typing import Any
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Relation-type → verb mapping (extend as new RLBench tasks are added)
-# ──────────────────────────────────────────────────────────────────────────
-_RELATION_VERBS: dict[str, dict[str, str]] = {
-    # type → {direction → verb phrase}
-    "holding": {
-        "acquire": "pick up {obj2}",
-        "release": "release {obj2}",
-    },
-    "stacked": {
-        "acquire": "stack {obj1} on {obj2}",
-        "release": "unstack {obj1} from {obj2}",
-    },
-    "on": {
-        "acquire": "place {obj1} on {obj2}",
-        "release": "remove {obj1} from {obj2}",
-    },
-    "in": {
-        "acquire": "place {obj1} in {obj2}",
-        "release": "remove {obj1} from {obj2}",
-    },
-    "near": {
-        "acquire": "move {obj1} near {obj2}",
-        "release": "move {obj1} away from {obj2}",
-    },
-}
-
-# Fallback template when relation type is unknown
-_FALLBACK_ACQUIRE = "achieve {type} between {obj1} and {obj2}"
-_FALLBACK_RELEASE = "undo {type} between {obj1} and {obj2}"
-
-
 def _rel_key(rel: dict) -> str:
     """Canonical key for a single relationship dict (order-independent)."""
     return json.dumps(rel, sort_keys=True)
 
 
 def _pretty_obj(name: str) -> str:
-    """Human-readable object name: ``cup_1`` → ``cup 1``."""
-    return name.replace("_", " ")
+    """Keep object id stable for training prompts."""
+    return str(name)
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Core: transition → language
-# ──────────────────────────────────────────────────────────────────────────
+def _object_phrase(obj_id: str, objects_meta: dict[str, Any] | None) -> str:
+    """Resolve object id to an attribute-aware phrase (e.g. 'white rubbish')."""
+    if not objects_meta:
+        return _pretty_obj(obj_id)
 
-def _describe_new_relation(rel: dict) -> str:
-    """Describe a *newly acquired* relation as an imperative phrase."""
-    rtype = rel.get("type", "unknown")
-    obj1 = _pretty_obj(rel.get("object1", "object"))
-    obj2 = _pretty_obj(rel.get("object2", "object"))
+    meta = objects_meta.get(obj_id, {})
+    if not isinstance(meta, dict):
+        return _pretty_obj(obj_id)
 
-    verbs = _RELATION_VERBS.get(rtype, {})
-    template = verbs.get("acquire", _FALLBACK_ACQUIRE)
-    return template.format(obj1=obj1, obj2=obj2, type=rtype)
+    base_phrase = _pretty_obj(obj_id)
+    base_type = meta.get("type")
+    if isinstance(base_type, str) and base_type.strip():
+        base_phrase = _pretty_obj(base_type.strip())
+    else:
+        # Fallback to display name when type is unavailable.
+        display_name = meta.get("display_name")
+        if isinstance(display_name, str) and display_name.strip():
+            base_phrase = _pretty_obj(display_name.strip())
+
+    attrs = meta.get("attributes", {})
+    color = attrs.get("color") if isinstance(attrs, dict) else None
+    if isinstance(color, str) and color.strip() and color.strip().lower() != "unknown":
+        return f"{color.strip()} {base_phrase}".strip()
+    return base_phrase
 
 
-def _describe_lost_relation(rel: dict) -> str:
-    """Describe a *lost* relation as an imperative phrase."""
-    rtype = rel.get("type", "unknown")
-    obj1 = _pretty_obj(rel.get("object1", "object"))
-    obj2 = _pretty_obj(rel.get("object2", "object"))
+def _relation_triplet(
+    rel: dict,
+    objects_meta: dict[str, Any] | None = None,
+) -> str:
+    """Format one relation triplet: 'obj1 relation obj2'."""
+    obj1 = _object_phrase(rel.get("object1", "object"), objects_meta)
+    rel_type = str(rel.get("type", "related_to"))
+    obj2 = _object_phrase(rel.get("object2", "object"), objects_meta)
+    return f"{obj1} {rel_type} {obj2}"
 
-    verbs = _RELATION_VERBS.get(rtype, {})
-    template = verbs.get("release", _FALLBACK_RELEASE)
-    return template.format(obj1=obj1, obj2=obj2, type=rtype)
+
+def _sorted_unique_relations(rels: list[dict]) -> list[dict]:
+    """Deduplicate and return stable sorted relation dicts."""
+    uniq: dict[str, dict] = {}
+    for r in rels:
+        uniq[_rel_key(r)] = r
+    vals = list(uniq.values())
+    vals.sort(
+        key=lambda r: (
+            str(r.get("object1", "")),
+            str(r.get("type", "")),
+            str(r.get("object2", "")),
+        )
+    )
+    return vals
 
 
 def scene_graph_transition_to_task(
@@ -99,7 +84,7 @@ def scene_graph_transition_to_task(
     objects_meta: dict[str, Any] | None = None,
     task_name: str | None = None,
 ) -> str:
-    """Convert a scene-graph transition into a natural-language task instruction.
+    """Convert a scene-graph transition into a relation-triplet task string.
 
     Parameters
     ----------
@@ -118,34 +103,46 @@ def scene_graph_transition_to_task(
     Returns
     -------
     str
-        A concise imperative instruction, e.g.
-        ``"Pick up cup 1 and stack cup 1 on cup 2."``
+        Comma-separated relation triplets, e.g.
+        ``"robot holding cup_1, cup_1 on cup_2"``
     """
     begin_set = {_rel_key(r) for r in begin_rels}
     end_set = {_rel_key(r) for r in end_rels}
 
-    # New relations acquired in this episode
-    new_rels = [r for r in end_rels if _rel_key(r) not in begin_set]
-    # Relations that disappeared
-    lost_rels = [r for r in begin_rels if _rel_key(r) not in end_set]
+    # Prefer goal-side transition edges (new in end state).
+    goal_delta = [r for r in end_rels if _rel_key(r) not in begin_set]
+    goal_delta = _sorted_unique_relations(goal_delta)
 
-    parts: list[str] = []
-    for r in lost_rels:
-        parts.append(_describe_lost_relation(r))
-    for r in new_rels:
-        parts.append(_describe_new_relation(r))
+    # If there are no new goal edges, fallback to full end state.
+    if not goal_delta:
+        goal_delta = _sorted_unique_relations(end_rels)
 
-    if not parts:
-        # No change detected — fallback to generic task description
+    # If end state is empty, fallback to relations removed from begin state.
+    if not goal_delta:
+        removed = [r for r in begin_rels if _rel_key(r) not in end_set]
+        goal_delta = _sorted_unique_relations(removed)
+
+    if not goal_delta:
         if task_name:
-            return f"Perform the {_pretty_obj(task_name)} task."
-        return "Perform the task."
+            return _pretty_obj(task_name)
+        return "task"
 
-    instruction = ", then ".join(parts) + "."
-    # Capitalize first letter
-    instruction = instruction[0].upper() + instruction[1:]
+    parts = [_relation_triplet(r, objects_meta) for r in goal_delta]
+    return ", ".join(parts)
 
-    return instruction
+
+def scene_graph_goal_to_task(
+    end_rels: list[dict],
+    objects_meta: dict[str, Any] | None = None,
+) -> str:
+    """Generate task string from goal scene graph only.
+
+    Output format: ``obj relation obj, obj relation obj``.
+    """
+    goal_rels = _sorted_unique_relations(end_rels or [])
+    if not goal_rels:
+        return "task"
+    return ", ".join(_relation_triplet(r, objects_meta) for r in goal_rels)
 
 
 def scene_graph_transition_to_task_with_context(
@@ -243,7 +240,7 @@ def format_scene_graph_context(
 
 def generate_task_descriptions(
     episodes: list[dict],
-    objects_meta: dict[str, Any],
+    objects_meta: dict[str, Any] | None,
     task_name: str,
     *,
     use_context: bool = False,
@@ -258,7 +255,7 @@ def generate_task_descriptions(
     objects_meta : dict
         Object metadata from the scene graph.
     task_name : str
-        RLBench task name.
+        RLBench task name (currently unused for non-context mode).
     use_context : bool
         If True, use the richer ConceptGraphs-style prompt that includes the
         full scene description.  Default False (concise imperative only).
@@ -268,16 +265,20 @@ def generate_task_descriptions(
     list[str]
         One task description string per episode.
     """
-    fn = (
-        scene_graph_transition_to_task_with_context
-        if use_context
-        else scene_graph_transition_to_task
-    )
     descs = []
     for ep in episodes:
+        begin_sg = ep.get("begin_sg", [])
+        end_sg = ep.get("end_sg", [])
         if use_context:
-            desc = fn(ep["begin_sg"], ep["end_sg"], objects_meta, task_name)
+            # Context mode should include transition information (begin -> end).
+            desc = scene_graph_transition_to_task_with_context(
+                begin_sg,
+                end_sg,
+                objects_meta or {},
+                task_name=None,
+            )
         else:
-            desc = fn(ep["begin_sg"], ep["end_sg"], objects_meta, task_name)
+            # Non-context mode should use goal scene graph only.
+            desc = scene_graph_goal_to_task(end_sg, objects_meta)
         descs.append(desc)
     return descs

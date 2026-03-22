@@ -82,7 +82,12 @@ def process_variation(task_name, variation, episode, dataset_path, camera, templ
     
     # Build scene graph
     scene_graph = {
-        'objects': {name: {'type': name} for name in OBJECTS},
+        'objects': utils.build_scene_graph_objects(
+            OBJECTS,
+            image_data=image_data,
+            handles_by_object=handles_by_object,
+            start_frame=0,
+        ),
         'frames': []
     }
     
@@ -106,7 +111,11 @@ def process_variation(task_name, variation, episode, dataset_path, camera, templ
     
     # Apply template
     try:
-        utils.apply_relationship_template(template_path, scene_graph, gripper_states)
+        utils.apply_relationship_template(
+            template_path,
+            scene_graph,
+            gripper_states,
+        )
     except Exception as e:
         print(f"❌ Failed to apply template: {e}")
         return False

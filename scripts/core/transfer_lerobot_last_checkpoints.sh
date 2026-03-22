@@ -8,16 +8,33 @@ set -euo pipefail
 # Defaults are tailored to this project and can be overridden via env vars:
 #   REMOTE_HOST, REMOTE_OUTPUT_DIR, LOCAL_OUTPUT_DIR, STATE_FILE
 
-REMOTE_HOST="${REMOTE_HOST:-ngocbach@en4217548l}"
+REMOTE_HOST="${REMOTE_HOST:-ngocbach@login.sol.rc.asu.edu}"
 REMOTE_OUTPUT_DIR="${REMOTE_OUTPUT_DIR:-/scratch/kpham34/cross_model_learning_based_robot_control/output/lerobot}"
 LOCAL_OUTPUT_DIR="${LOCAL_OUTPUT_DIR:-$HOME/Desktop/cross_model_learning_based_robot_control/output/lerobot}"
 STATE_FILE="${STATE_FILE:-$LOCAL_OUTPUT_DIR/.transferred_last_checkpoints.tsv}"
+SSH_CONTROL_PATH="${SSH_CONTROL_PATH:-$HOME/.ssh/cm-%r@%h:%p}"
 
 mkdir -p "$LOCAL_OUTPUT_DIR"
 touch "$STATE_FILE"
 
+SSH_COMMON_OPTS=(
+    -o ControlMaster=auto
+    -o ControlPersist=600
+    -o "ControlPath=$SSH_CONTROL_PATH"
+)
+
 log() {
     printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+start_master_connection() {
+    mkdir -p "$HOME/.ssh"
+    log "Opening SSH master connection to $REMOTE_HOST (one password prompt)"
+    ssh "${SSH_COMMON_OPTS[@]}" -MNf "$REMOTE_HOST"
+}
+
+stop_master_connection() {
+    ssh "${SSH_COMMON_OPTS[@]}" -O exit "$REMOTE_HOST" >/dev/null 2>&1 || true
 }
 
 state_has() {
@@ -84,7 +101,7 @@ bootstrap_existing_local() {
 }
 
 list_remote_last_targets() {
-    ssh "$REMOTE_HOST" "bash -lc '
+    ssh "${SSH_COMMON_OPTS[@]}" "$REMOTE_HOST" "bash -lc '
 set -euo pipefail
 shopt -s nullglob
 for run_dir in \"${REMOTE_OUTPUT_DIR}\"/*; do
@@ -117,7 +134,7 @@ transfer_one() {
 
     mkdir -p "$local_ckpt_root"
     log "Transferring $run_name ($local_ckpt_dirname)"
-    scp -r "${REMOTE_HOST}:${remote_ckpt_path}" "$local_ckpt_root/"
+    scp "${SSH_COMMON_OPTS[@]}" -r "${REMOTE_HOST}:${remote_ckpt_path}" "$local_ckpt_root/"
     if [[ "$local_ckpt_dirname" != "last" ]]; then
         ln -sfn "$local_ckpt_dirname" "$local_ckpt_root/last"
     fi
@@ -128,6 +145,9 @@ main() {
     local line run_name remote_ckpt_path transferred_count skipped_count
     transferred_count=0
     skipped_count=0
+
+    start_master_connection
+    trap stop_master_connection EXIT
 
     bootstrap_existing_local
 

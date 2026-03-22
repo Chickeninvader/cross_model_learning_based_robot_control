@@ -95,6 +95,40 @@ CAMERAS: Dict[str, str] = {
 }
 
 
+def _is_robot_or_gripper_object(obj_name: str, meta: dict[str, Any] | None) -> bool:
+    """Return True if object looks like robot/gripper related."""
+    text_parts = [str(obj_name)]
+    if isinstance(meta, dict):
+        for k in ("type", "display_name"):
+            v = meta.get(k)
+            if isinstance(v, str):
+                text_parts.append(v)
+    text = " ".join(text_parts).lower()
+    return ("robot" in text) or ("gripper" in text)
+
+
+def _strip_robot_gripper_color_attributes(objects_meta: dict[str, Any]) -> dict[str, Any]:
+    """Remove color attribute for robot/gripper-related objects."""
+    sanitized: dict[str, Any] = {}
+    for obj_name, meta in (objects_meta or {}).items():
+        if not isinstance(meta, dict):
+            sanitized[obj_name] = meta
+            continue
+
+        meta_copy = dict(meta)
+        if _is_robot_or_gripper_object(obj_name, meta_copy):
+            attrs = meta_copy.get("attributes")
+            if isinstance(attrs, dict) and "color" in attrs:
+                attrs_copy = dict(attrs)
+                attrs_copy.pop("color", None)
+                if attrs_copy:
+                    meta_copy["attributes"] = attrs_copy
+                else:
+                    meta_copy.pop("attributes", None)
+        sanitized[obj_name] = meta_copy
+    return sanitized
+
+
 # ===========================================================================
 # Main conversion logic
 # ===========================================================================
@@ -195,7 +229,7 @@ def convert(
     # NOTE: actions are computed per-episode below (not globally),
     # because relative actions would be wrong at episode boundaries.
 
-    objects_meta = scene_graph.get("objects", {})
+    objects_meta = _strip_robot_gripper_color_attributes(scene_graph.get("objects", {}))
 
     # -- Generate task descriptions from scene-graph transitions -------------
     task_descriptions: List[str] = generate_task_descriptions(
@@ -573,6 +607,78 @@ def convert(
     print(f"       {n_episodes} episodes, {total_frames} total frames, {fps} fps")
     print(f"       Tasks: {all_task_strings}")
     return out_dir
+
+
+def _concat_videos_ffmpeg(
+    input_videos: List[str],
+    output_path: str,
+    *,
+    fps: int,
+    codec: str = VIDEO_CODEC,
+    pix_fmt: str = PIX_FMT,
+) -> str:
+    """Concatenate multiple MP4 files into one."""
+    import subprocess
+    import tempfile
+
+    if not input_videos:
+        raise ValueError("No input videos provided for concatenation")
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        list_path = f.name
+        for p in input_videos:
+            f.write(f"file '{os.path.abspath(p)}'\n")
+
+    try:
+        cmd_copy = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            list_path,
+            "-an",
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            output_path,
+        ]
+        try:
+            subprocess.run(cmd_copy, check=True, capture_output=True)
+            return output_path
+        except subprocess.CalledProcessError:
+            cmd_reencode = [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                list_path,
+                "-an",
+                "-c:v",
+                codec,
+                "-pix_fmt",
+                pix_fmt,
+                "-r",
+                str(fps),
+                "-movflags",
+                "+faststart",
+                output_path,
+            ]
+            subprocess.run(cmd_reencode, check=True, capture_output=True)
+            return output_path
+    finally:
+        try:
+            os.unlink(list_path)
+        except OSError:
+            pass
 
 
 # ===========================================================================
@@ -953,6 +1059,271 @@ def merge_all_variations(
     return out_dir
 
 
+def merge_all_tasks_datasets(
+    input_root: str,
+    action_space: str,
+    output_root: str | None = None,
+    output_name: str | None = None,
+):
+    """Merge all task datasets for one action space into one dataset.
+
+    Expects task datasets already exported under *input_root* with names like
+    ``<task>_eef`` or ``<task>_joint``.
+    """
+    if output_root is None:
+        output_root = input_root
+
+    action_space = (action_space or "").strip().lower()
+    if action_space not in {"eef", "joint"}:
+        raise ValueError(f"Unknown action_space: {action_space}")
+
+    dataset_name = output_name or f"all_task_{action_space}"
+
+    candidates = [
+        d for d in os.listdir(input_root)
+        if d.endswith(f"_{action_space}")
+        and d != dataset_name
+        and os.path.isdir(os.path.join(input_root, d))
+        and os.path.exists(os.path.join(input_root, d, "meta", "info.json"))
+        and os.path.exists(os.path.join(input_root, d, "meta", "tasks.parquet"))
+        and os.path.exists(os.path.join(input_root, d, "meta", "episodes", "chunk-000", "file-000.parquet"))
+        and os.path.exists(os.path.join(input_root, d, "data", "chunk-000", "file-000.parquet"))
+    ]
+    candidates.sort()
+
+    if not candidates:
+        print(f"[WARN] No task datasets found to merge for action_space='{action_space}' under: {input_root}")
+        return None
+
+    out_dir = os.path.join(output_root, dataset_name)
+    print(f"\n{'='*60}")
+    print(f"[MERGE] Merging {len(candidates)} task dataset(s) -> {out_dir}")
+    print(f"{'='*60}")
+    for d in candidates:
+        print(f"       - {d}")
+
+    ref_info = _load_json(os.path.join(input_root, candidates[0], "meta", "info.json"))
+    fps = ref_info["fps"]
+    features = ref_info["features"]
+    camera_keys = [k for k, v in features.items() if v.get("dtype") == "video"]
+
+    all_data_rows: List[pd.DataFrame] = []
+    all_episode_meta: List[dict] = []
+    all_task_strings: List[str] = []
+    all_task_string_set: set = set()
+    cam_to_video_inputs: Dict[str, List[str]] = {k: [] for k in camera_keys}
+
+    global_episode_idx = 0
+    global_frame_idx = 0
+    total_frames = 0
+    dataset_summaries: List[dict] = []
+
+    for ds_name in candidates:
+        ds_dir = os.path.join(input_root, ds_name)
+        info = _load_json(os.path.join(ds_dir, "meta", "info.json"))
+        if int(info.get("fps", fps)) != int(fps):
+            raise ValueError(
+                f"All datasets must use the same fps. Expected {fps}, got {info.get('fps')} in {ds_dir}"
+            )
+
+        tasks_df = pd.read_parquet(os.path.join(ds_dir, "meta", "tasks.parquet"))
+        episodes_df = pd.read_parquet(
+            os.path.join(ds_dir, "meta", "episodes", "chunk-000", "file-000.parquet")
+        )
+        data_df = pd.read_parquet(
+            os.path.join(ds_dir, "data", "chunk-000", "file-000.parquet")
+        )
+
+        n_episodes = int(info.get("total_episodes", len(episodes_df)))
+        n_frames = int(info.get("total_frames", len(data_df)))
+
+        for task_str in tasks_df.index.tolist():
+            if task_str not in all_task_string_set:
+                all_task_strings.append(task_str)
+                all_task_string_set.add(task_str)
+
+        ep_offset = global_episode_idx
+        frame_offset = global_frame_idx
+
+        df = data_df.copy()
+        df["episode_index"] = df["episode_index"] + ep_offset
+        df["index"] = df["index"] + frame_offset
+        all_data_rows.append(df)
+
+        episodes_df = episodes_df.sort_values("episode_index")
+        base_from = int(episodes_df.iloc[0]["dataset_from_index"]) if len(episodes_df) > 0 else 0
+
+        for _, ep_row in episodes_df.iterrows():
+            old_ep_idx = int(ep_row["episode_index"])
+            new_ep_idx = old_ep_idx + ep_offset
+            chunk_idx = 0
+
+            length = int(ep_row["length"])
+            new_from = global_frame_idx + int(ep_row["dataset_from_index"]) - base_from
+            new_to = new_from + length
+            video_from_ts = new_from / fps
+            video_to_ts = new_to / fps
+
+            ep_meta: Dict[str, Any] = {
+                "episode_index": new_ep_idx,
+                "data/chunk_index": chunk_idx,
+                "data/file_index": 0,
+                "dataset_from_index": new_from,
+                "dataset_to_index": new_to,
+                "length": length,
+                "meta/episodes/chunk_index": 0,
+                "meta/episodes/file_index": 0,
+            }
+            if "tasks" in ep_row.index:
+                tasks_val = ep_row["tasks"]
+                first_task = None
+                try:
+                    if tasks_val is not None and len(tasks_val) > 0:
+                        first_task = tasks_val[0]
+                except Exception:
+                    first_task = None
+                if first_task is not None:
+                    ep_meta["tasks"] = np.array([str(first_task)], dtype=object)
+
+            for cam_key in camera_keys:
+                old_chunk = int(ep_row.get(f"videos/{cam_key}/chunk_index", 0))
+                old_file = int(ep_row.get(f"videos/{cam_key}/file_index", 0))
+                ep_meta[f"videos/{cam_key}/chunk_index"] = chunk_idx
+                ep_meta[f"videos/{cam_key}/file_index"] = 0
+                ep_meta[f"videos/{cam_key}/from_timestamp"] = float(video_from_ts)
+                ep_meta[f"videos/{cam_key}/to_timestamp"] = float(video_to_ts)
+
+                src_video = os.path.join(
+                    ds_dir,
+                    "videos",
+                    cam_key,
+                    f"chunk-{old_chunk:03d}",
+                    f"file-{old_file:03d}.mp4",
+                )
+                if not os.path.exists(src_video):
+                    raise FileNotFoundError(f"Missing expected source video: {src_video}")
+                cam_to_video_inputs[cam_key].append(src_video)
+
+            for col in ep_row.index:
+                if col.startswith("stats/"):
+                    ep_meta[col] = ep_row[col]
+
+            all_episode_meta.append(ep_meta)
+
+        old_idx_to_str = {
+            int(row["task_index"]): task_str for task_str, row in tasks_df.iterrows()
+        }
+        dataset_summaries.append({
+            "name": ds_name,
+            "episodes": n_episodes,
+            "frames": n_frames,
+            "ep_offset": ep_offset,
+            "frame_offset": frame_offset,
+            "old_idx_to_str": old_idx_to_str,
+        })
+        global_episode_idx += n_episodes
+        global_frame_idx += n_frames
+        total_frames += n_frames
+
+    total_episodes = global_episode_idx
+    print(f"[MERGE] Total: {total_episodes} episodes, {total_frames} frames")
+
+    task_str_to_idx = {s: i for i, s in enumerate(all_task_strings)}
+
+    merged_data = pd.concat(all_data_rows, ignore_index=True)
+    for ds in dataset_summaries:
+        frame_start = ds["frame_offset"]
+        frame_end = ds["frame_offset"] + ds["frames"]
+        mask = (merged_data["index"] >= frame_start) & (merged_data["index"] < frame_end)
+        old_idx_to_str = ds["old_idx_to_str"]
+        for col in [
+            "annotation.human.action.task_description", "task_index",
+            "annotation.human.action.task_name", "annotation.human.validity",
+        ]:
+            if col in merged_data.columns:
+                old_vals = merged_data.loc[mask, col].values
+                merged_data.loc[mask, col] = np.array([
+                    task_str_to_idx.get(old_idx_to_str.get(int(v), ""), int(v))
+                    for v in old_vals
+                ])
+
+    merged_data["index"] = np.arange(len(merged_data), dtype=np.int64)
+
+    print("[MERGE] Building single video per camera (file-000.mp4) ...")
+    for cam_key in camera_keys:
+        out_video = os.path.join(
+            out_dir,
+            "videos",
+            cam_key,
+            "chunk-000",
+            "file-000.mp4",
+        )
+        _concat_videos_ffmpeg(cam_to_video_inputs[cam_key], out_video, fps=fps)
+
+    data_dir = os.path.join(out_dir, "data", "chunk-000")
+    os.makedirs(data_dir, exist_ok=True)
+    merged_data.to_parquet(os.path.join(data_dir, "file-000.parquet"), index=False)
+    print(f"[MERGE] Wrote data parquet ({len(merged_data)} rows)")
+
+    meta_dir = os.path.join(out_dir, "meta")
+    os.makedirs(meta_dir, exist_ok=True)
+    pd.DataFrame(
+        {"task_index": list(range(len(all_task_strings)))}, index=all_task_strings
+    ).to_parquet(os.path.join(meta_dir, "tasks.parquet"))
+
+    ep_meta_dir = os.path.join(meta_dir, "episodes", "chunk-000")
+    os.makedirs(ep_meta_dir, exist_ok=True)
+    pd.DataFrame(all_episode_meta).to_parquet(
+        os.path.join(ep_meta_dir, "file-000.parquet"), index=False
+    )
+
+    info_out = dict(ref_info)
+    info_out["total_episodes"] = total_episodes
+    info_out["total_frames"] = total_frames
+    info_out["total_tasks"] = len(all_task_strings)
+    info_out["splits"] = {"train": f"0:{total_episodes}"}
+    for key in ["object_color_map", "scene_graph_objects", "episodes_scene_graph"]:
+        info_out.pop(key, None)
+    info_out["merged_from"] = [d["name"] for d in dataset_summaries]
+    with open(os.path.join(meta_dir, "info.json"), "w") as f:
+        json.dump(info_out, f, indent=4)
+
+    stats: Dict[str, Any] = {}
+    for feat_name, feat_spec in (ref_info.get("features") or {}).items():
+        dtype = (feat_spec or {}).get("dtype")
+        if dtype == "video":
+            stats[feat_name] = compute_image_stats_placeholder(total_frames)
+            continue
+
+        if feat_name not in merged_data.columns:
+            continue
+
+        if dtype == "bool":
+            stats[feat_name] = compute_bool_stats_groot(merged_data[feat_name].values)
+            continue
+
+        shape = (feat_spec or {}).get("shape", [1])
+        is_vector = False
+        try:
+            if isinstance(shape, list) and len(shape) > 0 and int(shape[0]) > 1:
+                is_vector = True
+        except Exception:
+            is_vector = False
+
+        if is_vector:
+            arr = np.stack(merged_data[feat_name].values).astype(np.float64)
+        else:
+            arr = merged_data[feat_name].values.astype(np.float64).reshape(-1, 1)
+        stats[feat_name] = compute_feature_stats_groot(arr)
+
+    with open(os.path.join(meta_dir, "stats.json"), "w") as f:
+        json.dump(stats, f, indent=4)
+
+    print(f"\n[DONE] Merged dataset '{dataset_name}' written to {out_dir}")
+    print(f"       {total_episodes} episodes, {total_frames} frames from {len(candidates)} task datasets")
+    return out_dir
+
+
 def _load_json(path: str) -> dict:
     with open(path) as f:
         return json.load(f)
@@ -969,8 +1340,8 @@ def parse_args():
             "Produces <task>_eef and/or <task>_joint under --output_root."
         )
     )
-    p.add_argument("--task_name", type=str, required=True,
-                   help="RLBench task name, e.g. stack_cups")
+    p.add_argument("--task_name", type=str, default=None,
+                   help="RLBench task name, e.g. stack_cups (required for conversion mode)")
     p.add_argument(
         "--variation",
         type=int,
@@ -993,11 +1364,62 @@ def parse_args():
         choices=["eef", "joint", "both"],
         help="Which dataset(s) to create (default: both).",
     )
+    p.add_argument(
+        "--strict_variations",
+        action="store_true",
+        help="Fail immediately if any variation conversion fails. Default behavior is to skip failed variations.",
+    )
+    p.add_argument(
+        "--merge_all_tasks_root",
+        type=str,
+        default=None,
+        help=(
+            "Merge mode: root directory containing per-task datasets (e.g. <task>_eef/<task>_joint). "
+            "When set, converter skips per-task conversion and creates all_task_<action_space> dataset(s)."
+        ),
+    )
+    p.add_argument(
+        "--merged_output_name",
+        type=str,
+        default=None,
+        help="Optional output dataset name in merge mode. If omitted, uses all_task_<action_space>.",
+    )
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+
+    # Merge-only mode across tasks: builds all_task_eef / all_task_joint.
+    if args.merge_all_tasks_root:
+        merge_root = args.merge_all_tasks_root
+        if not os.path.isdir(merge_root):
+            raise SystemExit(f"Merge root directory not found: {merge_root}")
+
+        action_spaces = ["eef", "joint"] if args.action_space == "both" else [args.action_space]
+        merge_failed = False
+        print(f"[INFO] Merge-all-tasks root: {merge_root}")
+        print(f"[INFO] Action spaces to merge: {action_spaces}")
+
+        for action_space in action_spaces:
+            out_name = args.merged_output_name or f"all_task_{action_space}"
+            try:
+                merged_path = merge_all_tasks_datasets(
+                    input_root=merge_root,
+                    action_space=action_space,
+                    output_root=args.output_root,
+                    output_name=out_name,
+                )
+                if merged_path is None:
+                    merge_failed = True
+            except Exception as e:
+                merge_failed = True
+                print(f"[WARN] Failed to merge action_space='{action_space}': {e}")
+
+        raise SystemExit(1 if merge_failed else 0)
+
+    if not args.task_name:
+        raise SystemExit("--task_name is required unless --merge_all_tasks_root is provided.")
 
     task_dir = os.path.join(args.rlbench_root, args.task_name)
     if not os.path.isdir(task_dir):
@@ -1019,6 +1441,9 @@ if __name__ == "__main__":
 
     print(f"[INFO] Variations to process: {variation_nums}")
     print(f"[INFO] Action spaces to export: {action_spaces}")
+    print(f"[INFO] Strict variation mode: {args.strict_variations}")
+
+    overall_failed = False
 
     for action_space in action_spaces:
         final_name = f"{args.task_name}_{action_space}"
@@ -1030,17 +1455,34 @@ if __name__ == "__main__":
             prefix=f".{args.task_name}_{action_space}_tmp_",
             dir=args.output_root,
         ) as tmp_root:
+            successful_vars = []
+            failed_vars = []
             for var_num in variation_nums:
-                convert(
-                    task_name=args.task_name,
-                    variation=var_num,
-                    rlbench_root=args.rlbench_root,
-                    output_root=tmp_root,
-                    fps=args.fps,
-                    episode_index_in_rlbench=args.episode,
-                    use_context_prompt=args.use_context_prompt,
-                    action_space=action_space,
+                try:
+                    convert(
+                        task_name=args.task_name,
+                        variation=var_num,
+                        rlbench_root=args.rlbench_root,
+                        output_root=tmp_root,
+                        fps=args.fps,
+                        episode_index_in_rlbench=args.episode,
+                        use_context_prompt=args.use_context_prompt,
+                        action_space=action_space,
+                    )
+                    successful_vars.append(var_num)
+                except Exception as e:
+                    failed_vars.append(var_num)
+                    print(f"[WARN] Skipping variation {var_num} ({action_space}) due to error: {e}")
+                    if args.strict_variations:
+                        raise
+
+            if not successful_vars:
+                print(
+                    f"[WARN] No successful variations for task '{args.task_name}' "
+                    f"in action_space='{action_space}'. Skipping merge."
                 )
+                overall_failed = True
+                continue
 
             merge_all_variations(
                 task_name=args.task_name,
@@ -1048,3 +1490,12 @@ if __name__ == "__main__":
                 output_root=args.output_root,
                 output_name=final_name,
             )
+            print(
+                f"[INFO] action_space='{action_space}' summary: "
+                f"success={len(successful_vars)}, failed={len(failed_vars)}"
+            )
+            if failed_vars:
+                print(f"[INFO] Failed variations ({action_space}): {failed_vars}")
+
+    if overall_failed:
+        raise SystemExit(1)

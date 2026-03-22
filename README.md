@@ -1,16 +1,17 @@
 # Cross-Model Learning-Based Robot Control
 
 A pipeline for generating RLBench demonstrations, converting them to
-GR00T-compatible LeRobot v3 datasets, and training NVIDIA GR00T N1.5 policies.
+GR00T-compatible LeRobot v3 datasets, and training/evaluating policies.
 
 ## Table of Contents
 
 1. [RLBench Dataset Generation](#rlbench-dataset-generation)
-2. [Scene Graph Generation](#scene-graph-generation-environment)
-3. [Dataset Conversion (RLBench → LeRobot v3)](#dataset-conversion-rlbench--lerobot-v3)
-4. [GR00T N1.5 Training](#groot-n15-training-on-asu-sol-hpc)
-5. [Troubleshooting](#troubleshooting-sol-specific)
-6. [RLBench Inference (Simulator)](#rlbench-inference-simulator)
+2. [Scene Graph Generation](#scene-graph-generation)
+3. [Dataset Conversion (RLBench -> LeRobot v3)](#dataset-conversion-rlbench---lerobot-v3)
+4. [LeRobot Visualization (.rrd)](#lerobot-visualization-rrd)
+5. [Training Notes (ASU Sol HPC)](#training-notes-asu-sol-hpc)
+6. [RLBench Evaluation](#rlbench-evaluation)
+7. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -19,546 +20,229 @@ GR00T-compatible LeRobot v3 datasets, and training NVIDIA GR00T N1.5 policies.
 ### Quick Start (Headless Docker + OSMesa)
 
 ```bash
-cd external/RLBench
+cd /workspace/external/RLBench
 docker-compose up -d
 ```
 
-Inside the Docker container:
+### Recommended dataset generation command (from repo root)
+
+Use the core wrapper script (recommended):
 
 ```bash
-# IMPORTANT: use the vendored repos under /workspace/external (not any
-# pip-installed packages in the conda env).
-export PYTHONPATH="/workspace/external/RLBench:/workspace/external/lerobot/src:${PYTHONPATH:-}"
-
-cd /workspace/external/RLBench
-python -m rlbench.dataset_generator \
-    --tasks put_rubbish_in_bin \
-    --variations 1 \
-    --processes 1 \
-    --episodes_per_task 1 \
-    --start_variation 0 \
-    --save_path /workspace/datasets/rlbench \
-    --image_size 256 256 \
-    --renderer opengl3
-
-# Use `--variations -1` to collect all variations for a task.
+cd /workspace
+scripts/core/dataset_generator.sh 20 put_rubbish_in_bin meat_on_grill
 ```
 
-### Quick Install (OSMesa + Xvfb)
+This generates RLBench datasets under `datasets/rlbench_trial_2` by default.
 
-Run as root or with `sudo` inside the container:
 
-```bash
-apt-get update && apt-get install -y \
-    mesa-utils x11-utils libosmesa6 libosmesa6-dev xvfb
-```
+---
 
-Add these environment variables:
+## Scene Graph Generation
 
-```bash
-export LIBGL_ALWAYS_SOFTWARE=1
-export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
-export MESA_GL_VERSION_OVERRIDE=3.3
-export QT_X11_NO_MITSHM=1
-export QT_QPA_PLATFORM=xcb
-export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libOSMesa.so.6
-export DISPLAY=:99
-```
+Detailed instructions are in:
 
-Start headless X server:
+- `src/data_collection/README.md`
+
+Main tools:
+- `src/data_collection/RLBench_scene_graph_collection.ipynb`
+- `scripts/core/apply_rlbench_trial2_templates.sh`
+
+Apply templates in batch:
 
 ```bash
-Xvfb :99 -screen 0 1280x1024x24 >/tmp/xvfb-99.log 2>&1 &
-export DISPLAY=:99
-sleep 0.5
+cd /workspace
+scripts/core/apply_rlbench_trial2_templates.sh \
+  --dataset-path /workspace/datasets/rlbench_trial_2 \
+  --episode 0 \
+  --camera front
 ```
 
 ---
 
-## Scene Graph Generation Environment
+## Dataset Conversion (RLBench -> LeRobot v3)
+
 
 ```bash
-conda activate comp_robotics
-conda install -c conda-forge opencv ipywidgets matplotlib jupyterlab gymnasium -y
+cd /workspace
+scripts/core/convert_rlbench_to_lerobot_batch.sh \
+  --dataset-path /workspace/datasets/rlbench_trial_2 \
+  --output-root /workspace/datasets/lerobot_trial_2 \
+  --action-space both
 ```
 
-Follow the notebook in `examples/scene_graph_analyzer.ipynb` to annotate datasets.
+This creates:
 
----
+- Per-task datasets: `<task>_eef`, `<task>_joint`
+- Final merged datasets:
+  - `all_task_eef`
+  - `all_task_joint`
 
-## Dataset Conversion: RLBench → LeRobot v3
-
-### Prerequisites
-
-- Python 3.10+ with conda env `lerobot` activated
-- Packages: `pandas`, `pyarrow`, `numpy`, `Pillow`, `av` (PyAV)
+### Common options
 
 ```bash
-source activate lerobot
+# selected tasks only
+scripts/core/convert_rlbench_to_lerobot_batch.sh \
+  --dataset-path /workspace/datasets/rlbench_trial_2 \
+  --tasks "lamp_on,put_rubbish_in_bin"
+
+# include context prompt generation
+scripts/core/convert_rlbench_to_lerobot_batch.sh \
+  --dataset-path /workspace/datasets/rlbench_trial_2 \
+  --use-context-prompt
 ```
 
-### RLBench Dataset Structure (Input)
+### LeRobot dataset layout
 
-```
-datasets/rlbench/<task_name>/variation<num>/
-├── episodes/
-│   └── episode0/
-│       ├── front_rgb/        # 0.png, 1.png, …, N.png
-│       ├── wrist_rgb/        # 0.png, 1.png, …, N.png
-│       └── low_dim_obs.pkl   # RLBench Demo observations
-├── <task_name>_scene_graph.json   # Per-frame scene graph
-└── object_color_map.json          # Object name → mask color
-```
-
-### Convert a Single Variation
-
-```bash
-python src/data_collection/convert_rlbench_to_lerobot.py \
-    --task_name stack_cups \
-    --variation 0 \
-    --rlbench_root datasets/rlbench \
-    --output_root datasets/lerobot \
-    --fps 20
-```
-
-This produces merged datasets (even for a single variation):
-
-```
-datasets/lerobot/
-├── stack_cups_eef/
-└── stack_cups_joint/
-```
-
-### Convert All Variations
-
-When `--variation` is omitted, the script converts **every** variation found
-under `datasets/rlbench/<task_name>/`, merges them, and writes **two datasets**:
-
-```bash
-python src/data_collection/convert_rlbench_to_lerobot.py \
-    --task_name put_rubbish_in_bin \
-    --rlbench_root datasets/rlbench \
-    --output_root datasets/lerobot \
-    --fps 20
-```
-
-This produces:
-
-```
-datasets/lerobot/
-├── put_rubbish_in_bin_eef/          # merged EEF-action dataset (all variations)
-└── put_rubbish_in_bin_joint/        # merged joint-velocity dataset (all variations)
-```
-
-The converter uses a temporary directory for intermediate per-variation exports and removes it at the end, so you should not see `*_variation*` folders in `datasets/lerobot/`.
-
-### Export only one action space
-
-By default the script exports **both** datasets. You can export only one:
-
-```bash
-# EEF delta actions only
-python src/data_collection/convert_rlbench_to_lerobot.py \
-    --task_name put_rubbish_in_bin \
-    --rlbench_root datasets/rlbench \
-    --output_root datasets/lerobot \
-    --fps 20 \
-    --action_space eef
-
-# Joint velocity actions only
-python src/data_collection/convert_rlbench_to_lerobot.py \
-    --task_name put_rubbish_in_bin \
-    --rlbench_root datasets/rlbench \
-    --output_root datasets/lerobot \
-    --fps 20 \
-    --action_space joint
-```
-
-#### Arguments
-
-| Argument | Default | Description |
-|---|---|---|
-| `--task_name` | *(required)* | RLBench task name, e.g. `stack_cups` |
-| `--variation` | *(all)* | Variation number. Omit to process all variations. |
-| `--rlbench_root` | `datasets/rlbench` | Root directory of RLBench datasets |
-| `--output_root` | `datasets/lerobot` | Root directory for output LeRobot datasets |
-| `--fps` | `20` | Frames per second for output videos |
-| `--episode` | `0` | Episode index inside the RLBench variation directory |
-| `--use_context_prompt` | `false` | Prepend ConceptGraphs context to task descriptions |
-| `--action_space` | `both` | Export `eef`, `joint`, or `both` datasets |
-
-### LeRobot Dataset Structure (Output)
-
-```
-datasets/lerobot/<task_name>_<eef|joint>/
+```text
+datasets/lerobot_trial_2/<task_or_all_task>_<eef|joint>/
 ├── meta/
-│   ├── info.json              # Dataset metadata, features, splits
-│   ├── stats.json             # Global min/max/mean/std/q01/q99
-│   ├── tasks.parquet          # Task descriptions
-│   └── episodes/
-│       └── chunk-000/
-│           └── file-000.parquet   # Per-episode metadata and stats
-├── data/
-│   └── chunk-000/
-│       └── file-000.parquet       # Per-frame data
-└── videos/                        # One MP4 per camera (merged)
+│   ├── info.json
+│   ├── stats.json
+│   ├── tasks.parquet
+│   └── episodes/chunk-000/file-000.parquet
+├── data/chunk-000/file-000.parquet
+└── videos/
     ├── observation.images.front_rgb/chunk-000/file-000.mp4
     └── observation.images.wrist_rgb/chunk-000/file-000.mp4
 ```
 
-**Data columns:**
+---
 
-| Column | Type | Description |
-|---|---|---|
-| `observation.state` | float32[8] | EEF dataset: EEF pose (x,y,z,qx,qy,qz,qw) + gripper_open; Joint dataset: joint positions (q0..q6) + gripper_open *(older exports used `observation.joint_state`)* |
-| `action` | float32[8] | EEF dataset: delta-EEF action; Joint dataset: joint velocity command |
-| `episode_index` | int64 | Episode this frame belongs to |
-| `timestamp` | float64 | Time in seconds from episode start |
-| `next.done` | bool | True on the last frame of each episode |
-| `next.reward` | float64 | 0.0 except 1.0 on last frame |
-| `index` | int64 | Global frame index across all episodes |
-| `task_index` | int64 | Index into tasks.parquet |
-| `annotation.human.action.task_description` | int64 | Task description index (GR00T) |
-| `annotation.human.action.task_name` | int64 | Short task name index (GR00T) |
-| `annotation.human.validity` | int64 | Validity label index (GR00T) |
+## LeRobot Visualization (.rrd)
 
-**Episode splitting:** Trajectories are split at scene-graph transitions.
-For example, if the scene graph transitions from "no relationships" →
-"robot holding cup" → "no relationships", that creates 2 episodes:
-- Episode 0: approach + grasp
-- Episode 1: place + release
-
-### Visualize a Converted Dataset
+Use:
 
 ```bash
-CUDA_VISIBLE_DEVICES="" python3 external/lerobot/src/lerobot/scripts/lerobot_dataset_viz.py \
-    --repo-id local/<task_name>_eef \
-    --root datasets/lerobot/<task_name>_eef \
-    --episode-index 0 \
-    --save 1 \
-    --output-dir datasets/lerobot/<task_name>_eef/output \
-    --batch-size 16 --num-workers 0 --tolerance-s 1e-4
+bash scripts/core/generate_lerobot_rrd.sh put_rubbish_in_bin eef 4
 ```
 
-Download the `.rrd` files and open with [Rerun](https://rerun.io/):
+Outputs are written under:
+
+- `datasets/.../<task>_<eef|joint>/output`
+
+---
+
+## Training Notes (ASU Sol HPC)
+
+
+### Transfer latest checkpoints
+
+Use:
 
 ```bash
-pip install rerun-sdk
-rerun local_stack_cups_eef_episode_0.rrd
+bash scripts/core/transfer_lerobot_last_checkpoints.sh
 ```
 
 ---
 
-## GR00T N1.5 Training on ASU Sol HPC
+## RLBench Evaluation
 
-### System Info
+Use:
 
-- **OS:** Rocky Linux 8 (GLIBC 2.28)
-- **GPU:** NVIDIA A100 (sm_80 / compute capability 8.0)
-- **CUDA toolkit:** 12.6.1 (via module)
-- **GCC:** 12.1.0 (via module)
-- **Python:** 3.10 (conda env `lerobot`)
+- `src/inference/rlbench/eval.sh`
 
-### 1. Load Modules & Activate Environment
-
-```bash
-module load mamba/latest
-source activate lerobot
-module load cuda-12.6.1-gcc-12.1.0
-module load gcc-12.1.0-gcc-11.2.0
-```
-
-### 2. Install Core Python Packages
-
-```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-pip install -e external/lerobot
-```
-
-> **Note:** If `setuptools` version errors occur during lerobot install,
-> pin it first: `pip install "setuptools<81.0.0"`
-
-### 3. Build flash-attn from Source
-
-Pre-built wheels require GLIBC ≥ 2.32 which Sol (Rocky Linux 8) does not have.
-You must build from source.
-
-```bash
-# Clone flash-attn
-cd /scratch/$USER/tmp
-git clone https://github.com/Dao-AILab/flash-attention.git flash-attn-src
-cd flash-attn-src
-```
-
-**Patch `setup.py`** — Replace `os.rename` with `shutil.move` on the wheel-copy
-line (~line 563) to fix cross-device link errors between `/tmp` and `/scratch`:
-
-```python
-# In setup.py, near the end of the file:
-# BEFORE:
-#     os.rename(wheel_filename, wheel_path)
-# AFTER:
-import shutil
-shutil.move(wheel_filename, wheel_path)
-```
-
-**Build and install:**
-
-```bash
-export FLASH_ATTENTION_FORCE_BUILD=TRUE   # must be exactly "TRUE", not "1"
-export FLASH_ATTN_CUDA_ARCHS=80           # A100 only; avoids unsupported sm_120
-export MAX_JOBS=4                          # prevent OOM during compilation
-
-pip install . 2>&1 | tee /scratch/$USER/tmp/flashattn_build.log
-```
-
-> Build takes ~20 minutes on Sol. Verify with:
-> ```bash
-> cd /scratch/$USER   # do NOT run from the source directory
-> python -c "import flash_attn; print(flash_attn.__version__)"
-> # Expected: 2.8.3 (or newer)
-> ```
-
-### 4. Install FFmpeg & PyAV (Video Backend)
-
-`torchcodec` (the default lerobot video backend) has a C++11 ABI mismatch with
-the pip-installed PyTorch on Sol. Use `pyav` as the video backend instead.
-
-```bash
-conda install -c conda-forge ffmpeg -y
-pip install av   # PyAV — should already be installed with lerobot
-```
-
-When running training, always pass `--dataset.video_backend=pyav` (already set
-in `scripts/train_groot_1gpu_smoke.sh`).
-
-### 5. Run a Smoke Test
-
-```bash
-# Single variation
-bash scripts/train_groot_1gpu_smoke.sh stack_cups_eef
-
-# All variations (merged dataset)
-bash scripts/train_groot_1gpu_smoke.sh put_rubbish_in_bin_eef datasets/lerobot/put_rubbish_in_bin_eef
-
-# Absolute path on HPC
-bash scripts/train_groot_1gpu_smoke.sh put_rubbish_in_bin_eef \
-    /scratch/kpham34/cross_model_learning_based_robot_control/datasets/lerobot/put_rubbish_in_bin_eef
-```
-
-The first positional argument is the dataset ID, the second (optional) is the
-dataset root path (defaults to `datasets/lerobot/<DATASET_ID>`).
-
-All parameters can be overridden via environment variables:
-
-```bash
-BATCH_SIZE=4 NUM_STEPS=1000 SAVE_FREQ=100 LOG_FREQ=10 NUM_PROCESSES=2 \
-    bash scripts/train_groot_1gpu_smoke.sh put_rubbish_in_bin_eef
-```
-
-### 6. Transfer only the latest checkpoint for each run
-
-If you train on ASU Sol and want to copy only `checkpoints/last` for each run
-to your local machine, use:
-
-```bash
-bash scripts/transfer_lerobot_last_checkpoints.sh
-```
-
-Default source/target paths in the script:
-
-- Remote host: `ngocbach@en4217548l`
-- Remote output: `/scratch/kpham34/cross_model_learning_based_robot_control/output/lerobot`
-- Local output: `~/Desktop/cross_model_learning_based_robot_control/output/lerobot`
-- State file: `~/Desktop/cross_model_learning_based_robot_control/output/lerobot/.transferred_last_checkpoints.tsv`
-
-What it does:
-
-- Traverses each run under remote `output/lerobot`.
-- Resolves `checkpoints/last` symlink to its real checkpoint directory (for
-  example `020000`).
-- Copies that resolved directory with `scp -r`.
-- Recreates local `checkpoints/last` symlink.
-- Records `(run_name, remote_checkpoint_path)` in a local state file.
-- Skips items that were already transferred in prior runs.
-
-You can override defaults via environment variables:
-
-```bash
-REMOTE_HOST="user@cluster" \
-REMOTE_OUTPUT_DIR="/scratch/.../output/lerobot" \
-LOCAL_OUTPUT_DIR="$HOME/Desktop/cross_model_learning_based_robot_control/output/lerobot" \
-STATE_FILE="$HOME/Desktop/cross_model_learning_based_robot_control/output/lerobot/.transferred_last_checkpoints.tsv" \
-bash scripts/transfer_lerobot_last_checkpoints.sh
-```
-
-### Troubleshooting (Sol-specific)
-
-| Problem | Cause | Fix |
-|---|---|---|
-| `GLIBC_2.32 not found` when importing flash-attn | Pre-built wheel needs newer GLIBC | Build from source (step 3) |
-| `OSError: [Errno 18] Invalid cross-device link` during flash-attn build | `os.rename()` across `/tmp` ↔ `/scratch` | Patch setup.py: `os.rename` → `shutil.move` |
-| `FLASH_ATTENTION_FORCE_BUILD` ignored | Env var checked with `== "TRUE"` | Set exactly `TRUE`, not `1` or `true` |
-| `nvcc fatal: Unsupported gpu architecture 'compute_120'` | CUDA 12.6 doesn't support sm_120+ | Set `FLASH_ATTN_CUDA_ARCHS=80` |
-| `ModuleNotFoundError: No module named 'flash_attn_2_cuda'` | Running python from flash-attn source dir | `cd` out of the source directory first |
-| `undefined symbol: _ZN3c1013MessageLogger6streamB5cxx11Ev` in torchcodec | C++11 ABI mismatch with PyTorch | Use `--dataset.video_backend=pyav` instead |
-
----
-
-## RLBench Inference (Simulator)
-
-Use [src/inference/rlbench/infer_rlbench.py](src/inference/rlbench/infer_rlbench.py) to run a trained policy inside the RLBench simulator and record the resulting observations (front + wrist RGB + low-dim).
-
-### Prerequisites
-
-- Run this in an environment where RLBench + PyRep works headlessly (e.g., the Docker/Xvfb setup from **RLBench Dataset Generation** above).
-- Make sure `rlbench` and `lerobot` are importable (either installed in your env, or via `PYTHONPATH`).
-
-If you are using the vendored repos in this workspace, from the repo root you can do:
-
-```bash
-export PYTHONPATH="$(pwd)/external/RLBench:$(pwd)/external/lerobot/src:${PYTHONPATH:-}"
-```
-
-- Optional: install `ffmpeg` if you want the script to also generate `.mp4` preview videos (it will still save PNGs + `low_dim_obs.pkl` without ffmpeg).
-
-### LeRobot checkpoint inference (GR00T / SmolVLA)
-
-The script expects an **EEF-pose action mode** for LeRobot policies (they output delta-EEF actions which are converted to absolute EEF targets for RLBench).
-
-- For EEF-action checkpoints (trained on `<task>_eef`): use `--action_mode ee_planning` (recommended) or `--action_mode ee_ik`.
-- For joint-action checkpoints (trained on `<task>_joint`): use `--action_mode joint_velocity`.
-
-Multi-instruction support: you can pass multiple ordered instructions in `--task_description` (separated by sentences, newlines, `;`, or `|`). The script will execute them **sequentially**, running each instruction for `--max_steps` steps, and continuing from the current simulator state.
-
-Optional stall heuristic: if the end-effector pose stops changing (EEF position change < `--stall_eps_pos` and rotation change < `--stall_eps_rot_deg`) for `--stall_steps` consecutive steps, the script will automatically advance to the next instruction (or stop the episode if it was the last instruction).
-
-Example:
-
-```bash
-python src/inference/rlbench/infer_rlbench.py \
-    --task put_rubbish_in_bin --variation 0 \
-    --episodes 1 --max_steps 300 \
-    --policy lerobot \
-    --action_mode ee_planning --renderer opengl3 \
-    --checkpoint output/lerobot/smolvla_put_rubbish_in_bin_all_20260312_183353 \
-    --dataset_root datasets/lerobot_without_prompt/put_rubbish_in_bin_all \
-    --task_description "Pick up paper. Release paper, then place paper in trash bin" \
-    --stall_steps 25 --stall_eps_pos 0.001 --stall_eps_rot_deg 2.0 \
-    --device cuda \
-    --save_path output/rlbench_inference/smolvla_multi_instruction
-```
-
-`--checkpoint` can point to any of:
-
-- a `pretrained_model/` directory
-- a checkpoint directory containing `pretrained_model/`
-- a run directory containing `checkpoints/` (the script will use `checkpoints/last` if present, otherwise the highest-numbered checkpoint)
-
-#### Example: GR00T
-
-```bash
-python src/inference/rlbench/infer_rlbench.py \
-    --task put_rubbish_in_bin --variation 0 \
-    --episodes 1 --max_steps 300 \
-    --policy lerobot \
-    --action_mode ee_planning --renderer opengl3 \
-    --checkpoint output/lerobot/groot_smoke_put_rubbish_in_bin_all_20260312_132849 \
-    --dataset_root datasets/lerobot_without_prompt/put_rubbish_in_bin_all \
-    --task_description "Put the rubbish in the bin." \
-    --device cuda \
-    --save_path output/rlbench_inference/groot_put_rubbish_in_bin_v0
-```
-
-#### Example: SmolVLA (trained on a merged dataset)
-
-```bash
-python src/inference/rlbench/infer_rlbench.py \
-    --task put_rubbish_in_bin --variation 0 \
-    --episodes 1 --max_steps 300 \
-    --policy lerobot \
-    --action_mode ee_planning --renderer opengl3 \
-    --checkpoint output/lerobot/smolvla_put_rubbish_in_bin_all_20260312_183353 \
-    --dataset_root datasets/lerobot_without_prompt/put_rubbish_in_bin_all \
-    --task_description "Pick up paper." \
-    --device cuda \
-    --save_path output/rlbench_inference/smolvla_put_rubbish_in_bin_v0
-```
-
-SmolVLA note: some SmolVLA checkpoints list visual inputs as `observation.images.camera1/2/3` in their config, but the saved `policy_preprocessor.json` contains a `rename_observations_processor` that maps RLBench dataset keys (`front_rgb`, `wrist_rgb`) to those camera slots. The inference script automatically uses that saved rename map when `policy_cfg.type == "smolvla"` (no extra CLI flags).
-
-### Output format
-
-For each episode, the script writes:
-
-```
-<save_path>/episode0/
-├── front_rgb/0.png, 1.png, ...
-├── wrist_rgb/0.png, 1.png, ...
-├── low_dim_obs.pkl
-├── front_rgb.mp4        # if ffmpeg available
-└── wrist_rgb.mp4        # if ffmpeg available
-```
-
-### Planner-vs-policy evaluation
-
-Use `src/inference/rlbench/eval.py` to compare your trained policy against the RLBench default planner over multiple deterministic runs.
-
-- Planner rollout is generated with the same live-demo mechanism used by `rlbench.dataset_generator`.
-- Policy rollout starts from the same initial state via `reset_to_demo(...)`.
-- Metrics are phase-aware using gripper transitions:
-    - **Phase 1 (pick):** close transition, grasp success, L2 (EEF/joint).
-    - **Phase 2 (release/place):** release transition, final success, trajectory/final L2.
-
-Example (10 runs):
-
-```bash
-python src/inference/rlbench/eval.py \
-        --task put_rubbish_in_bin --variation 0 \
-        --runs 10 --seed 0 \
-        --max_steps 150 \
-        --action_mode joint_velocity --renderer opengl3 \
-        --checkpoint output/lerobot/smolvla_put_rubbish_in_bin_all_20260312_183353 \
-        --dataset_root datasets/lerobot_without_prompt/put_rubbish_in_bin_all \
-        --task_description "Pick up paper. Release paper, then place paper in trash bin." \
-        --save_path output/rlbench_eval/put_rubbish_in_bin
-```
-
-Main outputs:
-
-```
-output/rlbench_eval/put_rubbish_in_bin/
-├── run_000/
-│   ├── planner/episodes/episode0/      # RLBench default demo save format + rollout sidecars
-│   ├── policy/episodes/episode0/       # policy rollout save format + rollout sidecars
-│   └── metrics.json
-├── per_run_metrics.json
-├── per_run_metrics.csv
-└── summary.json
-```
-
-### Batch summary across all runs (no re-inference)
-
-If you already have evaluation folders (for example `policy_state/varX_seedY`) and want a single report across **all runs**:
+Batch summarize existing runs:
 
 ```bash
 bash src/inference/rlbench/eval.sh --summarize_only
 ```
 
-This runs aggregate-only mode in `eval.py` and writes:
+---
 
+## Troubleshooting
+
+Troubleshooting and debugging are now maintained in a separate file:
+
+- `TROUBLESHOOTING.md`
+
+# Cross-Model Learning-Based Robot Control
+
+This repository provides a practical pipeline for:
+
+1. generating RLBench demonstrations,
+2. building scene graphs/templates,
+3. converting to LeRobot v3 format,
+4. training/evaluating policies.
+
+Most runnable commands are in `scripts/core/`.
+
+## Core Scripts
+
+- `scripts/core/setup_external.sh` - setup external dependencies.
+- `scripts/core/dataset_generator.sh` - generate RLBench task datasets.
+- `scripts/core/apply_rlbench_trial2_templates.sh` - batch apply relationship templates.
+- `scripts/core/convert_rlbench_to_lerobot_batch.sh` - batch convert RLBench -> LeRobot and merge final datasets.
+- `scripts/core/generate_lerobot_rrd.sh` - export `.rrd` visualization files for LeRobot datasets.
+- `scripts/core/transfer_lerobot_last_checkpoints.sh` - copy latest checkpoints from remote runs.
+
+## End-to-End Quick Start
+
+From repo root:
+
+```bash
+cd /workspace
 ```
-output/rlbench_eval/put_rubbish_in_bin/
-├── detailed_summary.json   # aggregate report
-└── detailed_runs.csv       # one row per eval dir (with run-mean + overall episode metrics)
-├── overall_metrics.csv     # one row per policy x action combination
+
+### 1) Generate RLBench data
+
+```bash
+scripts/core/dataset_generator.sh 20 put_rubbish_in_bin meat_on_grill
 ```
 
-In `detailed_summary.json`:
+### 2) Create scene graph metadata
 
-- `comparison.overall` reports metrics across **all runs and all episodes**.
-- `episode_success_rate_mean` is the mean of per-run success rates.
-- `episode_success_rate_overall` is pooled success over all episode rows.
-- `joint_l2_overall` / `pos_l2_overall` / `rot_deg_overall` are pooled means over all episode rows.
-- `by_policy_state`, `by_policy`, and `by_state` include the same run-mean + pooled-overall metrics.
-- `overall_metrics.csv` is a compact table for each policy/action/episode combination (e.g. `smolvla + joint_velocity + episode 0`), where each metric is averaged over that episode index across all runs.
+Run notebooks:
+
+- `src/data_collection/create_info_json.ipynb`
+- `src/data_collection/RLBench_scene_graph_collection.ipynb`
+
+### 3) Apply templates to all tasks/variations
+
+```bash
+scripts/core/apply_rlbench_trial2_templates.sh \
+  --dataset-path /workspace/datasets/rlbench_trial_2 \
+  --episode 0 \
+  --camera front
+```
+
+### 4) Convert to LeRobot and create final merged datasets
+
+```bash
+scripts/core/convert_rlbench_to_lerobot_batch.sh \
+  --dataset-path /workspace/datasets/rlbench_trial_2 \
+  --output-root /workspace/datasets/lerobot_trial_2 \
+  --action-space both
+```
+
+This creates per-task datasets plus:
+
+- `/workspace/datasets/lerobot_trial_2/all_task_eef`
+- `/workspace/datasets/lerobot_trial_2/all_task_joint`
+
+## Common Commands
+
+### Convert only selected tasks
+
+```bash
+scripts/core/convert_rlbench_to_lerobot_batch.sh \
+  --dataset-path /workspace/datasets/rlbench_trial_2 \
+  --tasks "lamp_on,put_rubbish_in_bin" \
+  --output-root /workspace/datasets/lerobot_trial_2
+```
+
+### Use context prompt for language generation
+
+```bash
+scripts/core/convert_rlbench_to_lerobot_batch.sh \
+  --dataset-path /workspace/datasets/rlbench_trial_2 \
+  --use-context-prompt
+```
+
+
+## Notes
+
+- Conversion is resilient by default: missing variation data is skipped.
+- Scene graph template application skips tasks without template files.
+- For data collection details, see `src/data_collection/README.md`.
+

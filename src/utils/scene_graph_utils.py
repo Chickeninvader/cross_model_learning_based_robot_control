@@ -132,6 +132,130 @@ def calculate_object_position(mask_handles, handle_list):
     center_x = int(np.mean(coords[1]))
     return (center_x, center_y)
 
+
+def _base_object_type(object_name):
+    """Convert object id/name to a generic type string."""
+    # Example: cup_1 -> cup, rubbish -> rubbish, robot -> robot
+    base = re.sub(r'_\d+$', '', str(object_name))
+    return base.replace('_', ' ')
+
+
+def _rgb_to_color_name(rgb):
+    """Map an RGB triplet to a coarse color name."""
+    rgb_u8 = np.uint8([[rgb]])
+    hsv = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2HSV)[0, 0]
+    h, s, v = int(hsv[0]), int(hsv[1]), int(hsv[2])
+
+    # Low saturation colors first.
+    if s < 30:
+        if v < 45:
+            return "black"
+        if v > 210:
+            return "white"
+        return "gray"
+
+    # Brown is dark orange/yellow.
+    if 8 <= h <= 25 and v < 160:
+        return "brown"
+    if h < 10 or h >= 170:
+        return "red"
+    if h < 20:
+        return "orange"
+    if h < 35:
+        return "yellow"
+    if h < 85:
+        return "green"
+    if h < 105:
+        return "cyan"
+    if h < 135:
+        return "blue"
+    if h < 160:
+        return "purple"
+    return "pink"
+
+
+def estimate_object_colors(
+    image_data,
+    objects,
+    handles_by_object,
+    start_frame=0,
+    max_frames=30,
+    min_pixels=40,
+):
+    """Estimate a representative color per object from RGB + mask frames."""
+    color_info = {}
+    if not image_data.get('rgb') or not image_data.get('mask'):
+        return color_info
+
+    n_frames = min(len(image_data['rgb']), len(image_data['mask']))
+    if start_frame >= n_frames:
+        return color_info
+
+    end_frame = min(n_frames, start_frame + max_frames)
+    per_object_rgb_samples = {name: [] for name in objects}
+
+    for frame_idx in range(start_frame, end_frame):
+        rgb_bgr = cv2.imread(image_data['rgb'][frame_idx])
+        if rgb_bgr is None:
+            continue
+        rgb_frame = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB)
+        mask_handles = decode_mask_image(image_data['mask'][frame_idx])
+
+        for name in objects:
+            handle_ids = handles_by_object.get(name, [])
+            if not handle_ids:
+                continue
+            obj_mask = np.isin(mask_handles, handle_ids)
+            if int(obj_mask.sum()) < min_pixels:
+                continue
+            pixels = rgb_frame[obj_mask]
+            if pixels.size == 0:
+                continue
+            per_object_rgb_samples[name].append(np.median(pixels, axis=0))
+
+    for name in objects:
+        samples = per_object_rgb_samples.get(name, [])
+        if not samples:
+            continue
+        rgb_med = np.median(np.vstack(samples), axis=0)
+        rgb_triplet = [int(round(c)) for c in rgb_med.tolist()]
+        color_info[name] = {
+            "color": _rgb_to_color_name(rgb_triplet),
+            "rgb": rgb_triplet,
+        }
+
+    return color_info
+
+
+def build_scene_graph_objects(
+    objects,
+    image_data=None,
+    handles_by_object=None,
+    start_frame=0,
+):
+    """Build scene-graph object metadata with optional color attributes."""
+    object_meta = {}
+    color_info = {}
+    if image_data is not None and handles_by_object is not None:
+        color_info = estimate_object_colors(
+            image_data=image_data,
+            objects=objects,
+            handles_by_object=handles_by_object,
+            start_frame=start_frame,
+        )
+
+    for name in objects:
+        base_type = _base_object_type(name)
+        meta = {"type": base_type}
+        pretty_name = str(name).replace('_', ' ')
+        color = color_info.get(name, {}).get("color")
+        if color:
+            meta["attributes"] = {"color": color}
+            # Keep instance disambiguation (e.g. "cup 1") in language labels.
+            meta["display_name"] = f"{color} {pretty_name}".strip()
+        object_meta[name] = meta
+    return object_meta
+
 def extract_positions_over_time(image_data, objects, handles_by_object, start_frame=0):
     """Extract positions for all OBJECTS over the episode.
     
@@ -572,25 +696,100 @@ def save_relationship_template(scene_graph, gripper_states, output_path):
                 'to_state': 'closed' if gripper_states[i] else 'open'
             })
     
-    # For each transition, capture the relationships that start at that frame
+    # Build a frame-id -> frame map for robust lookup (frame ids may not be perfectly aligned)
+    frames_sorted = sorted(scene_graph.get('frames', []), key=lambda f: f.get('frame_id', -1))
+    frame_ids = [f.get('frame_id', -1) for f in frames_sorted]
+
+    # For each transition, capture a goal relationship snapshot for its segment.
+    # Segment i spans [transition_i, transition_{i+1}) in frame-id space.
+    # We prefer the latest non-empty relationships in that segment so tasks where
+    # state changes occur near the segment end are captured correctly.
     for trans_idx, trans in enumerate(gripper_changes):
-        frame_id = trans['frame']
-        
-        # Find this frame in scene graph
-        frame_data = None
-        for frame in scene_graph['frames']:
-            if frame['frame_id'] == frame_id:
-                frame_data = frame
+        start_fid = trans['frame']
+        if trans_idx + 1 < len(gripper_changes):
+            end_fid = gripper_changes[trans_idx + 1]['frame'] - 1
+        else:
+            end_fid = frame_ids[-1] if frame_ids else start_fid
+
+        candidate_frames = [
+            f for f in frames_sorted
+            if start_fid <= f.get('frame_id', -1) <= end_fid
+        ]
+
+        if not candidate_frames and frames_sorted:
+            # Fallback to nearest available frame >= start, otherwise last frame.
+            later = [f for f in frames_sorted if f.get('frame_id', -1) >= start_fid]
+            candidate_frames = later[:1] if later else [frames_sorted[-1]]
+
+        selected_frame = None
+        for f in reversed(candidate_frames):
+            if f.get('relationships'):
+                selected_frame = f
                 break
-        
-        if frame_data:
-            template['transitions'].append({
-                'transition_index': trans_idx,
-                'from_state': trans['from_state'],
-                'to_state': trans['to_state'],
-                'relationships': frame_data.get('relationships', [])
-            })
+        if selected_frame is None and candidate_frames:
+            selected_frame = candidate_frames[-1]
+
+        # Fallback: if segment frames are all empty, use nearest prior
+        # non-empty frame up to the segment end. This helps tasks where
+        # annotation was placed just before the transition frame (often the
+        # case when the transition happens at the last frame).
+        if (
+            selected_frame is not None
+            and not selected_frame.get('relationships')
+            and frames_sorted
+        ):
+            prior = [
+                f for f in frames_sorted
+                if f.get('frame_id', -1) <= end_fid and f.get('relationships')
+            ]
+            if prior:
+                selected_frame = prior[-1]
+                print(
+                    f"  transition {trans_idx}: segment empty, "
+                    f"fallback to prior annotated frame {selected_frame.get('frame_id')}"
+                )
+
+        relationships = []
+        selected_fid = start_fid
+        if selected_frame is not None:
+            relationships = [r.copy() for r in selected_frame.get('relationships', [])]
+            selected_fid = selected_frame.get('frame_id', start_fid)
+
+        template['transitions'].append({
+            'transition_index': trans_idx,
+            'from_state': trans['from_state'],
+            'to_state': trans['to_state'],
+            'relationships': relationships
+        })
+        print(
+            f"  transition {trans_idx}: {trans['from_state']}->{trans['to_state']} "
+            f"segment [{start_fid}, {end_fid}] -> frame {selected_fid} "
+            f"({len(relationships)} rels)"
+        )
     
+    # Fallback: if this is a single-transition template and the selected segment
+    # was empty, but the scene graph has annotated relationships elsewhere, use
+    # the latest annotated relationships to avoid silent empty templates.
+    total_rels = sum(len(t.get('relationships', [])) for t in template['transitions'])
+    if len(template['transitions']) == 1 and total_rels == 0 and frames_sorted:
+        nonempty_anywhere = [f for f in frames_sorted if f.get('relationships')]
+        if nonempty_anywhere:
+            fallback_rels = [r.copy() for r in nonempty_anywhere[-1].get('relationships', [])]
+            template['transitions'][0]['relationships'] = fallback_rels
+            total_rels = len(fallback_rels)
+            print(
+                "  fallback(single-transition): using latest annotated frame "
+                f"{nonempty_anywhere[-1].get('frame_id')} ({total_rels} rels)"
+            )
+
+    # Guard: avoid silently saving an all-empty template.
+    total_rels = sum(len(t.get('relationships', [])) for t in template['transitions'])
+    if template['transitions'] and total_rels == 0:
+        raise ValueError(
+            "Template would be empty (0 relationships across all transitions). "
+            "Please annotate at least one relationship before saving."
+        )
+
     # Save template
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, 'w') as f:
@@ -602,13 +801,29 @@ def save_relationship_template(scene_graph, gripper_states, output_path):
     return template
 
 
-def apply_relationship_template(template_path, scene_graph, gripper_states):
+def apply_relationship_template(
+    template_path,
+    scene_graph,
+    gripper_states,
+    *,
+    single_transition_apply_from_start=False,
+    single_transition_apply_at_end=True,
+):
     """Apply a relationship template to a scene graph based on gripper transitions.
     
     Args:
         template_path: Path to template JSON file
         scene_graph: Scene graph dict to modify (in-place)
         gripper_states: List of bool (gripper closed states) for this variation
+        single_transition_apply_from_start: If True, when exactly one template
+            transition is matched, apply that relationship segment from the
+            first frame instead of the matched gripper-change frame. This
+            helps tasks where the semantic transition spans most of the
+            episode but the gripper change occurs only near the end.
+        single_transition_apply_at_end: If True, when template has exactly one
+            transition, apply its relationships at the last frame only. This
+            is useful for single-goal tasks where final relation should appear
+            at the episode end, not at an earlier gripper change.
     
     Returns:
         Modified scene_graph
@@ -616,6 +831,16 @@ def apply_relationship_template(template_path, scene_graph, gripper_states):
     # Load template
     with open(template_path, 'r') as f:
         template = json.load(f)
+
+    # Guard: empty templates cause silent no-op; fail fast so users can fix
+    # the source annotation/template.
+    if template.get('transitions'):
+        total_template_rels = sum(len(t.get('relationships', [])) for t in template['transitions'])
+        if total_template_rels == 0:
+            raise ValueError(
+                f"Template has {len(template['transitions'])} transitions but 0 relationships. "
+                "Re-create template from an annotated scene graph."
+            )
     
     # Find gripper transitions in current data
     gripper_changes = []
@@ -637,30 +862,63 @@ def apply_relationship_template(template_path, scene_graph, gripper_states):
     segments = []  # list of (start_frame_id, relationships_list)
 
     applied_count = 0
-    for tmpl_trans in template['transitions']:
-        trans_idx = tmpl_trans['transition_index']
 
-        if trans_idx >= len(gripper_changes):
-            print(f"⚠ No matching transition {trans_idx} in current variation (only {len(gripper_changes)} found)")
-            continue
+    # Special handling for single-transition templates: final relation at end.
+    if (
+        single_transition_apply_at_end
+        and len(template.get('transitions', [])) == 1
+        and scene_graph.get('frames')
+    ):
+        last_frame_id = scene_graph['frames'][-1]['frame_id']
+        rels = [r.copy() for r in template['transitions'][0].get('relationships', [])]
+        segments.append((last_frame_id, rels))
+        applied_count = 1
+        print(
+            "ℹ Single-transition end mode: applying template relationships "
+            f"at last frame {last_frame_id}."
+        )
+    else:
+        for tmpl_trans in template['transitions']:
+            trans_idx = tmpl_trans['transition_index']
 
-        current_trans = gripper_changes[trans_idx]
+            if trans_idx >= len(gripper_changes):
+                print(f"⚠ No matching transition {trans_idx} in current variation (only {len(gripper_changes)} found)")
+                continue
 
-        if (current_trans['from_state'] != tmpl_trans['from_state'] or
-                current_trans['to_state'] != tmpl_trans['to_state']):
-            print(f"⚠ Transition {trans_idx} type mismatch: "
-                  f"template={tmpl_trans['from_state']}->{tmpl_trans['to_state']}, "
-                  f"current={current_trans['from_state']}->{current_trans['to_state']}")
-            continue
+            current_trans = gripper_changes[trans_idx]
 
-        segments.append((current_trans['frame'], tmpl_trans['relationships']))
-        applied_count += 1
-        print(f"✓ Matched transition {trans_idx}: "
-              f"{tmpl_trans['from_state']} -> {tmpl_trans['to_state']} "
-              f"at frame {current_trans['frame']}")
+            if (current_trans['from_state'] != tmpl_trans['from_state'] or
+                    current_trans['to_state'] != tmpl_trans['to_state']):
+                print(f"⚠ Transition {trans_idx} type mismatch: "
+                      f"template={tmpl_trans['from_state']}->{tmpl_trans['to_state']}, "
+                      f"current={current_trans['from_state']}->{current_trans['to_state']}")
+                continue
+
+            segments.append((current_trans['frame'], tmpl_trans['relationships']))
+            applied_count += 1
+            print(f"✓ Matched transition {trans_idx}: "
+                  f"{tmpl_trans['from_state']} -> {tmpl_trans['to_state']} "
+                  f"at frame {current_trans['frame']}")
 
     # Sort segments by start frame so we can do a simple forward scan
     segments.sort(key=lambda s: s[0])
+
+    # Edge case: a single semantic transition often corresponds to "start -> goal"
+    # for the full episode, while the physical gripper change may happen very late.
+    # In that case, applying only from the late frame leaves only a few frames labeled.
+    if (
+        single_transition_apply_from_start
+        and len(template.get('transitions', [])) == 1
+        and len(segments) == 1
+        and scene_graph.get('frames')
+    ):
+        first_frame_id = scene_graph['frames'][0]['frame_id']
+        rels = segments[0][1]
+        segments = [(first_frame_id, rels)]
+        print(
+            "ℹ Single-transition mode: applying template relationships "
+            f"from first frame {first_frame_id}."
+        )
 
     # Walk every frame in the scene graph and assign relationships based on
     # which segment it falls into.  Before the first segment → empty list.
