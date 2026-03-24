@@ -9,8 +9,8 @@ GR00T-compatible LeRobot v3 datasets, and training/evaluating policies.
 2. [Scene Graph Generation](#scene-graph-generation)
 3. [Dataset Conversion (RLBench -> LeRobot v3)](#dataset-conversion-rlbench---lerobot-v3)
 4. [LeRobot Visualization (.rrd)](#lerobot-visualization-rrd)
-5. [Training Notes (ASU Sol HPC)](#training-notes-asu-sol-hpc)
-6. [RLBench Evaluation](#rlbench-evaluation)
+5. [Training](#training)
+6. [Inference & RLBench Evaluation](#inference--rlbench-evaluation)
 7. [Troubleshooting](#troubleshooting)
 
 ---
@@ -123,10 +123,14 @@ Outputs are written under:
 
 ---
 
-## Training Notes (ASU Sol HPC)
+## Training
 
 
-### Transfer latest checkpoints
+Training code is under:
+
+- `src/training`
+
+For remote checkpoint sync (ASU Sol HPC), use:
 
 Use:
 
@@ -136,17 +140,90 @@ bash scripts/core/transfer_lerobot_last_checkpoints.sh
 
 ---
 
-## RLBench Evaluation
+## Inference & RLBench Evaluation
 
-Use:
+Evaluation scripts are maintained under `scripts/core`:
 
-- `src/inference/rlbench/eval.sh`
+- `scripts/core/eval.sh` canonical entrypoint.
+- `scripts/core/eval_rlbench_single_task.sh` single-task evaluator.
+- `scripts/core/eval_rlbench_all_tasks.sh` all-task evaluator.
+- `src/inference/rlbench/eval.sh` backward-compatible wrapper.
 
-Batch summarize existing runs:
+### Single-task evaluation
 
 ```bash
-bash src/inference/rlbench/eval.sh --summarize_only
+cd /workspace
+scripts/core/eval.sh \
+  --task put_rubbish_in_bin \
+  --runs 10 \
+  --variation 0 \
+  --dataset_parent /workspace/datasets/lerobot_trial_2 \
+  --rlbench_root /workspace/datasets/rlbench_trial_2
 ```
+
+### All-task evaluation (recommended for merged models)
+
+```bash
+cd /workspace
+scripts/core/eval.sh --all_tasks \
+  --tasks put_rubbish_in_bin,put_banana_in_bin,lamp_on,push_button,meat_on_grill \
+  --runs 10 \
+  --variation 0 \
+  --dataset_mode all \
+  --dataset_parent /workspace/datasets/lerobot_trial_2 \
+  --rlbench_root /workspace/datasets/rlbench_trial_2
+```
+
+### Task description behavior
+
+By default, you do not need to pass `--task_description`.
+
+`src/inference/rlbench/eval.py` resolves text in this order:
+
+1. explicit `--task_description` (if provided),
+2. dataset parquet metadata (best effort),
+3. RLBench reset-time task description.
+
+### Summarize-only mode
+
+```bash
+scripts/core/eval.sh \
+  --task lamp_on \
+  --summarize_only
+
+scripts/core/eval.sh --all_tasks \
+  --tasks lamp_on,push_button \
+  --summarize_only
+```
+
+### Outputs and metrics
+
+Single-task outputs:
+
+- `/workspace/output/rlbench_eval/<task>/...`
+
+All-task outputs:
+
+- `/workspace/output/rlbench_eval/all_tasks/<task>/<policy>_<state>/var<variation>_seed<seed>/...`
+
+Each run contains rollout artifacts plus:
+
+- `metrics.json`
+- `summary.json`
+- `per_run_metrics.csv`
+
+Aggregate outputs include:
+
+- `detailed_summary.json`
+- `detailed_runs.csv`
+- `overall_metrics.csv`
+
+`per_run_metrics.csv` includes fields such as:
+
+- `task_description`
+- `instruction`
+- `policy_success`
+- `joint_l2`, `pos_l2`, `rot_deg`, `eef_l2`
 
 ---
 
@@ -155,94 +232,4 @@ bash src/inference/rlbench/eval.sh --summarize_only
 Troubleshooting and debugging are now maintained in a separate file:
 
 - `TROUBLESHOOTING.md`
-
-# Cross-Model Learning-Based Robot Control
-
-This repository provides a practical pipeline for:
-
-1. generating RLBench demonstrations,
-2. building scene graphs/templates,
-3. converting to LeRobot v3 format,
-4. training/evaluating policies.
-
-Most runnable commands are in `scripts/core/`.
-
-## Core Scripts
-
-- `scripts/core/setup_external.sh` - setup external dependencies.
-- `scripts/core/dataset_generator.sh` - generate RLBench task datasets.
-- `scripts/core/apply_rlbench_trial2_templates.sh` - batch apply relationship templates.
-- `scripts/core/convert_rlbench_to_lerobot_batch.sh` - batch convert RLBench -> LeRobot and merge final datasets.
-- `scripts/core/generate_lerobot_rrd.sh` - export `.rrd` visualization files for LeRobot datasets.
-- `scripts/core/transfer_lerobot_last_checkpoints.sh` - copy latest checkpoints from remote runs.
-
-## End-to-End Quick Start
-
-From repo root:
-
-```bash
-cd /workspace
-```
-
-### 1) Generate RLBench data
-
-```bash
-scripts/core/dataset_generator.sh 20 put_rubbish_in_bin meat_on_grill
-```
-
-### 2) Create scene graph metadata
-
-Run notebooks:
-
-- `src/data_collection/create_info_json.ipynb`
-- `src/data_collection/RLBench_scene_graph_collection.ipynb`
-
-### 3) Apply templates to all tasks/variations
-
-```bash
-scripts/core/apply_rlbench_trial2_templates.sh \
-  --dataset-path /workspace/datasets/rlbench_trial_2 \
-  --episode 0 \
-  --camera front
-```
-
-### 4) Convert to LeRobot and create final merged datasets
-
-```bash
-scripts/core/convert_rlbench_to_lerobot_batch.sh \
-  --dataset-path /workspace/datasets/rlbench_trial_2 \
-  --output-root /workspace/datasets/lerobot_trial_2 \
-  --action-space both
-```
-
-This creates per-task datasets plus:
-
-- `/workspace/datasets/lerobot_trial_2/all_task_eef`
-- `/workspace/datasets/lerobot_trial_2/all_task_joint`
-
-## Common Commands
-
-### Convert only selected tasks
-
-```bash
-scripts/core/convert_rlbench_to_lerobot_batch.sh \
-  --dataset-path /workspace/datasets/rlbench_trial_2 \
-  --tasks "lamp_on,put_rubbish_in_bin" \
-  --output-root /workspace/datasets/lerobot_trial_2
-```
-
-### Use context prompt for language generation
-
-```bash
-scripts/core/convert_rlbench_to_lerobot_batch.sh \
-  --dataset-path /workspace/datasets/rlbench_trial_2 \
-  --use-context-prompt
-```
-
-
-## Notes
-
-- Conversion is resilient by default: missing variation data is skipped.
-- Scene graph template application skips tasks without template files.
-- For data collection details, see `src/data_collection/README.md`.
 

@@ -16,11 +16,9 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
-import csv
 import json
 import os
 import random
-import re
 import sys
 from pathlib import Path
 
@@ -32,21 +30,10 @@ _project_root = Path(__file__).parent.parent.parent.parent
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from pyrep.const import RenderMode
-
-from rlbench import ObservationConfig
-from rlbench.action_modes.action_mode import MoveArmThenGripper
-from rlbench.action_modes.arm_action_modes import (
-    EndEffectorPoseViaIK,
-    EndEffectorPoseViaPlanning,
-    JointVelocity,
-)
-from rlbench.action_modes.gripper_action_modes import Discrete
 from rlbench.backend.utils import task_file_to_task_class
 from rlbench.environment import Environment
 
 from src.utils.rlbench_policy import LeRobotPolicy
-from src.utils.rlbench_infer_utils import split_task_description_into_steps
 from src.utils.rlbench_eval_utils import (
     capture_task_env_state,
     collect_planner_rollout,
@@ -56,391 +43,98 @@ from src.utils.rlbench_eval_utils import (
 )
 from src.utils.rlbench_rollout_io import save_observations, save_rollout_sidecars
 from src.utils.rlbench_utils import extract_eef_state, extract_joint_state
-from src.utils.rlbench_eval_helpers import (
-    parse_bool,
-    parse_float,
-    parse_int,
-    mean_or_none,
-    std_or_none,
+from src.utils.rlbench_eval_aggregate import aggregate_batch_results
+from src.utils.scene_graph_language import generate_task_descriptions
+from src.utils.rlbench_eval_setup import (
+    build_action_mode,
+    build_obs_config,
+    write_csv,
+    write_json,
 )
 
-
-def _build_obs_config(image_size: list[int], renderer: str) -> ObservationConfig:
-    """Build ObservationConfig for low-dim + wrist/front RGB only."""
-    obs_config = ObservationConfig()
-    obs_config.set_all_high_dim(False)
-    obs_config.set_all_low_dim(True)
-    obs_config.joint_forces = False
-
-    cameras = [obs_config.wrist_camera, obs_config.front_camera]
-    for cam in cameras:
-        cam.set_all(False)
-        cam.rgb = True
-        cam.depth = False
-        cam.mask = False
-        cam.point_cloud = False
-        cam.image_size = image_size
-        cam.depth_in_meters = False
-        cam.masks_as_one_channel = False
-
-    if renderer == "opengl":
-        render_mode = RenderMode.OPENGL
-    elif renderer == "opengl3":
-        render_mode = RenderMode.OPENGL3
-    else:
-        raise ValueError(f"Unknown renderer: {renderer}")
-
-    for cam in cameras:
-        cam.render_mode = render_mode
-
-    return obs_config
+_RELATIONSHIP_TASK_STEPS_CACHE: dict[tuple[str, bool], list[str]] = {}
 
 
-def _build_action_mode(action_mode: str) -> MoveArmThenGripper:
-    if action_mode == "ee_planning":
-        arm_mode = EndEffectorPoseViaPlanning(absolute_mode=True, collision_checking=False)
-    elif action_mode == "ee_ik":
-        arm_mode = EndEffectorPoseViaIK(absolute_mode=True, collision_checking=False)
-    elif action_mode == "joint_velocity":
-        arm_mode = JointVelocity()
-    else:
-        raise ValueError(f"Unknown action mode: {action_mode}")
+def _resolve_task_steps_from_relationship_template(
+    task: str,
+    rlbench_root: str | Path,
+    explicit_template_path: str | None,
+    *,
+    use_context_prompt: bool = False,
+) -> list[str]:
+    template_path = _resolve_relationship_template_path(task, rlbench_root, explicit_template_path)
+    if template_path is None:
+        return [""]
 
-    return MoveArmThenGripper(arm_action_mode=arm_mode, gripper_action_mode=Discrete())
-
-
-def _write_json(path: str, payload: dict | list) -> None:
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, ensure_ascii=False)
-
-
-def _write_csv(path: str, rows: list[dict]) -> None:
-    if not rows:
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write("")
-        return
-
-    fieldnames = list(rows[0].keys())
-    with open(path, "w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+    cache_key = (str(template_path.resolve()), bool(use_context_prompt))
+    cached = _RELATIONSHIP_TASK_STEPS_CACHE.get(cache_key)
+    if cached is None:
+        cached = _infer_task_steps_from_relationship_template(
+            template_path,
+            task,
+            use_context_prompt=use_context_prompt,
+        )
+        _RELATIONSHIP_TASK_STEPS_CACHE[cache_key] = cached
+    return cached if cached else [""]
 
 
-def aggregate_batch_results(aggregate_root: str, task_name: str = "rlbench_task") -> dict:
-    """Aggregate already-generated batch outputs without rerunning inference."""
-    root = Path(aggregate_root)
-    if not root.exists():
-        raise FileNotFoundError(f"Aggregate root does not exist: {aggregate_root}")
+def _infer_task_steps_from_relationship_template(
+    template_path: Path,
+    task: str,
+    *,
+    use_context_prompt: bool = False,
+) -> list[str]:
+    """Generate ordered per-segment instructions from relationship template."""
+    try:
+        with open(template_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return []
 
-    run_summaries: list[dict] = []
-    run_rows: list[dict] = []
-    episode_rows: list[dict] = []
+    transitions = data.get("transitions")
+    if not isinstance(transitions, list) or not transitions:
+        return []
 
-    policy_state_dirs = sorted([p for p in root.iterdir() if p.is_dir()])
-    var_seed_re = re.compile(r"^var(-?\d+)_seed(-?\d+)$")
+    info_path = template_path.parent / "info.json"
+    objects_meta: dict[str, dict[str, str]] = {}
+    if info_path.is_file():
+        try:
+            with open(info_path, "r", encoding="utf-8") as handle:
+                info_data = json.load(handle)
+            raw_objects = info_data.get("objects", {})
+            if isinstance(raw_objects, dict):
+                for obj in raw_objects.values():
+                    if not isinstance(obj, dict):
+                        continue
+                    name = str(obj.get("name", "")).strip()
+                    if name:
+                        objects_meta[name] = {"type": name}
+        except Exception:
+            objects_meta = {}
 
-    for policy_state_dir in policy_state_dirs:
-        name = policy_state_dir.name
-        if "_" not in name:
+    episodes: list[dict[str, list[dict]]] = []
+    begin_sg: list[dict] = []
+    for transition in transitions:
+        if not isinstance(transition, dict):
             continue
-        policy, state = name.rsplit("_", 1)
+        rels = transition.get("relationships", [])
+        if not isinstance(rels, list):
+            rels = []
+        end_sg = [r for r in rels if isinstance(r, dict)]
+        episodes.append({"begin_sg": list(begin_sg), "end_sg": end_sg})
+        begin_sg = end_sg
 
-        for eval_dir in sorted([p for p in policy_state_dir.iterdir() if p.is_dir()]):
-            match = var_seed_re.match(eval_dir.name)
-            if match is None:
-                continue
-            variation = int(match.group(1))
-            seed = int(match.group(2))
+    if not episodes:
+        return []
 
-            csv_path = eval_dir / "per_run_metrics.csv"
-            if not csv_path.exists():
-                continue
-
-            with open(csv_path, "r", encoding="utf-8", newline="") as handle:
-                reader = csv.DictReader(handle)
-                rows = list(reader)
-
-            per_run_episode_rows: dict[int, list[dict]] = {}
-            for row in rows:
-                success = parse_bool(row.get("policy_success", False))
-                row_joint = parse_float(row.get("joint_l2"))
-                row_pos = parse_float(row.get("pos_l2"))
-                row_rot = parse_float(row.get("rot_deg"))
-                row_eef = parse_float(row.get("eef_l2"))
-                run_index = parse_int(row.get("run_index"))
-                if run_index is None:
-                    # Fallback for legacy CSVs without run_index.
-                    run_index = 0
-
-                enriched_episode = {
-                    "policy": policy,
-                    "state": state,
-                    "variation": variation,
-                    "seed": seed,
-                    "run_index": run_index,
-                    "episode_index": parse_int(row.get("episode_index")),
-                    "instruction": row.get("instruction"),
-                    "policy_success": success,
-                    "joint_l2": row_joint,
-                    "pos_l2": row_pos,
-                    "rot_deg": row_rot,
-                    "eef_l2": row_eef,
-                    "eval_dir": str(eval_dir),
-                }
-                episode_rows.append(enriched_episode)
-                per_run_episode_rows.setdefault(run_index, []).append(enriched_episode)
-
-            eval_run_metrics: list[dict] = []
-            for run_index, run_eps in sorted(per_run_episode_rows.items(), key=lambda kv: kv[0]):
-                run_episode_successes = [float(bool(ep.get("policy_success", False))) for ep in run_eps]
-                run_joint_l2 = [ep.get("joint_l2") for ep in run_eps]
-                run_pos_l2 = [ep.get("pos_l2") for ep in run_eps]
-                run_rot_deg = [ep.get("rot_deg") for ep in run_eps]
-                run_eef_l2 = [ep.get("eef_l2") for ep in run_eps]
-                all_success = (
-                    float(all(v > 0.5 for v in run_episode_successes))
-                    if run_episode_successes
-                    else None
-                )
-                metric = {
-                    "policy": policy,
-                    "state": state,
-                    "variation": variation,
-                    "seed": seed,
-                    "run_index": run_index,
-                    "num_episodes": len(run_eps),
-                    "episode_success_rate": mean_or_none(run_episode_successes),
-                    "all_episode_success_rate": all_success,
-                    "joint_l2_mean": mean_or_none(run_joint_l2),
-                    "pos_l2_mean": mean_or_none(run_pos_l2),
-                    "rot_deg_mean": mean_or_none(run_rot_deg),
-                    "eef_l2_mean": mean_or_none(run_eef_l2),
-                    "eval_dir": str(eval_dir),
-                }
-                eval_run_metrics.append(metric)
-                run_rows.append(metric)
-
-            run_summaries.append(
-                {
-                    "policy": policy,
-                    "state": state,
-                    "variation": variation,
-                    "seed": seed,
-                    "num_runs": len(eval_run_metrics),
-                    "num_episodes": len(rows),
-                    "episode_success_rate_mean": _mean_or_none(
-                        [r.get("episode_success_rate") for r in eval_run_metrics]
-                    ),
-                    "episode_success_rate_overall": _mean_or_none(
-                        [float(bool(ep.get("policy_success", False))) for ep in episode_rows if ep["eval_dir"] == str(eval_dir)]
-                    ),
-                    "all_episode_success_rate_mean": _mean_or_none(
-                        [r.get("all_episode_success_rate") for r in eval_run_metrics]
-                    ),
-                    "joint_l2_mean": _mean_or_none([r.get("joint_l2_mean") for r in eval_run_metrics]),
-                    "joint_l2_overall": _mean_or_none(
-                        [ep.get("joint_l2") for ep in episode_rows if ep["eval_dir"] == str(eval_dir)]
-                    ),
-                    "pos_l2_mean": _mean_or_none([r.get("pos_l2_mean") for r in eval_run_metrics]),
-                    "pos_l2_overall": _mean_or_none(
-                        [ep.get("pos_l2") for ep in episode_rows if ep["eval_dir"] == str(eval_dir)]
-                    ),
-                    "rot_deg_mean": _mean_or_none([r.get("rot_deg_mean") for r in eval_run_metrics]),
-                    "rot_deg_overall": _mean_or_none(
-                        [ep.get("rot_deg") for ep in episode_rows if ep["eval_dir"] == str(eval_dir)]
-                    ),
-                    "eval_dir": str(eval_dir),
-                }
-            )
-
-    def _group_runs(key: str) -> list[dict]:
-        groups: dict[str, list[dict]] = {}
-        for row in run_rows:
-            groups.setdefault(str(row[key]), []).append(row)
-
-        summaries: list[dict] = []
-        for group_key, rows in groups.items():
-            group_eval_dirs = {str(r["eval_dir"]) for r in rows}
-            group_episodes = [ep for ep in episode_rows if str(ep[key]) == group_key]
-            summaries.append(
-                {
-                    key: group_key,
-                    "num_eval_dirs": len(group_eval_dirs),
-                    "num_runs": len(rows),
-                    "num_episodes": len(group_episodes),
-                    "episode_success_rate_mean": _mean_or_none([r.get("episode_success_rate") for r in rows]),
-                    "episode_success_rate_std": std_or_none([r.get("episode_success_rate") for r in rows]),
-                    "episode_success_rate_overall": _mean_or_none(
-                        [float(bool(ep.get("policy_success", False))) for ep in group_episodes]
-                    ),
-                    "all_episode_success_rate_mean": _mean_or_none(
-                        [r.get("all_episode_success_rate") for r in rows]
-                    ),
-                    "joint_l2_mean": _mean_or_none([r.get("joint_l2_mean") for r in rows]),
-                    "joint_l2_overall": _mean_or_none([ep.get("joint_l2") for ep in group_episodes]),
-                    "pos_l2_mean": _mean_or_none([r.get("pos_l2_mean") for r in rows]),
-                    "pos_l2_overall": _mean_or_none([ep.get("pos_l2") for ep in group_episodes]),
-                    "rot_deg_mean": _mean_or_none([r.get("rot_deg_mean") for r in rows]),
-                    "rot_deg_overall": _mean_or_none([ep.get("rot_deg") for ep in group_episodes]),
-                }
-            )
-        summaries.sort(
-            key=lambda r: (
-                -(r.get("all_episode_success_rate_mean") or -1.0),
-                r.get("joint_l2_mean") if r.get("joint_l2_mean") is not None else float("inf"),
-            )
-        )
-        return summaries
-
-    pair_groups: dict[tuple[str, str], list[dict]] = {}
-    for row in run_rows:
-        pair_groups.setdefault((str(row["policy"]), str(row["state"])), []).append(row)
-
-    by_policy_state: list[dict] = []
-    for (policy, state), rows in pair_groups.items():
-        group_eval_dirs = {str(r["eval_dir"]) for r in rows}
-        group_episodes = [
-            ep
-            for ep in episode_rows
-            if str(ep["policy"]) == policy and str(ep["state"]) == state
-        ]
-        by_policy_state.append(
-            {
-                "policy": policy,
-                "state": state,
-                "num_eval_dirs": len(group_eval_dirs),
-                "num_runs": len(rows),
-                "num_episodes": len(group_episodes),
-                "episode_success_rate_mean": _mean_or_none([r.get("episode_success_rate") for r in rows]),
-                "episode_success_rate_std": std_or_none([r.get("episode_success_rate") for r in rows]),
-                "episode_success_rate_overall": _mean_or_none(
-                    [float(bool(ep.get("policy_success", False))) for ep in group_episodes]
-                ),
-                "all_episode_success_rate_mean": _mean_or_none(
-                    [r.get("all_episode_success_rate") for r in rows]
-                ),
-                "joint_l2_mean": _mean_or_none([r.get("joint_l2_mean") for r in rows]),
-                "joint_l2_overall": _mean_or_none([ep.get("joint_l2") for ep in group_episodes]),
-                "pos_l2_mean": _mean_or_none([r.get("pos_l2_mean") for r in rows]),
-                "pos_l2_overall": _mean_or_none([ep.get("pos_l2") for ep in group_episodes]),
-                "rot_deg_mean": _mean_or_none([r.get("rot_deg_mean") for r in rows]),
-                "rot_deg_overall": _mean_or_none([ep.get("rot_deg") for ep in group_episodes]),
-            }
-        )
-    by_policy_state.sort(
-        key=lambda r: (
-            -(r.get("all_episode_success_rate_mean") or -1.0),
-            r.get("joint_l2_mean") if r.get("joint_l2_mean") is not None else float("inf"),
-        )
+    task_steps = generate_task_descriptions(
+        episodes,
+        objects_meta,
+        task,
+        use_context=use_context_prompt,
     )
-
-    # Convenience table for "policy x action x episode" reporting.
-    # In this benchmark pipeline:
-    #   eef   -> ee_planning
-    #   joint -> joint_velocity
-    action_mode_map = {
-        "eef": "ee_planning",
-        "joint": "joint_velocity",
-    }
-    combo_episode_groups: dict[tuple[str, str, int], list[dict]] = {}
-    for ep in episode_rows:
-        ep_idx = ep.get("episode_index")
-        if ep_idx is None:
-            continue
-        key = (str(ep.get("policy")), str(ep.get("state")), int(ep_idx))
-        combo_episode_groups.setdefault(key, []).append(ep)
-
-    overall_metrics_rows: list[dict] = []
-    for (policy, state, episode_index), rows in sorted(
-        combo_episode_groups.items(),
-        key=lambda item: (item[0][0], item[0][1], item[0][2]),
-    ):
-        run_keys = {
-            (
-                int(parse_int(r.get("variation")) or 0),
-                int(parse_int(r.get("seed")) or 0),
-                int(parse_int(r.get("run_index")) or 0),
-            )
-            for r in rows
-        }
-        eval_dirs = {str(r.get("eval_dir")) for r in rows}
-        overall_metrics_rows.append(
-            {
-                "policy": policy,
-                "state": state,
-                "action_mode": action_mode_map.get(state, "unknown"),
-                "episode_index": episode_index,
-                "num_eval_dirs": len(eval_dirs),
-                "num_runs": len(run_keys),
-                "num_episode_rows": len(rows),
-                "episode_success_rate": _mean_or_none(
-                    [float(bool(ep.get("policy_success", False))) for ep in rows]
-                ),
-                "joint_l2_mean": _mean_or_none([ep.get("joint_l2") for ep in rows]),
-                "pos_l2_mean": _mean_or_none([ep.get("pos_l2") for ep in rows]),
-                "rot_deg_mean": _mean_or_none([ep.get("rot_deg") for ep in rows]),
-                "eef_l2_mean": _mean_or_none([ep.get("eef_l2") for ep in rows]),
-            }
-        )
-
-    overall = {
-        "num_eval_dirs": len(run_summaries),
-        "num_runs": len(run_rows),
-        "num_episodes": len(episode_rows),
-        "episode_success_rate_mean": mean_or_none([r.get("episode_success_rate") for r in run_rows]),
-        "episode_success_rate_std": std_or_none([r.get("episode_success_rate") for r in run_rows]),
-        "episode_success_rate_overall": mean_or_none(
-            [float(bool(ep.get("policy_success", False))) for ep in episode_rows]
-        ),
-        "all_episode_success_rate_mean": mean_or_none(
-            [r.get("all_episode_success_rate") for r in run_rows]
-        ),
-        "joint_l2_mean": mean_or_none([r.get("joint_l2_mean") for r in run_rows]),
-        "joint_l2_overall": mean_or_none([ep.get("joint_l2") for ep in episode_rows]),
-        "pos_l2_mean": mean_or_none([r.get("pos_l2_mean") for r in run_rows]),
-        "pos_l2_overall": mean_or_none([ep.get("pos_l2") for ep in episode_rows]),
-        "rot_deg_mean": mean_or_none([r.get("rot_deg_mean") for r in run_rows]),
-        "rot_deg_overall": mean_or_none([ep.get("rot_deg") for ep in episode_rows]),
-        "eef_l2_mean": mean_or_none([r.get("eef_l2_mean") for r in run_rows]),
-        "eef_l2_overall": mean_or_none([ep.get("eef_l2") for ep in episode_rows]),
-    }
-
-    return {
-        "task": task_name,
-        "aggregate_root": str(root),
-        "num_eval_dirs": len(run_summaries),
-        "num_runs": len(run_rows),
-        "num_episode_rows": len(episode_rows),
-        "run_details": sorted(
-            run_summaries,
-            key=lambda r: (str(r["policy"]), str(r["state"]), int(r["variation"]), int(r["seed"])),
-        ),
-        "per_run_details": sorted(
-            run_rows,
-            key=lambda r: (
-                str(r["policy"]),
-                str(r["state"]),
-                int(r["variation"]),
-                int(r["seed"]),
-                int(r["run_index"]),
-            ),
-        ),
-        "comparison": {
-            "overall": overall,
-            "by_policy_state": by_policy_state,
-            "by_policy": _group_runs("policy"),
-            "by_state": _group_runs("state"),
-        },
-        "overall_metrics_rows": overall_metrics_rows,
-    }
-
-
-def _instruction_steps(task_description: str) -> list[str]:
-    steps = split_task_description_into_steps(task_description or "")
-    cleaned = [s.strip() for s in steps if s.strip()]
-    return cleaned if cleaned else [""]
+    cleaned_steps = [str(s).strip() for s in task_steps if str(s).strip()]
+    return cleaned_steps
 
 
 def _gripper_change_indices(observations: list, threshold: float = 0.5) -> list[int]:
@@ -471,7 +165,9 @@ def _segment_ranges(boundaries: list[int], n_segments: int, last_index: int) -> 
         end = boundaries[idx] if idx < len(boundaries) else last_index
         end = int(max(start, min(end, last_index)))
         ranges.append((start, end))
-        start = end
+        # Boundaries are segment END indices, so next segment starts at end+1.
+        # This avoids reusing the transition frame as both previous-end and next-start.
+        start = min(end + 1, last_index)
     return ranges
 
 
@@ -622,22 +318,18 @@ def _save_episode_outputs(
 
 
 def run_evaluation(args: argparse.Namespace) -> None:
-    if not args.checkpoint:
-        raise ValueError("--checkpoint is required unless --aggregate_only is used.")
-    if not args.dataset_root:
-        raise ValueError("--dataset_root is required unless --aggregate_only is used.")
 
     os.makedirs(args.save_path, exist_ok=True)
 
-    obs_config = _build_obs_config(list(args.image_size), args.renderer)
-    action_mode = _build_action_mode(args.action_mode)
+    obs_config = build_obs_config(list(args.image_size), args.renderer)
+    action_mode = build_action_mode(args.action_mode)
 
     env = Environment(
         action_mode=action_mode,
         obs_config=obs_config,
         arm_max_velocity=args.arm_max_velocity,
         arm_max_acceleration=args.arm_max_acceleration,
-        headless=True,
+        headless=not args.debug,
     )
     env.launch()
     print(f"RLBench launched for evaluation (task={args.task}, variation={args.variation})")
@@ -649,188 +341,109 @@ def run_evaluation(args: argparse.Namespace) -> None:
     template_path = _resolve_relationship_template_path(
         args.task, rlbench_root, args.relationship_template
     )
-    template_transitions: list[dict] | None = None
-    if not getattr(args, "no_relationship_template", False) and template_path is not None:
-        template_transitions = _load_relationship_transitions(template_path)
-        if template_transitions:
-            print(
-                f"Segmentation from relationship template: {template_path} "
-                f"({len(template_transitions)} transition(s) → {len(template_transitions)} episode(s))"
-            )
-        else:
-            template_transitions = None
-    if template_transitions is None and not getattr(args, "no_relationship_template", False):
-        expected = rlbench_root / args.task / f"{args.task}_relationship_template.json"
-        print(
-            f"Warning: relationship template missing or empty ({expected}); "
-            "using instruction-step count + gripper boundaries."
+    template_transitions = _load_relationship_transitions(template_path) if template_path else []
+    print(
+        f"Segmentation from relationship template: {template_path} "
+        f"({len(template_transitions)} transition(s) → {len(template_transitions)} episode(s))"
+    )
+    if not template_transitions:
+        raise ValueError(f"Relationship template missing or empty: {template_path}")
+
+    task_steps = _resolve_task_steps_from_relationship_template(
+        args.task,
+        rlbench_root,
+        args.relationship_template,
+        use_context_prompt=args.with_context_prompt,
+    )
+    task_description = " ".join(task_steps).strip()
+
+    task_class = task_file_to_task_class(args.task)
+    task_env = env.get_task(task_class)
+
+    policy = LeRobotPolicy(
+        checkpoint_path=args.checkpoint,
+        dataset_root=args.dataset_root,
+        # Important: do NOT bind the full multi-step prompt at init.
+        # We set per-instruction text right before each segment rollout.
+        task_description="",
+        action_mode=args.action_mode,
+        device=args.device,
+    )
+
+    for run_idx in range(args.runs):
+        run_seed = args.seed + run_idx
+        random.seed(run_seed)
+        np.random.seed(run_seed)
+        torch.manual_seed(run_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(run_seed)
+
+        task_env.set_variation(args.variation)
+        print(f"\n[{run_idx + 1}/{args.runs}] seed={run_seed}")
+
+        run_dir = os.path.join(args.save_path, f"run_{run_idx:03d}")
+        os.makedirs(run_dir, exist_ok=True)
+
+        planner_obs, planner_grasped, planner_demo, planner_state_snaps = collect_planner_rollout(
+            task_env,
+            max_attempts=args.planner_max_attempts,
         )
 
-    try:
-        task_class = task_file_to_task_class(args.task)
-        task_env = env.get_task(task_class)
+        # Reset to exactly the same initial state sampled for planner rollout.
+        _descriptions, _initial_obs = task_env.reset_to_demo(planner_demo)
+        last_expert_idx = max(0, len(planner_obs) - 1)
+        gripper_changes = _gripper_change_indices(planner_obs)
 
-        policy = LeRobotPolicy(
-            checkpoint_path=args.checkpoint,
-            dataset_root=args.dataset_root,
-            # Important: do NOT bind the full multi-step prompt at init.
-            # We set per-instruction text right before each segment rollout.
-            task_description="",
-            action_mode=args.action_mode,
-            device=args.device,
+        n_segments, boundaries = _segmentation_from_relationship_template(
+            planner_obs, template_transitions, last_expert_idx
         )
+        
+        segment_instructions = _instructions_per_segment(
+            n_segments, task_steps, task_description
+        )
+        ranges = _segment_ranges(boundaries, n_segments, last_expert_idx)
 
-        for run_idx in range(args.runs):
-            run_seed = args.seed + run_idx
-            random.seed(run_seed)
-            np.random.seed(run_seed)
-            torch.manual_seed(run_seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(run_seed)
+        initial_state = capture_task_env_state(task_env)
+        # RLBench demo callback does not provide a snapshot for the very first
+        # observation, so fill it from reset_to_demo() state.
+        if planner_state_snaps:
+            if planner_state_snaps[0] is None:
+                planner_state_snaps[0] = initial_state
 
-            task_env.set_variation(args.variation)
-            print(f"\n[{run_idx + 1}/{args.runs}] seed={run_seed}")
+        episode_metrics: list[dict] = []
 
-            run_dir = os.path.join(args.save_path, f"run_{run_idx:03d}")
-            os.makedirs(run_dir, exist_ok=True)
+        for ep_idx in range(n_segments):
+            step_text = segment_instructions[ep_idx]
+            seg_start, seg_end = ranges[ep_idx]
+            print(f"  ep={ep_idx} instruction={step_text}")
 
-            planner_obs, planner_grasped, planner_demo, planner_state_snaps = collect_planner_rollout(
-                task_env,
-                max_attempts=args.planner_max_attempts,
+            planner_episode_dir = os.path.join(run_dir, "planner", "episodes", f"episode{ep_idx}")
+            policy_episode_dir = os.path.join(run_dir, "policy", "episodes", f"episode{ep_idx}")
+
+            planner_ep_obs = planner_obs[seg_start : seg_end + 1]
+            planner_ep_grasp = planner_grasped[seg_start : seg_end + 1]
+
+            planner_actions_full = planner_actions_from_observations(planner_ep_obs)
+            planner_actions_step = (
+                planner_actions_full[1:]
+                if planner_actions_full.shape[0] > 1
+                else np.zeros((0, 8), dtype=np.float64)
             )
+            planner_rewards = np.zeros((planner_actions_step.shape[0],), dtype=np.float32)
+            planner_dones = np.zeros((planner_actions_step.shape[0],), dtype=np.bool_)
+            if planner_rewards.shape[0] > 0:
+                planner_rewards[-1] = 1.0
+                planner_dones[-1] = True
 
-            # Reset to exactly the same initial state sampled for planner rollout.
-            descriptions, _initial_obs = task_env.reset_to_demo(planner_demo)
-            task_description = args.task_description
-            if task_description is None:
-                task_description = descriptions[0] if descriptions else ""
-
-            task_steps = _instruction_steps(task_description)
-            last_expert_idx = max(0, len(planner_obs) - 1)
-            gripper_changes = _gripper_change_indices(planner_obs)
-
-            if template_transitions:
-                n_segments, boundaries = _segmentation_from_relationship_template(
-                    planner_obs, template_transitions, last_expert_idx
-                )
-                segmentation_source = "relationship_template"
-            else:
-                n_segments = max(1, len(task_steps))
-                boundaries = _segment_boundaries(gripper_changes, n_segments, last_expert_idx)
-                segmentation_source = "instruction_steps_gripper"
-                if len(gripper_changes) < max(0, n_segments - 1):
-                    print(
-                        "  Warning: expert gripper transitions fewer than task steps; "
-                        "reusing final expert state for remaining segments."
-                    )
-
-            segment_instructions = _instructions_per_segment(
-                n_segments, task_steps, task_description
-            )
-            ranges = _segment_ranges(boundaries, n_segments, last_expert_idx)
-
-            initial_state = capture_task_env_state(task_env)
-            # RLBench demo callback does not provide a snapshot for the very first
-            # observation, so fill it from reset_to_demo() state.
-            if planner_state_snaps:
-                if planner_state_snaps[0] is None:
-                    planner_state_snaps[0] = initial_state
-
-            episode_metrics: list[dict] = []
-
-            for ep_idx in range(n_segments):
-                step_text = segment_instructions[ep_idx]
-                seg_start, seg_end = ranges[ep_idx]
-                print(f"  ep={ep_idx} instruction={step_text}")
-
-                planner_episode_dir = os.path.join(run_dir, "planner", "episodes", f"episode{ep_idx}")
-                policy_episode_dir = os.path.join(run_dir, "policy", "episodes", f"episode{ep_idx}")
-
-                planner_ep_obs = planner_obs[seg_start : seg_end + 1]
-                planner_ep_grasp = planner_grasped[seg_start : seg_end + 1]
-
-                planner_actions_full = planner_actions_from_observations(planner_ep_obs)
-                planner_actions_step = (
-                    planner_actions_full[1:]
-                    if planner_actions_full.shape[0] > 1
-                    else np.zeros((0, 8), dtype=np.float64)
-                )
-                planner_rewards = np.zeros((planner_actions_step.shape[0],), dtype=np.float32)
-                planner_dones = np.zeros((planner_actions_step.shape[0],), dtype=np.bool_)
-                if planner_rewards.shape[0] > 0:
-                    planner_rewards[-1] = 1.0
-                    planner_dones[-1] = True
-
-                _save_episode_outputs(
-                    planner_ep_obs,
-                    planner_episode_dir,
-                    grasped_target=planner_ep_grasp,
-                    actions_step=planner_actions_step,
-                    rewards=planner_rewards,
-                    dones=planner_dones,
-                    info={
-                        "source": "planner",
-                        "run_index": run_idx,
-                        "seed": run_seed,
-                        "variation": args.variation,
-                        "episode_index": ep_idx,
-                        "instruction": step_text,
-                        "segment_start_index": seg_start,
-                        "segment_end_index": seg_end,
-                    },
-                )
-
-                # Always restore from planner-aligned state for every episode
-                # (including episode 0) to keep planner/policy start states matched.
-                policy_start_state = (
-                    planner_state_snaps[seg_start] if seg_start < len(planner_state_snaps) else None
-                )
-                if policy_start_state is None:
-                    policy_start_state = initial_state
-                policy_start_obs = restore_task_env_state(task_env, policy_start_state)
-
-                policy_rollout = rollout_policy(
-                    task_env,
-                    policy,
-                    initial_obs=policy_start_obs,
-                    task_description=step_text,
-                    max_steps_per_instruction=args.max_steps,
-                    stop_on_success=False,
-                )
-
-                policy_actions_step = np.asarray(policy_rollout["actions"], dtype=np.float64)
-                if policy_actions_step.ndim == 1 and policy_actions_step.size > 0:
-                    policy_actions_step = policy_actions_step.reshape(1, -1)
-                if policy_actions_step.size == 0:
-                    policy_actions_step = np.zeros((0, 8), dtype=np.float64)
-
-                policy_rewards = np.asarray(policy_rollout["rewards"], dtype=np.float32)
-                policy_dones = np.asarray(policy_rollout["dones"], dtype=np.bool_)
-
-                _save_episode_outputs(
-                    policy_rollout["observations"],
-                    policy_episode_dir,
-                    grasped_target=policy_rollout["grasped_target"],
-                    actions_step=policy_actions_step,
-                    rewards=policy_rewards,
-                    dones=policy_dones,
-                    info={
-                        "source": "policy",
-                        "run_index": run_idx,
-                        "seed": run_seed,
-                        "variation": args.variation,
-                        "episode_index": ep_idx,
-                        "instruction": step_text,
-                        "policy_success": bool(policy_rollout["success"]),
-                        "policy_errors": policy_rollout["errors"],
-                    },
-                )
-
-                expert_final_obs = planner_obs[seg_end]
-                policy_final_obs = policy_rollout["observations"][-1]
-                dist = _segment_state_metric(expert_final_obs, policy_final_obs)
-
-                episode_metric = {
+            _save_episode_outputs(
+                planner_ep_obs,
+                planner_episode_dir,
+                grasped_target=planner_ep_grasp,
+                actions_step=planner_actions_step,
+                rewards=planner_rewards,
+                dones=planner_dones,
+                info={
+                    "source": "planner",
                     "run_index": run_idx,
                     "seed": run_seed,
                     "variation": args.variation,
@@ -838,43 +451,130 @@ def run_evaluation(args: argparse.Namespace) -> None:
                     "instruction": step_text,
                     "segment_start_index": seg_start,
                     "segment_end_index": seg_end,
-                    "policy_success": bool(policy_rollout["success"]),
-                    "policy_terminated": bool(policy_rollout["terminated"]),
-                    "policy_error_count": int(len(policy_rollout["errors"])),
-                    "eef_l2": dist["eef_l2"],
-                    "joint_l2": dist["joint_l2"],
-                    "pos_l2": dist["pos_l2"],
-                    "rot_deg": dist["rot_deg"],
-                }
-                episode_metrics.append(episode_metric)
-                run_rows.append(dict(episode_metric))
+                },
+            )
 
+            # Always restore from planner-aligned state for every episode
+            # (including episode 0) to keep planner/policy start states matched.
+            policy_start_state = planner_state_snaps[seg_start] if seg_start < len(planner_state_snaps) else None
+            policy_start_source = f"planner_state_snaps[{seg_start}]"
+            if policy_start_state is None:
+                policy_start_state = initial_state
+                policy_start_source = "initial_state_fallback"
+
+            if args.debug_snapshot_restore:
                 print(
-                    "  "
-                    f"ep={ep_idx} success={episode_metric['policy_success']} "
-                    f"joint_l2={episode_metric['joint_l2']:.6f} "
-                    f"pos_l2={episode_metric['pos_l2']:.6f}"
+                    f"[restore-select] run={run_idx} ep={ep_idx} seg_start={seg_start} "
+                    f"seg_end={seg_end} source={policy_start_source} "
+                    f"snapshots_len={len(planner_state_snaps)}"
                 )
 
-            run_metric = {
+            policy_start_obs = restore_task_env_state(
+                task_env,
+                policy_start_state,
+                debug_restore=args.debug_snapshot_restore,
+                debug_label=f"run{run_idx}_ep{ep_idx}",
+            )
+
+            if args.debug_snapshot_restore and seg_start < len(planner_obs):
+                planner_start_obs = planner_obs[seg_start]
+                planner_start_eef = extract_eef_state(planner_start_obs).astype(np.float64)
+                policy_start_eef = extract_eef_state(policy_start_obs).astype(np.float64)
+                planner_start_joint = extract_joint_state(planner_start_obs).astype(np.float64)
+                policy_start_joint = extract_joint_state(policy_start_obs).astype(np.float64)
+                print(
+                    f"[restore-compare] run={run_idx} ep={ep_idx} "
+                    f"eef_l2={float(np.linalg.norm(policy_start_eef - planner_start_eef)):.6f} "
+                    f"joint_l2={float(np.linalg.norm(policy_start_joint - planner_start_joint)):.6f} "
+                    f"gripper_planner={float(getattr(planner_start_obs, 'gripper_open', np.nan)):.4f} "
+                    f"gripper_policy={float(getattr(policy_start_obs, 'gripper_open', np.nan)):.4f}"
+                )
+
+            policy_rollout = rollout_policy(
+                task_env,
+                policy,
+                initial_obs=policy_start_obs,
+                task_description=step_text,
+                max_steps_per_instruction=args.max_steps,
+                stop_on_success=False,
+                binarize_gripper_action=args.binarize_gripper_action,
+            )
+
+            policy_actions_step = np.asarray(policy_rollout["actions"], dtype=np.float64)
+            if policy_actions_step.ndim == 1 and policy_actions_step.size > 0:
+                policy_actions_step = policy_actions_step.reshape(1, -1)
+            if policy_actions_step.size == 0:
+                policy_actions_step = np.zeros((0, 8), dtype=np.float64)
+
+            policy_rewards = np.asarray(policy_rollout["rewards"], dtype=np.float32)
+            policy_dones = np.asarray(policy_rollout["dones"], dtype=np.bool_)
+
+            _save_episode_outputs(
+                policy_rollout["observations"],
+                policy_episode_dir,
+                grasped_target=policy_rollout["grasped_target"],
+                actions_step=policy_actions_step,
+                rewards=policy_rewards,
+                dones=policy_dones,
+                info={
+                    "source": "policy",
+                    "run_index": run_idx,
+                    "seed": run_seed,
+                    "variation": args.variation,
+                    "episode_index": ep_idx,
+                    "instruction": step_text,
+                    "policy_success": bool(policy_rollout["success"]),
+                    "policy_errors": policy_rollout["errors"],
+                },
+            )
+
+            expert_final_obs = planner_obs[seg_end]
+            policy_final_obs = policy_rollout["observations"][-1]
+            dist = _segment_state_metric(expert_final_obs, policy_final_obs)
+
+            episode_metric = {
                 "run_index": run_idx,
                 "seed": run_seed,
                 "variation": args.variation,
+                "episode_index": ep_idx,
                 "task_description": task_description,
-                "task_steps": task_steps,
-                "segment_instructions": segment_instructions,
-                "segmentation_source": segmentation_source,
-                "relationship_template_path": str(template_path) if template_path else None,
-                "num_template_transitions": len(template_transitions) if template_transitions else None,
-                "expert_gripper_change_indices": gripper_changes,
-                "segment_boundaries": boundaries,
-                "episode_metrics": episode_metrics,
+                "instruction": step_text,
+                "segment_start_index": seg_start,
+                "segment_end_index": seg_end,
+                "policy_success": bool(policy_rollout["success"]),
+                "policy_terminated": bool(policy_rollout["terminated"]),
+                "policy_error_count": int(len(policy_rollout["errors"])),
+                "eef_l2": dist["eef_l2"],
+                "joint_l2": dist["joint_l2"],
+                "pos_l2": dist["pos_l2"],
+                "rot_deg": dist["rot_deg"],
             }
-            run_metrics.append(run_metric)
+            episode_metrics.append(episode_metric)
+            run_rows.append(dict(episode_metric))
 
-            _write_json(os.path.join(run_dir, "metrics.json"), run_metric)
+            print(
+                "  "
+                f"ep={ep_idx} success={episode_metric['policy_success']} "
+                f"joint_l2={episode_metric['joint_l2']:.6f} "
+                f"pos_l2={episode_metric['pos_l2']:.6f}"
+            )
 
-    finally:
+        run_metric = {
+            "run_index": run_idx,
+            "seed": run_seed,
+            "variation": args.variation,
+            "task_description": task_description,
+            "task_steps": task_steps,
+            "segment_instructions": segment_instructions,
+            "relationship_template_path": str(template_path) if template_path else None,
+            "num_template_transitions": len(template_transitions) if template_transitions else None,
+            "expert_gripper_change_indices": gripper_changes,
+            "segment_boundaries": boundaries,
+            "episode_metrics": episode_metrics,
+        }
+        run_metrics.append(run_metric)
+
+        write_json(os.path.join(run_dir, "metrics.json"), run_metric)
         env.shutdown()
 
     max_episodes = max((len(r.get("episode_metrics", [])) for r in run_metrics), default=0)
@@ -917,9 +617,9 @@ def run_evaluation(args: argparse.Namespace) -> None:
         "per_episode": per_episode_summary,
     }
 
-    _write_json(os.path.join(args.save_path, "summary.json"), summary)
-    _write_json(os.path.join(args.save_path, "per_run_metrics.json"), run_metrics)
-    _write_csv(os.path.join(args.save_path, "per_run_metrics.csv"), run_rows)
+    write_json(os.path.join(args.save_path, "summary.json"), summary)
+    write_json(os.path.join(args.save_path, "per_run_metrics.json"), run_metrics)
+    write_csv(os.path.join(args.save_path, "per_run_metrics.csv"), run_rows)
 
     print("\nEvaluation complete.")
     print(f"Saved outputs to: {args.save_path}")
@@ -956,9 +656,9 @@ def parse_args() -> argparse.Namespace:
         help="Ignore relationship template; use instruction steps + first gripper changes.",
     )
     parser.add_argument(
-        "--task_description",
-        type=str,
-        default="Pick up paper. Release paper, then place paper in trash bin.",
+        "--with_context_prompt",
+        action="store_true",
+        help="Use ConceptGraphs-style context prompt for per-segment instructions.",
     )
     parser.add_argument("--device", type=str, default=None)
 
@@ -973,12 +673,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arm_max_velocity", type=float, default=1.0)
     parser.add_argument("--arm_max_acceleration", type=float, default=4.0)
     parser.add_argument("--planner_max_attempts", type=int, default=10)
-    parser.add_argument("--save_path", type=str, default="output/rlbench_eval/default_task")
     parser.add_argument(
-        "--aggregate_only",
-        action="store_true",
-        help="Skip RLBench evaluation and only aggregate existing outputs under --aggregate_root.",
+        "--binarize_gripper_action",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Snap policy gripper action (last dim) to nearest 0/1 before env.step().",
     )
+    parser.add_argument("--save_path", type=str, default="output/rlbench_eval/default_task")
     parser.add_argument(
         "--aggregate_root",
         type=str,
@@ -1006,36 +707,20 @@ def parse_args() -> argparse.Namespace:
             "(default: <aggregate_root>/overall_metrics.csv)."
         ),
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Run in debug mode with RLBench renderer visible and verbose logging.",
+    )
+    parser.add_argument(
+        "--debug_snapshot_restore",
+        action="store_true",
+        help="Print detailed snapshot/restore diagnostics around policy episode starts.",
+    )
 
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     parsed_args = parse_args()
-    if parsed_args.aggregate_only:
-        aggregate_root = parsed_args.aggregate_root or parsed_args.save_path
-        payload = aggregate_batch_results(aggregate_root, task_name=parsed_args.task)
-
-        output_json = parsed_args.aggregate_output_json
-        if output_json is None:
-            output_json = str(Path(aggregate_root) / "detailed_summary.json")
-        _write_json(output_json, payload)
-
-        output_csv = parsed_args.aggregate_output_csv
-        if output_csv is None:
-            output_csv = str(Path(aggregate_root) / "detailed_runs.csv")
-        _write_csv(output_csv, payload.get("run_details", []))
-
-        output_overall_csv = parsed_args.aggregate_output_overall_csv
-        if output_overall_csv is None:
-            output_overall_csv = str(Path(aggregate_root) / "overall_metrics.csv")
-        _write_csv(output_overall_csv, payload.get("overall_metrics_rows", []))
-
-        print("\nAggregate-only summary complete.")
-        print(f"Aggregate root: {aggregate_root}")
-        print(f"Detailed JSON : {output_json}")
-        print(f"Detailed CSV  : {output_csv}")
-        print(f"Overall CSV   : {output_overall_csv}")
-        print(json.dumps(payload.get("comparison", {}), indent=2))
-    else:
-        run_evaluation(parsed_args)
+    run_evaluation(parsed_args)

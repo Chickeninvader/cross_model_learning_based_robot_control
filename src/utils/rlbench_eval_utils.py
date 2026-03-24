@@ -102,41 +102,97 @@ def is_target_grasped(task_env: Any, target_attr: str = "rubbish") -> bool:
 
 
 def capture_task_env_state(task_env: Any) -> dict[str, Any]:
-    """Capture a restorable task+robot simulator state snapshot."""
+    """Capture a restorable task+robot simulator state snapshot.
+
+    In addition to CoppeliaSim configuration trees, we also capture
+    PyRep's Python-side gripper grasp bookkeeping (``_grasped_objects``
+    and ``_old_parents``).  Without this, restoring the sim tree alone
+    leaves PyRep unaware of the grasp, so the first physics step after
+    restore drops the object.
+    """
+    gripper = task_env._robot.gripper
+    grasped_objects = list(gripper._grasped_objects)
+    old_parents = list(gripper._old_parents)
+
     return {
         "arm": task_env._robot.arm.get_configuration_tree(),
-        "gripper": task_env._robot.gripper.get_configuration_tree(),
+        "gripper": gripper.get_configuration_tree(),
         "task": task_env._task.get_state(),
+        "grasped_objects": grasped_objects,
+        "old_parents": old_parents,
     }
 
 
-def restore_task_env_state(task_env: Any, state: dict[str, Any], settle_steps: int = 2) -> Any:
+def restore_task_env_state(
+    task_env: Any,
+    state: dict[str, Any],
+    settle_steps: int = 2,
+    *,
+    debug_restore: bool = False,
+    debug_label: str | None = None,
+) -> Any:
     """Restore a previously captured task+robot simulator snapshot and return observation."""
     scene = task_env._scene
     scene.pyrep.set_configuration_tree(state["arm"])
     scene.pyrep.set_configuration_tree(state["gripper"])
 
     task_state = state["task"]
-    try:
+    tag = f"[restore:{debug_label}] " if debug_label else "[restore] "
+    if debug_restore:
+        try:
+            current_obj_count = len(task_env._task.get_base().get_objects_in_tree(exclude_base=False))
+        except Exception:
+            current_obj_count = -1
+        expected_obj_count = int(task_state[1]) if isinstance(task_state, tuple) and len(task_state) > 1 else -1
+        print(
+            f"{tag}before task.restore_state expected_objects={expected_obj_count} "
+            f"current_objects={current_obj_count} settle_steps={int(settle_steps)}"
+        )
+    # Restore task tree (direct config-tree to avoid object-count guard).
+    if isinstance(task_state, tuple) and len(task_state) > 0:
+        scene.pyrep.set_configuration_tree(task_state[0])
+    else:
         task_env._task.restore_state(task_state)
-    except RuntimeError as exc:
-        # RLBench task.restore_state() validates object-tree size before restore.
-        # During grasp/release transitions, grasped objects can temporarily move
-        # under the gripper tree, causing size mismatch even though restoring the
-        # saved configuration tree itself is still valid.
-        if "Expected to be resetting" in str(exc):
-            scene.pyrep.set_configuration_tree(task_state[0])
-        else:
-            raise
+
+    # Restore grasp state.  The task-tree restore above can pull grasped
+    # objects back to their original parent, undoing the gripper-tree
+    # restore.  We fix this by explicitly re-parenting each grasped
+    # object under the gripper attach point AFTER all trees are restored.
+    gripper = task_env._robot.gripper
+    saved_grasped = state.get("grasped_objects", [])
+    saved_parents = state.get("old_parents", [])
+
+    # Clear any stale Python-side grasp state first.
+    gripper._grasped_objects = []
+    gripper._old_parents = []
+
+    if saved_grasped:
+        for obj, old_parent in zip(saved_grasped, saved_parents):
+            if not obj.still_exists():
+                continue
+            gripper._grasped_objects.append(obj)
+            gripper._old_parents.append(old_parent)
+            # Force object back under gripper attach point (task-tree
+            # restore may have moved it to the task hierarchy).
+            obj.set_parent(gripper._attach_point, keep_in_place=True)
+        if debug_restore:
+            names = [o.get_name() for o in gripper._grasped_objects]
+            print(f"{tag}restored grasped_objects={names}")
 
     task_env._robot.arm.set_joint_target_velocities([0] * len(task_env._robot.arm.joints))
-    task_env._robot.gripper.set_joint_target_velocities([0] * len(task_env._robot.gripper.joints))
+    gripper.set_joint_target_velocities([0] * len(gripper.joints))
 
-    for _ in range(max(0, int(settle_steps))):
+    # Skip settle steps when holding an object — physics steps can
+    # break the freshly-restored contact before the policy even starts.
+    effective_settle = 0 if gripper._grasped_objects else settle_steps
+    for _ in range(max(0, int(effective_settle))):
         scene.pyrep.step()
         task_env._task.step()
 
-    return task_env.get_observation()
+    obs = task_env.get_observation()
+    if debug_restore:
+        print(f"{tag}after restore gripper_open={float(getattr(obs, 'gripper_open', np.nan)):.4f}")
+    return obs
 
 
 def collect_planner_rollout(
@@ -173,17 +229,8 @@ def collect_planner_rollout(
     # Callback is not called for the very first observation in scene.get_demo.
     # Start with an explicit False (task starts ungrasped), then align lengths.
     grasp_flags = [False] + grasp_flags_each_step
-    if len(grasp_flags) < n_obs:
-        grasp_flags.extend([grasp_flags[-1] if grasp_flags else False] * (n_obs - len(grasp_flags)))
-    elif len(grasp_flags) > n_obs:
-        grasp_flags = grasp_flags[:n_obs]
 
     state_snapshots: list[dict[str, Any] | None] = [None] + state_snapshots_each_step
-    if len(state_snapshots) < n_obs:
-        filler = state_snapshots[-1] if state_snapshots else None
-        state_snapshots.extend([filler] * (n_obs - len(state_snapshots)))
-    elif len(state_snapshots) > n_obs:
-        state_snapshots = state_snapshots[:n_obs]
 
     if save_dir is not None:
         from src.utils.rlbench_rollout_io import save_observations, save_rollout_sidecars
@@ -234,6 +281,7 @@ def rollout_policy(
     max_steps_per_instruction: int,
     *,
     stop_on_success: bool = True,
+    binarize_gripper_action: bool = True,
 ) -> dict[str, Any]:
     """Run policy rollout with optional multi-instruction prompt splitting."""
     observations = [initial_obs]
@@ -258,6 +306,11 @@ def rollout_policy(
                 action = np.concatenate([action, pad], axis=0)
             elif action.shape[0] > 8:
                 action = action[:8]
+
+            # RLBench gripper command is expected to be binary-ish (open/close).
+            # Snap to nearest {0,1} to avoid weak half-close commands.
+            if binarize_gripper_action and action.shape[0] >= 8 and np.isfinite(action[7]):
+                action[7] = float(np.round(np.clip(action[7], 0.0, 1.0)))
 
             try:
                 obs, reward, done = task_env.step(action)
