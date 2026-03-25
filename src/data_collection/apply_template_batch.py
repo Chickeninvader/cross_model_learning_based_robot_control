@@ -14,7 +14,7 @@ Generated outputs per variation:
     - object_color_map.json          : Object-to-color mapping
 
 Usage:
-    python apply_template_batch.py --task stack_cups --variations 1 2 3 --episode 0
+    python apply_template_batch.py --task stack_cups --dataset_path datasets/rlbench_<run_name> --variations 1 2 3 --episode 0
 
 Author: Auto-generated scene graph tool
 """
@@ -23,9 +23,6 @@ import argparse
 import os
 import sys
 import json
-
-# Add src to path
-sys.path.insert(0, '/workspace/src')
 import utils.scene_graph_utils as utils
 
 
@@ -44,7 +41,7 @@ def process_variation(task_name, variation, episode, dataset_path, camera, templ
     task_info = utils.load_task_info(task_path)
     
     OBJECTS = task_info['object_names']
-    OBJECT_MAPPING = task_info['object_mapping']
+    REF_MAPPING = task_info['object_mapping']
     
     # Load variation data
     try:
@@ -55,6 +52,11 @@ def process_variation(task_name, variation, episode, dataset_path, camera, templ
     except Exception as e:
         print(f"❌ Failed to load variation {variation}: {e}")
         return False
+    
+    # Discover the actual handle-to-name mapping for this variation
+    # (handle IDs change per variation; sorted-order matching resolves them)
+    OBJECT_MAPPING = utils.discover_object_mapping(REF_MAPPING, image_data)
+    print(f"Resolved object mapping: {OBJECT_MAPPING}")
     
     # Extract gripper states
     gripper_states = utils.extract_gripper_states(demo)
@@ -167,8 +169,8 @@ def main():
                        help='Variation numbers to process (e.g., 1 2 3). If not specified, processes all variations under the task.')
     parser.add_argument('--episode', type=int, default=0,
                        help='Episode number (default: 0)')
-    parser.add_argument('--dataset_path', type=str, default='/workspace/datasets/rlbench',
-                       help='Path to RLBench dataset')
+    parser.add_argument('--dataset_path', type=str, required=True,
+                       help='Path to RLBench dataset root containing per-task folders')
     parser.add_argument('--camera', type=str, default='front',
                        choices=['front', 'wrist', 'left_shoulder', 'right_shoulder', 'overhead'],
                        help='Camera view to use (default: front)')

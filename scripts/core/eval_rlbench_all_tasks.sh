@@ -227,73 +227,58 @@ mkdir -p "${SAVE_ROOT}"
 IFS=',' read -r -a POLICIES_ARR <<< "${POLICIES}"
 IFS=',' read -r -a STATES_ARR <<< "${STATES}"
 
+TASKS_CSV="$(IFS=','; echo "${TASKS_ARR[*]}")"
+
 if [[ "${SUMMARIZE_ONLY}" -eq 0 ]]; then
-  for task in "${TASKS_ARR[@]}"; do
-    [[ -n "${task}" ]] || continue
-    task_save_root="${SAVE_ROOT}/${task}"
-    mkdir -p "${task_save_root}"
+  for policy in "${POLICIES_ARR[@]}"; do
+    policy="$(echo "${policy}" | xargs)"
+    [[ -n "${policy}" ]] || continue
+    for state in "${STATES_ARR[@]}"; do
+      state="$(echo "${state}" | xargs)"
+      [[ -n "${state}" ]] || continue
+      action_mode="$(action_mode_for_state "${state}")" || continue
 
-    for policy in "${POLICIES_ARR[@]}"; do
-      policy="$(echo "${policy}" | xargs)"
-      [[ -n "${policy}" ]] || continue
-      for state in "${STATES_ARR[@]}"; do
-        state="$(echo "${state}" | xargs)"
-        [[ -n "${state}" ]] || continue
-        action_mode="$(action_mode_for_state "${state}")" || continue
-        dataset_root="$(dataset_root_for "${task}" "${state}")"
+      # For multi-task checkpoint we use the first task's dataset root as
+      # reference (the policy was trained on the joint dataset).
+      first_task="${TASKS_ARR[0]}"
+      dataset_root="$(dataset_root_for "${first_task}" "${state}")"
 
-        if ! checkpoint_dir="$(find_latest_all_task_training_dir "${policy}" "${state}")"; then
-          echo "[WARN] No all-task checkpoint for policy=${policy} state=${state}; skipping." >&2
-          continue
-        fi
-        if [[ ! -d "${dataset_root}" ]]; then
-          echo "[WARN] Dataset root not found: ${dataset_root}; skipping." >&2
-          continue
-        fi
+      if ! checkpoint_dir="$(find_latest_all_task_training_dir "${policy}" "${state}")"; then
+        echo "[WARN] No all-task checkpoint for policy=${policy} state=${state}; skipping." >&2
+        continue
+      fi
+      if [[ ! -d "${dataset_root}" ]]; then
+        echo "[WARN] Dataset root not found: ${dataset_root}; skipping." >&2
+        continue
+      fi
 
-        for ((pair_idx=0; pair_idx<RUNS; pair_idx++)); do
-          pair_variation="${VARIATIONS[pair_idx]}"
-          pair_seed="$((SEED + pair_idx))"
-          save_path="${task_save_root}/${policy}_${state}/var${pair_variation}_seed${pair_seed}"
-          cmd=(
-            "${PYTHON_BIN}" "${WORKSPACE_ROOT}/src/inference/rlbench/eval.py"
-            --task "${task}"
-            --variation "${pair_variation}"
-            --runs "1"
-            --seed "${pair_seed}"
-            --max_steps "${MAX_STEPS}"
-            --action_mode "${action_mode}"
-            --renderer "${RENDERER}"
-            --checkpoint "${checkpoint_dir}"
-            --dataset_root "${dataset_root}"
-            --save_path "${save_path}"
-            --rlbench_root "${RLBENCH_ROOT}"
-          )
-          if [[ -n "${DEFAULT_TASK_DESCRIPTION}" ]]; then
-            cmd+=(--task_description "${DEFAULT_TASK_DESCRIPTION}")
-          fi
-          if [[ -n "${DEVICE}" ]]; then
-            cmd+=(--device "${DEVICE}")
-          fi
-          echo "Command: ${cmd[*]}"
-          if [[ "${DRY_RUN}" -eq 0 ]]; then
-            "${cmd[@]}"
-          fi
-        done
-      done
+      save_path="${SAVE_ROOT}/${policy}_${state}"
+
+      cmd=(
+        "${PYTHON_BIN}" "${WORKSPACE_ROOT}/src/inference/rlbench/eval.py"
+        --tasks "${TASKS_CSV}"
+        --variation "${VARIATIONS[0]}"
+        --runs "${RUNS}"
+        --seed "${SEED}"
+        --max_steps "${MAX_STEPS}"
+        --action_mode "${action_mode}"
+        --renderer "${RENDERER}"
+        --checkpoint "${checkpoint_dir}"
+        --dataset_root "${dataset_root}"
+        --save_path "${save_path}"
+        --rlbench_root "${RLBENCH_ROOT}"
+      )
+      if [[ -n "${DEFAULT_TASK_DESCRIPTION}" ]]; then
+        cmd+=(--task_description "${DEFAULT_TASK_DESCRIPTION}")
+      fi
+      if [[ -n "${DEVICE}" ]]; then
+        cmd+=(--device "${DEVICE}")
+      fi
+      echo "Command: ${cmd[*]}"
+      if [[ "${DRY_RUN}" -eq 0 ]]; then
+        "${cmd[@]}"
+      fi
     done
-
-    # Per-task summary right after task finishes.
-    task_summary_cmd=(
-      "${PYTHON_BIN}" "${WORKSPACE_ROOT}/src/inference/rlbench/eval.py"
-      --task "${task}"
-      --aggregate_only
-      --aggregate_root "${task_save_root}"
-    )
-    echo "Task summary command: ${task_summary_cmd[*]}"
-    if [[ "${DRY_RUN}" -eq 0 ]]; then
-      "${task_summary_cmd[@]}"
-    fi
   done
 fi
 
@@ -301,7 +286,6 @@ fi
 global_summary_cmd=(
   "${PYTHON_BIN}" "${WORKSPACE_ROOT}/src/inference/rlbench/eval.py"
   --task "all_tasks"
-  --aggregate_only
   --aggregate_root "${SAVE_ROOT}"
 )
 echo "Global summary command: ${global_summary_cmd[*]}"

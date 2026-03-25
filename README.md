@@ -1,101 +1,212 @@
 # Cross-Model Learning-Based Robot Control
 
-A pipeline for generating RLBench demonstrations, converting them to
-GR00T-compatible LeRobot v3 datasets, and training/evaluating policies.
+This repository contains the active RLBench -> scene graph -> LeRobot ->
+training -> RLBench evaluation pipeline used in this project.
 
-## Table of Contents
+`README.md` is now the canonical project guide. The local
+`src/data_collection/README.md` is kept as a short quick reference, and
+`TROUBLESHOOTING.md` collects operational/debug notes.
 
-1. [RLBench Dataset Generation](#rlbench-dataset-generation)
-2. [Scene Graph Generation](#scene-graph-generation)
-3. [Dataset Conversion (RLBench -> LeRobot v3)](#dataset-conversion-rlbench---lerobot-v3)
-4. [LeRobot Visualization (.rrd)](#lerobot-visualization-rrd)
-5. [Training](#training)
-6. [Inference & RLBench Evaluation](#inference--rlbench-evaluation)
-7. [Troubleshooting](#troubleshooting)
+## Current Status
 
----
+The codebase already reflects substantial recent work. The current pipeline
+supports:
 
-## RLBench Dataset Generation
+- RLBench dataset generation through `scripts/core/dataset_generator.sh`
+- interactive `info.json` creation and relationship-template annotation inside
+  `src/data_collection/RLBench_scene_graph_collection.ipynb`
+- batch scene-graph/template application through
+  `scripts/core/apply_rlbench_scene_graph_templates.sh`
+- variation-aware object-handle remapping via
+  `src/utils/scene_graph_utils.py::discover_object_mapping()`
+- heuristic object color extraction used by scene-graph language generation
+- RLBench -> LeRobot conversion with per-task and merged `all_task_*` datasets
+- `.rrd` export through `scripts/core/generate_lerobot_rrd.sh`
+- RLBench evaluation with relationship-template-aware segmentation and batch
+  aggregation in `src/inference/rlbench/eval.py`
+- Sol/SLURM training wrappers for GR00T and SmolVLA in `src/training/`
 
-### Quick Start (Headless Docker + OSMesa)
+## Repository Map
 
-```bash
-cd /workspace/external/RLBench
-docker-compose up -d
+```text
+.
+├── README.md
+├── TROUBLESHOOTING.md
+├── environment.yml
+├── docker-compose.yml
+├── scripts/core/                 # canonical shell entrypoints
+├── scripts/dummy/                # ad hoc utilities / one-off helpers
+├── src/data_collection/          # notebook + conversion/template tools
+├── src/inference/rlbench/        # active RLBench evaluation flow
+├── src/training/                 # Sol HPC training wrappers
+└── src/utils/                    # shared RLBench / scene-graph helpers
 ```
 
-### Recommended dataset generation command (from repo root)
+Other inference stacks under `src/inference/` such as `OvSGTR`, `LASER`, and
+`lang_sam` are present, but the main maintained end-to-end workflow in this
+repo is the RLBench/LeRobot path described below.
 
-Use the core wrapper script (recommended):
+## Setup
+
+### 1. External dependencies
+
+From the repository root:
 
 ```bash
-cd /workspace
-scripts/core/dataset_generator.sh 20 put_rubbish_in_bin meat_on_grill
+bash scripts/core/setup_external.sh
 ```
 
-This generates RLBench datasets under `datasets/rlbench_trial_2` by default.
+This prepares `external/OvSGTR`, `external/LASER`,
+`external/lang-segment-anything`, and `external/lerobot`.
 
+`external/RLBench` is also expected by the dataset and evaluation scripts, but
+it is not cloned by `setup_external.sh`; place it at `external/RLBench`.
 
----
+### 2. Python path
 
-## Scene Graph Generation
-
-Detailed instructions are in:
-
-- `src/data_collection/README.md`
-
-Main tools:
-- `src/data_collection/RLBench_scene_graph_collection.ipynb`
-- `scripts/core/apply_rlbench_trial2_templates.sh`
-
-Apply templates in batch:
+For local shell runs and notebooks, start from the repository root and export:
 
 ```bash
-cd /workspace
-scripts/core/apply_rlbench_trial2_templates.sh \
-  --dataset-path /workspace/datasets/rlbench_trial_2 \
+export PYTHONPATH="$PWD:$PWD/src:$PWD/external/RLBench:$PWD/external/lerobot/src:${PYTHONPATH:-}"
+```
+
+This matters especially for notebooks and `src/data_collection/apply_template_batch.py`.
+
+### 3. Optional Docker workflow
+
+If you use the provided container setup, start it from the repository root:
+
+```bash
+docker compose up -d
+```
+
+Do not run `docker compose` from `external/RLBench`; the tracked
+`docker-compose.yml` lives at the repo root.
+
+## End-to-End Workflow
+
+### 1. Generate RLBench raw data
+
+Recommended entrypoint:
+
+```bash
+OUT_ROOT=datasets/rlbench_<run_name> bash scripts/core/dataset_generator.sh 20 put_rubbish_in_bin meat_on_grill
+```
+
+Required output root:
+
+- output root: `$OUT_ROOT` (set `OUT_ROOT`; required)
+
+Optional defaults in `scripts/core/dataset_generator.sh`:
+
+- RLBench root: `external/RLBench` (override with `RLBENCH_ROOT`)
+- episodes per variation: `1`
+- start variation: `20`
+- renderer: `opengl3`
+
+If you want a fresh run from variation 0, override the default:
+
+```bash
+START_VARIATION=0 bash scripts/core/dataset_generator.sh 5 lamp_on push_button
+```
+
+Useful environment overrides:
+
+- `RLBENCH_ROOT`
+- `OUT_ROOT`
+- `EPISODES_PER_TASK`
+- `PROCESSES`
+- `IMAGE_WIDTH`, `IMAGE_HEIGHT`
+- `RENDERER`
+
+### 2. Create `info.json` and relationship templates
+
+The single notebook `src/data_collection/RLBench_scene_graph_collection.ipynb`
+now covers both:
+
+- creating or updating task-level `info.json`
+- annotating a reference variation and saving
+  `<task>_relationship_template.json`
+
+Expected outputs per task:
+
+- `$OUT_ROOT/<task>/info.json`
+- `$OUT_ROOT/<task>/<task>_relationship_template.json`
+
+Important implementation detail:
+
+- `info.json` stores a reference `object_mapping`
+- later variations do not reuse the same raw RLBench mask handle IDs
+- the batch pipeline re-resolves actual handle IDs per variation using
+  `discover_object_mapping()` before applying the saved template
+
+### 3. Apply templates across variations
+
+```bash
+bash scripts/core/apply_rlbench_scene_graph_templates.sh \
+  --dataset-path "$OUT_ROOT" \
   --episode 0 \
   --camera front
 ```
 
----
-
-## Dataset Conversion (RLBench -> LeRobot v3)
-
+Subset example:
 
 ```bash
-cd /workspace
-scripts/core/convert_rlbench_to_lerobot_batch.sh \
-  --dataset-path /workspace/datasets/rlbench_trial_2 \
-  --output-root /workspace/datasets/lerobot_trial_2 \
+bash scripts/core/apply_rlbench_scene_graph_templates.sh \
+  --dataset-path "$OUT_ROOT" \
+  --tasks "lamp_on,put_rubbish_in_bin" \
+  --skip-videos
+```
+
+Per-variation outputs:
+
+- `<task>_scene_graph.json`
+- `object_color_map.json`
+- `episode_overlay.mp4`
+- `episode_mask.mp4`
+- `episode_mask_encoded.mp4`
+
+Color labels are estimated heuristically from image/mask data in
+`src/utils/scene_graph_utils.py`; treat them as approximate semantic labels, not
+ground-truth physical color annotations.
+
+### 4. Convert RLBench -> LeRobot
+
+```bash
+bash scripts/core/convert_rlbench_to_lerobot_batch.sh \
+  --dataset-path "$OUT_ROOT" \
+  --output-root datasets/lerobot_<run_name> \
   --action-space both
 ```
 
-This creates:
-
-- Per-task datasets: `<task>_eef`, `<task>_joint`
-- Final merged datasets:
-  - `all_task_eef`
-  - `all_task_joint`
-
-### Common options
+Common options:
 
 ```bash
 # selected tasks only
-scripts/core/convert_rlbench_to_lerobot_batch.sh \
-  --dataset-path /workspace/datasets/rlbench_trial_2 \
+bash scripts/core/convert_rlbench_to_lerobot_batch.sh \
+  --dataset-path "$OUT_ROOT" \
+  --output-root datasets/lerobot_<run_name> \
   --tasks "lamp_on,put_rubbish_in_bin"
 
-# include context prompt generation
-scripts/core/convert_rlbench_to_lerobot_batch.sh \
-  --dataset-path /workspace/datasets/rlbench_trial_2 \
+# generate context-rich task descriptions
+bash scripts/core/convert_rlbench_to_lerobot_batch.sh \
+  --dataset-path "$OUT_ROOT" \
+  --output-root datasets/lerobot_<run_name> \
   --use-context-prompt
 ```
 
-### LeRobot dataset layout
+Current behavior:
+
+- creates per-task datasets such as `<task>_eef` and `<task>_joint`
+- merges successful task conversions into `all_task_eef` and `all_task_joint`
+  by default
+- skips broken variations by default
+- supports `--strict` to fail on task/variation errors
+
+Typical layout:
 
 ```text
-datasets/lerobot_trial_2/<task_or_all_task>_<eef|joint>/
+datasets/lerobot_<run_name>/<task_or_all_task>_<eef|joint>/
 ├── meta/
 │   ├── info.json
 │   ├── stats.json
@@ -107,129 +218,174 @@ datasets/lerobot_trial_2/<task_or_all_task>_<eef|joint>/
     └── observation.images.wrist_rgb/chunk-000/file-000.mp4
 ```
 
----
+### 5. Export `.rrd` files for inspection
 
-## LeRobot Visualization (.rrd)
-
-Use:
-
-```bash
-bash scripts/core/generate_lerobot_rrd.sh put_rubbish_in_bin eef 4
-```
-
-Outputs are written under:
-
-- `datasets/.../<task>_<eef|joint>/output`
-
----
-
-## Training
-
-
-Training code is under:
-
-- `src/training`
-
-For remote checkpoint sync (ASU Sol HPC), use:
-
-Use:
+The current visualization script uses `--dataset-path`; the older positional
+`task eef 4` form is stale.
 
 ```bash
-bash scripts/core/transfer_lerobot_last_checkpoints.sh
+bash scripts/core/generate_lerobot_rrd.sh \
+  --dataset-path datasets/lerobot_<run_name>/push_button_eef \
+  --start-episode 0 \
+  --num-episodes 4
 ```
 
----
+Outputs are written to:
 
-## Inference & RLBench Evaluation
+- `datasets/lerobot_<run_name>/<dataset_name>/output`
 
-Evaluation scripts are maintained under `scripts/core`:
+This script uses the vendored
+`external/lerobot/src/lerobot/scripts/lerobot_dataset_viz.py`.
 
-- `scripts/core/eval.sh` canonical entrypoint.
-- `scripts/core/eval_rlbench_single_task.sh` single-task evaluator.
-- `scripts/core/eval_rlbench_all_tasks.sh` all-task evaluator.
-- `src/inference/rlbench/eval.sh` backward-compatible wrapper.
+### 6. Train policies
+
+Training wrappers live in `src/training/`:
+
+- `src/training/run_groot_sol.sh`
+- `src/training/run_smolvla_sol.sh`
+- `src/training/training_script_log.sh`
+
+Examples:
+
+```bash
+sbatch src/training/run_groot_sol.sh --dataset-kind eef
+sbatch src/training/run_smolvla_sol.sh --dataset-kind joint
+bash src/training/training_script_log.sh put_rubbish_in_bin
+```
+
+Important note:
+
+- these scripts are currently Sol/SLURM oriented
+- `REPO_ROOT`, scratch paths, and SBATCH account settings are site-specific
+- adjust them before treating them as portable training entrypoints
+
+Useful dataset transfer helper:
+
+```bash
+bash scripts/core/transfer_dataset_to_server.sh \
+  --dataset-path datasets/lerobot_<run_name> \
+  --task all_task
+```
+
+## RLBench Evaluation
+
+### Canonical wrappers
+
+The maintained shell entrypoints are:
+
+- `scripts/core/eval.sh`
+- `scripts/core/eval_rlbench_single_task.sh`
+- `scripts/core/eval_rlbench_all_tasks.sh`
+- `src/inference/rlbench/eval.sh` as a compatibility wrapper
 
 ### Single-task evaluation
 
 ```bash
-cd /workspace
-scripts/core/eval.sh \
+bash scripts/core/eval.sh \
   --task put_rubbish_in_bin \
   --runs 10 \
   --variation 0 \
-  --dataset_parent /workspace/datasets/lerobot_trial_2 \
-  --rlbench_root /workspace/datasets/rlbench_trial_2
+  --dataset_parent datasets/lerobot_<run_name> \
+  --rlbench_root datasets/rlbench_<run_name>
 ```
 
-### All-task evaluation (recommended for merged models)
+### All-task evaluation
 
 ```bash
-cd /workspace
-scripts/core/eval.sh --all_tasks \
+bash scripts/core/eval.sh --all_tasks \
   --tasks put_rubbish_in_bin,put_banana_in_bin,lamp_on,push_button,meat_on_grill \
   --runs 10 \
   --variation 0 \
   --dataset_mode all \
-  --dataset_parent /workspace/datasets/lerobot_trial_2 \
-  --rlbench_root /workspace/datasets/rlbench_trial_2
+  --dataset_parent datasets/lerobot_<run_name> \
+  --rlbench_root datasets/rlbench_<run_name>
 ```
-
-### Task description behavior
-
-By default, you do not need to pass `--task_description`.
-
-`src/inference/rlbench/eval.py` resolves text in this order:
-
-1. explicit `--task_description` (if provided),
-2. dataset parquet metadata (best effort),
-3. RLBench reset-time task description.
 
 ### Summarize-only mode
 
 ```bash
-scripts/core/eval.sh \
+bash scripts/core/eval.sh \
   --task lamp_on \
   --summarize_only
 
-scripts/core/eval.sh --all_tasks \
+bash scripts/core/eval.sh --all_tasks \
   --tasks lamp_on,push_button \
   --summarize_only
 ```
 
-### Outputs and metrics
+### Advanced `eval.py` options
 
-Single-task outputs:
+`src/inference/rlbench/eval.py` contains newer evaluation features that are not
+all exposed by the thin shell wrappers yet, including:
 
-- `/workspace/output/rlbench_eval/<task>/...`
+- `--robot_setup` with support for `panda`, `jaco`, `mico`, `sawyer`, `ur5`
+- `--with_context_prompt` for context-rich per-segment instructions
+- `--relationship_template` / `--no_relationship_template`
+- `--binarize_gripper_action`
+- `--policy_start_offset`
+- `--debug_snapshot_restore`
 
-All-task outputs:
+Examples:
 
-- `/workspace/output/rlbench_eval/all_tasks/<task>/<policy>_<state>/var<variation>_seed<seed>/...`
+```bash
+python src/inference/rlbench/eval.py \
+  --task put_rubbish_in_bin \
+  --checkpoint output/lerobot/example_checkpoint \
+  --dataset_root datasets/lerobot_<run_name>/put_rubbish_in_bin_eef \
+  --rlbench_root datasets/rlbench_<run_name> \
+  --action_mode ee_planning \
+  --robot_setup ur5 \
+  --with_context_prompt \
+  --save_path output/rlbench_eval/put_rubbish_in_bin/custom_run
+```
 
-Each run contains rollout artifacts plus:
+Current evaluation behavior:
+
+- if a relationship template exists, segmentation is aligned to template
+  transitions and matching gripper changes
+- otherwise, evaluation falls back to legacy instruction/gripper-change logic
+- `joint_velocity` is restricted to `robot_setup=panda`
+- non-Panda robots should use `ee_planning` or `ee_ik`
+
+Outputs typically include:
 
 - `metrics.json`
 - `summary.json`
 - `per_run_metrics.csv`
-
-Aggregate outputs include:
-
 - `detailed_summary.json`
 - `detailed_runs.csv`
 - `overall_metrics.csv`
 
-`per_run_metrics.csv` includes fields such as:
+Notebook for inspection:
 
-- `task_description`
-- `instruction`
-- `policy_success`
-- `joint_l2`, `pos_l2`, `rot_deg`, `eef_l2`
+- `src/inference/rlbench/inspect_eval_run.ipynb`
 
----
+## Documentation Policy
+
+To reduce drift, the documentation is now split intentionally:
+
+- `README.md`: canonical project overview and active workflow
+- `src/data_collection/README.md`: short data-collection quick reference
+- `TROUBLESHOOTING.md`: debugging notes and environment-specific fixes
+
+## Cursor Rules and Skills
+This repo includes Cursor rules and skills under `.cursor/` to keep the agent consistent with how this pipeline is meant to be used:
+
+- Project rules: `.cursor/rules/*.mdc` (short, always-on conventions like path/import norms and pipeline safety/repro guidelines)
+- Project skills:
+  - `.cursor/skills/robotics-pipeline-workflow/SKILL.md` for the step ordering from dataset generation -> scene graph templates -> LeRobot conversion -> training -> evaluation
+  - `.cursor/skills/robotics-eval-and-experiments/SKILL.md` for fair evaluation comparisons, metrics logging, and experiment result summaries
+
+When working on data collection (`info.json` -> relationship templates), start from `src/data_collection/README.md` and follow the pipeline skill for the correct step ordering.
 
 ## Troubleshooting
 
-Troubleshooting and debugging are now maintained in a separate file:
+See `TROUBLESHOOTING.md` for:
 
-- `TROUBLESHOOTING.md`
+- RLBench rendering/display issues
+- missing scene-graph/template artifacts
+- LeRobot conversion failures
+- `.rrd` export problems
+- Sol/flash-attn and `torchcodec` issues
+- evaluation path confusion
 

@@ -181,35 +181,31 @@ if [[ "${SUMMARIZE_ONLY}" -eq 0 ]]; then
         continue
       fi
 
-      for ((pair_idx=0; pair_idx<RUNS; pair_idx++)); do
-        pair_variation="${VARIATIONS[pair_idx]}"
-        pair_seed="$((SEED + pair_idx))"
-        save_path="${SAVE_ROOT}/${policy}_${state}/var${pair_variation}_seed${pair_seed}"
-        cmd=(
-          "${PYTHON_BIN}" "${WORKSPACE_ROOT}/src/inference/rlbench/eval.py"
-          --task "${TASK}"
-          --variation "${pair_variation}"
-          --runs "1"
-          --seed "${pair_seed}"
-          --max_steps "${MAX_STEPS}"
-          --action_mode "${action_mode}"
-          --renderer "${RENDERER}"
-          --checkpoint "${checkpoint_dir}"
-          --dataset_root "${dataset_root}"
-          --save_path "${save_path}"
-          --rlbench_root "${RLBENCH_ROOT}"
-        )
-        if [[ -n "${TASK_DESCRIPTION}" ]]; then
-          cmd+=(--task_description "${TASK_DESCRIPTION}")
-        fi
-        if [[ -n "${DEVICE}" ]]; then
-          cmd+=(--device "${DEVICE}")
-        fi
-        echo "Command: ${cmd[*]}"
-        if [[ "${DRY_RUN}" -eq 0 ]]; then
-          "${cmd[@]}"
-        fi
-      done
+      save_path="${SAVE_ROOT}/${policy}_${state}"
+      cmd=(
+        "${PYTHON_BIN}" "${WORKSPACE_ROOT}/src/inference/rlbench/eval.py"
+        --task "${TASK}"
+        --variation "${VARIATIONS[0]}"
+        --runs "${RUNS}"
+        --seed "${SEED}"
+        --max_steps "${MAX_STEPS}"
+        --action_mode "${action_mode}"
+        --renderer "${RENDERER}"
+        --checkpoint "${checkpoint_dir}"
+        --dataset_root "${dataset_root}"
+        --save_path "${save_path}"
+        --rlbench_root "${RLBENCH_ROOT}"
+      )
+      if [[ -n "${TASK_DESCRIPTION}" ]]; then
+        cmd+=(--task_description "${TASK_DESCRIPTION}")
+      fi
+      if [[ -n "${DEVICE}" ]]; then
+        cmd+=(--device "${DEVICE}")
+      fi
+      echo "Command: ${cmd[*]}"
+      if [[ "${DRY_RUN}" -eq 0 ]]; then
+        "${cmd[@]}"
+      fi
     done
   done
 fi

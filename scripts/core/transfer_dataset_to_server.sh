@@ -9,6 +9,8 @@ set -euo pipefail
 REMOTE_HOST="${REMOTE_HOST:-ngocbach@login.sol.rc.asu.edu}"
 REMOTE_DATASETS_DIR="${REMOTE_DATASETS_DIR:-/scratch/kpham34/cross_model_learning_based_robot_control/datasets}"
 SSH_CONTROL_PATH="${SSH_CONTROL_PATH:-$HOME/.ssh/cm-%r@%h:%p}"
+RSYNC_COMPRESS="${RSYNC_COMPRESS:-0}"
+RSYNC_MAX_RETRIES="${RSYNC_MAX_RETRIES:-3}"
 
 DATASET_PATH=""
 TASK_NAME=""
@@ -22,16 +24,20 @@ Usage:
 Examples:
   # Transfer full dataset folder to remote datasets root
   scripts/transfer_dataset_to_server.sh \
-    --dataset-path /workspace/datasets/rlbench_trial_2
+    --dataset-path datasets/rlbench_<run_name>
 
   # Transfer one task subfolder only
   scripts/transfer_dataset_to_server.sh \
-    --dataset-path /workspace/datasets/rlbench_trial_2 \
+    --dataset-path datasets/rlbench_<run_name> \
     --task put_rubbish_in_bin
 
   # Transfer final merged datasets (both all_task_eef and all_task_joint)
-  scripts/transfer_dataset_to_server.sh \
-    --dataset-path /workspace/datasets/lerobot_trial_2 \
+  ./scripts/core/transfer_dataset_to_server.sh \
+    --dataset-path datasets/lerobot_<run_name> \
+    --task all_task
+
+  ./scripts/core/transfer_dataset_to_server.sh \
+    --dataset-path datasets/lerobot_trial_3 \
     --task all_task
 
 Options:
@@ -94,26 +100,77 @@ SSH_COMMON_OPTS=(
   -o ControlMaster=auto
   -o ControlPersist=600
   -o "ControlPath=$SSH_CONTROL_PATH"
+  -o ServerAliveInterval=30
+  -o ServerAliveCountMax=6
 )
 
 mkdir -p "$HOME/.ssh"
-log "Opening SSH master connection to $REMOTE_HOST (one password prompt)"
-ssh "${SSH_COMMON_OPTS[@]}" -MNf "$REMOTE_HOST"
-trap 'ssh "${SSH_COMMON_OPTS[@]}" -O exit "$REMOTE_HOST" >/dev/null 2>&1 || true' EXIT
+open_ssh_master() {
+  log "Opening SSH master connection to $REMOTE_HOST (one password prompt)"
+  ssh "${SSH_COMMON_OPTS[@]}" -MNf "$REMOTE_HOST"
+}
+
+close_ssh_master() {
+  ssh "${SSH_COMMON_OPTS[@]}" -O exit "$REMOTE_HOST" >/dev/null 2>&1 || true
+}
+
+open_ssh_master
+trap 'close_ssh_master' EXIT
 
 dataset_name="$(basename "$DATASET_PATH")"
 remote_dataset_dir="${REMOTE_DATASETS_DIR%/}/${dataset_name}"
 rsync_common_opts=(
-  -az
+  -a
   --info=progress2
   --partial
+  --append-verify
   --human-readable
   -e "ssh ${SSH_COMMON_OPTS[*]}"
 )
 
+if [[ "$RSYNC_COMPRESS" == "1" ]]; then
+  rsync_common_opts+=(-z)
+fi
+
 if [[ "$DRY_RUN" -eq 1 ]]; then
   rsync_common_opts+=(--dry-run)
 fi
+
+run_rsync_with_retry() {
+  local src_path="$1"
+  local dst_path="$2"
+  local attempt=1
+  local rc=0
+
+  while (( attempt <= RSYNC_MAX_RETRIES )); do
+    log "rsync attempt ${attempt}/${RSYNC_MAX_RETRIES}: ${src_path} -> ${dst_path}"
+    set +e
+    rsync "${rsync_common_opts[@]}" "$src_path" "$dst_path"
+    rc=$?
+    set -e
+
+    if [[ "$rc" -eq 0 ]]; then
+      return 0
+    fi
+
+    # Common transient transport failures: socket/stream/SSH disconnect.
+    if [[ "$rc" -eq 10 || "$rc" -eq 12 || "$rc" -eq 255 ]]; then
+      if (( attempt < RSYNC_MAX_RETRIES )); then
+        local wait_secs=$((attempt * 5))
+        log "rsync failed with code ${rc}; retrying in ${wait_secs}s..."
+        close_ssh_master
+        open_ssh_master
+        sleep "$wait_secs"
+        attempt=$((attempt + 1))
+        continue
+      fi
+    fi
+
+    return "$rc"
+  done
+
+  return "$rc"
+}
 
 if [[ -n "$TASK_NAME" ]]; then
   remote_task_parent="$remote_dataset_dir/"
@@ -138,7 +195,7 @@ if [[ -n "$TASK_NAME" ]]; then
     fi
 
     log "Syncing task '${task}' from '$DATASET_PATH' to ${REMOTE_HOST}:${remote_task_parent}"
-    rsync "${rsync_common_opts[@]}" \
+    run_rsync_with_retry \
       "${local_task_path%/}/" \
       "${REMOTE_HOST}:${remote_task_parent}${task}/"
     transferred_any=1
@@ -154,7 +211,7 @@ else
   ssh "${SSH_COMMON_OPTS[@]}" "$REMOTE_HOST" "mkdir -p '$remote_parent'"
 
   log "Syncing dataset '${dataset_name}' to ${REMOTE_HOST}:${remote_parent}"
-  rsync "${rsync_common_opts[@]}" \
+  run_rsync_with_retry \
     "${DATASET_PATH%/}/" \
     "${REMOTE_HOST}:${remote_parent}${dataset_name}/"
 fi

@@ -7,7 +7,7 @@ and converts them to CSV while preserving the directory structure.
 
 Usage
 -----
-    python scripts/parquet_to_csv.py --task stack_cups --lerobot-root datasets/lerobot --output-dir output/csv
+    python scripts/dummy/parquet_to_csv.py --task all_task --lerobot-root datasets/lerobot_trial_3 --output-dir output/csv
 
 The script expects the merged dataset layout produced by
 `src/data_collection/convert_rlbench_to_lerobot.py`:

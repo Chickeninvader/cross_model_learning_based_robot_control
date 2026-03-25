@@ -21,7 +21,7 @@ def load_task_info(task_path):
     """Load task configuration from info.json.
     
     Args:
-        task_path: Path to task directory (e.g., /workspace/datasets/rlbench/stack_cups)
+        task_path: Path to task directory (e.g., datasets/rlbench/stack_cups)
     
     Returns:
         dict with keys: 'objects', 'relations', 'object_mapping'
@@ -48,6 +48,111 @@ def load_task_info(task_path):
     return info
 
 
+def _scan_mask_handles(image_data, max_frames=5):
+    """Return the sorted set of all non-zero handle IDs found in the first few mask frames."""
+    handles = set()
+    mask_paths = image_data.get('mask', [])
+    for mask_path in mask_paths[:max_frames]:
+        decoded = decode_mask_image(mask_path)
+        handles.update(int(h) for h in np.unique(decoded) if h != 0)
+    return sorted(handles)
+
+
+def discover_object_mapping(reference_mapping, image_data, robot_names=None):
+    """Build a handle-to-name mapping for the current variation by matching
+    sorted non-robot handles against the reference variation's order.
+
+    RLBench mask handle IDs change per variation, but the *sorted order*
+    and *relative offsets* of non-robot object handles stay consistent.
+    Robot/gripper handle IDs (e.g. 31, 34, 35) are stable across variations.
+
+    Only handles explicitly present in ``reference_mapping`` are included in
+    the output — unmapped Panda arm joints are ignored.
+
+    Parameters
+    ----------
+    reference_mapping : dict[int, str]
+        The ``object_mapping`` from ``info.json`` (annotated on one reference
+        variation).  Keys are handle IDs, values are object names.
+    image_data : dict
+        Must contain ``'mask'`` key with a list of mask image paths for the
+        target variation.
+    robot_names : set[str] | None
+        Object names that belong to the robot/gripper (default:
+        ``{"robot", "gripper"}``).
+
+    Returns
+    -------
+    dict[int, str]
+        New mapping from *this variation's* actual handle IDs to object names.
+    """
+    if robot_names is None:
+        robot_names = {"robot", "gripper"}
+
+    # Separate reference into robot vs non-robot handles
+    ref_robot = {h: n for h, n in reference_mapping.items() if n in robot_names}
+    ref_objects = {h: n for h, n in reference_mapping.items() if n not in robot_names}
+
+    # Sorted reference object handles -> ordered list of names
+    ref_obj_handles_sorted = sorted(ref_objects.keys())
+    ref_obj_names_ordered = [ref_objects[h] for h in ref_obj_handles_sorted]
+
+    # Robot/gripper handles are stable — keep exactly those from the reference
+    new_mapping = dict(ref_robot)
+
+    if not ref_obj_handles_sorted:
+        return new_mapping
+
+    # Discover actual handles from this variation's masks
+    actual_handles = set(_scan_mask_handles(image_data))
+
+    # Fast path: if the reference object handles all exist in the actual mask,
+    # this is the same (or compatible) variation — use them directly.
+    ref_obj_set = set(ref_obj_handles_sorted)
+    if ref_obj_set.issubset(actual_handles):
+        for h, name in ref_objects.items():
+            new_mapping[h] = name
+        return new_mapping
+
+    # The relative offsets between non-robot object handles are stable across
+    # variations — only the base ID shifts.  Use offset-pattern matching to
+    # find the correct handles.
+    ref_base = ref_obj_handles_sorted[0]
+    ref_offsets = [h - ref_base for h in ref_obj_handles_sorted]
+
+    # Panda arm joint handles that are stable across all variations.
+    # Used only to exclude false-positive offset matches during discovery;
+    # they are NOT added to the output mapping.
+    _stable_arm_handles = frozenset({10, 42, 43, 44, 45, 46, 48, 52, 55})
+
+    # Candidate bases: actual handles that are NOT in the reference mapping
+    # and NOT known stable arm joints.  Shifted object handles are always
+    # new IDs that didn't exist in the reference variation.
+    all_ref_handles = set(reference_mapping.keys())
+    exclude = all_ref_handles | _stable_arm_handles
+    candidates = sorted(actual_handles - exclude)
+
+    matched_base = None
+    for base in candidates:
+        expected = {base + off for off in ref_offsets}
+        if expected.issubset(actual_handles):
+            matched_base = base
+            break
+
+    if matched_base is not None:
+        for offset, obj_name in zip(ref_offsets, ref_obj_names_ordered):
+            new_mapping[matched_base + offset] = obj_name
+    else:
+        warnings.warn(
+            f"discover_object_mapping: could not find offset-matching base "
+            f"among {len(candidates)} candidate handles. "
+            f"Falling back to reference mapping."
+        )
+        return dict(reference_mapping)
+
+    return new_mapping
+
+
 def extract_gripper_states(demo):
     """Extract gripper open/closed states from demo data.
     
@@ -66,8 +171,13 @@ def extract_gripper_states(demo):
     return gripper_states
 
 
-def load_episode_data(task_name, variation, episode, DATASET_PATH='/workspace/rlbench_data', CAMERA='front'):
+def load_episode_data(task_name, variation, episode, DATASET_PATH=None, CAMERA='front'):
     """Load episode data including observations and images."""
+    if not DATASET_PATH:
+        raise ValueError(
+            "DATASET_PATH is required (RLBench dataset root). "
+            "Pass DATASET_PATH=... from the wrapper script."
+        )
     episode_path = f"{DATASET_PATH}/{task_name}/variation{variation}/episodes/episode{episode}"
     
     # Load low-dimensional observations
@@ -146,10 +256,12 @@ def _rgb_to_color_name(rgb):
     hsv = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2HSV)[0, 0]
     h, s, v = int(hsv[0]), int(hsv[1]), int(hsv[2])
 
-    # Low saturation colors first.
+    # Low value first – too dark to distinguish hue.
+    if v < 45:
+        return "black"
+
+    # Low saturation – achromatic.
     if s < 30:
-        if v < 45:
-            return "black"
         if v > 210:
             return "white"
         return "gray"
@@ -249,9 +361,8 @@ def build_scene_graph_objects(
         meta = {"type": base_type}
         pretty_name = str(name).replace('_', ' ')
         color = color_info.get(name, {}).get("color")
-        if color:
+        if color and base_type != "robot":
             meta["attributes"] = {"color": color}
-            # Keep instance disambiguation (e.g. "cup 1") in language labels.
             meta["display_name"] = f"{color} {pretty_name}".strip()
         object_meta[name] = meta
     return object_meta
