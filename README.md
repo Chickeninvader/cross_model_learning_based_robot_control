@@ -21,6 +21,9 @@ supports:
   `src/utils/scene_graph_utils.py::discover_object_mapping()`
 - heuristic object color extraction used by scene-graph language generation
 - RLBench -> LeRobot conversion with per-task and merged `all_task_*` datasets
+- dataset upload to the training host via `scripts/core/transfer_dataset_to_server.sh`
+- checkpoint download from the training host via
+  `scripts/core/transfer_lerobot_last_checkpoints.sh`
 - `.rrd` export through `scripts/core/generate_lerobot_rrd.sh`
 - RLBench evaluation with relationship-template-aware segmentation and batch
   aggregation in `src/inference/rlbench/eval.py`
@@ -218,7 +221,43 @@ datasets/lerobot_<run_name>/<task_or_all_task>_<eef|joint>/
     └── observation.images.wrist_rgb/chunk-000/file-000.mp4
 ```
 
-### 5. Export `.rrd` files for inspection
+### 5. Transfer LeRobot data to the training server
+
+After `datasets/lerobot_<run_name>/` exists (per-task folders and/or merged
+`all_task_eef` / `all_task_joint` from step 4), sync it to the remote datasets
+tree with rsync:
+
+```bash
+bash scripts/core/transfer_dataset_to_server.sh \
+  --dataset-path datasets/lerobot_<run_name> \
+  --task all_task
+```
+
+Other useful forms:
+
+```bash
+# entire local folder under the remote datasets root
+bash scripts/core/transfer_dataset_to_server.sh \
+  --dataset-path datasets/lerobot_<run_name>
+
+# single task subtree only
+bash scripts/core/transfer_dataset_to_server.sh \
+  --dataset-path datasets/lerobot_<run_name> \
+  --task put_rubbish_in_bin
+
+# preview rsync without copying
+bash scripts/core/transfer_dataset_to_server.sh \
+  --dataset-path datasets/lerobot_<run_name> \
+  --task all_task \
+  --dry-run
+```
+
+Defaults are site-specific; override with environment variables documented at
+the top of `scripts/core/transfer_dataset_to_server.sh` (for example
+`REMOTE_HOST`, `REMOTE_DATASETS_DIR`). The transfer is resumable—if a run is
+interrupted, rerun the same command to continue.
+
+### 6. Export `.rrd` files for inspection
 
 The current visualization script uses `--dataset-path`; the older positional
 `task eef 4` form is stale.
@@ -237,7 +276,7 @@ Outputs are written to:
 This script uses the vendored
 `external/lerobot/src/lerobot/scripts/lerobot_dataset_viz.py`.
 
-### 6. Train policies
+### 7. Train policies
 
 Training wrappers live in `src/training/`:
 
@@ -259,13 +298,25 @@ Important note:
 - `REPO_ROOT`, scratch paths, and SBATCH account settings are site-specific
 - adjust them before treating them as portable training entrypoints
 
-Useful dataset transfer helper:
+Use step 5 to upload LeRobot datasets before running jobs on the remote
+cluster.
+
+### 8. Pull LeRobot checkpoints from the server
+
+After training on the remote host, copy the **latest** checkpoint per run into
+local `output/lerobot/` (paths and SSH target match the defaults in the
+script, all overridable via env vars):
 
 ```bash
-bash scripts/core/transfer_dataset_to_server.sh \
-  --dataset-path datasets/lerobot_<run_name> \
-  --task all_task
+bash scripts/core/transfer_lerobot_last_checkpoints.sh
 ```
+
+The script keeps a small state file so reruns skip checkpoints that are already
+copied; if a download is partial, rerun the same command to continue.
+
+Environment overrides are listed at the top of
+`scripts/core/transfer_lerobot_last_checkpoints.sh` (for example
+`REMOTE_HOST`, `REMOTE_OUTPUT_DIR`, `LOCAL_OUTPUT_DIR`, `STATE_FILE`).
 
 ## RLBench Evaluation
 
@@ -373,7 +424,7 @@ This repo includes Cursor rules and skills under `.cursor/` to keep the agent co
 
 - Project rules: `.cursor/rules/*.mdc` (short, always-on conventions like path/import norms and pipeline safety/repro guidelines)
 - Project skills:
-  - `.cursor/skills/robotics-pipeline-workflow/SKILL.md` for the step ordering from dataset generation -> scene graph templates -> LeRobot conversion -> training -> evaluation
+  - `.cursor/skills/robotics-pipeline-workflow/SKILL.md` for the step ordering from dataset generation -> scene graph templates -> LeRobot conversion -> upload to training host -> training -> checkpoint download -> evaluation
   - `.cursor/skills/robotics-eval-and-experiments/SKILL.md` for fair evaluation comparisons, metrics logging, and experiment result summaries
 
 When working on data collection (`info.json` -> relationship templates), start from `src/data_collection/README.md` and follow the pipeline skill for the correct step ordering.
