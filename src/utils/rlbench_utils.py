@@ -70,8 +70,12 @@ def extract_joint_state(obs) -> np.ndarray:
     if joint_positions is None:
         raise AttributeError("Observation is missing 'joint_positions'.")
     joints = np.asarray(joint_positions, dtype=np.float32).reshape(-1)
-    if joints.shape[0] != 7:
-        raise ValueError(f"Expected joint_positions to have 7 elements, got {joints.shape[0]}")
+    if joints.shape[0] == 6:
+        # Keep a fixed-width 7-joint vector across robots (e.g. UR5 has 6 arm joints)
+        # so downstream eval arrays/metrics remain shape-stable.
+        joints = np.append(joints, np.float32(0.0))
+    elif joints.shape[0] != 7:
+        raise ValueError(f"Expected joint_positions to have 6 or 7 elements, got {joints.shape[0]}")
 
     grip = np.float32(getattr(obs, "gripper_open", 0.0))
     return np.append(joints, grip)

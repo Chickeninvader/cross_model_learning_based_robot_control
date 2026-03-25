@@ -22,6 +22,10 @@ def build_obs_config(image_size: list[int], renderer: str) -> ObservationConfig:
     obs_config.set_all_high_dim(False)
     obs_config.set_all_low_dim(True)
     obs_config.joint_forces = False
+    # Some RLBench robot grippers (e.g. UR5 variants) do not expose touch sensors.
+    # Disable this observation channel so scene.get_observation() doesn't call
+    # gripper.get_touch_sensor_forces() and raise NotImplementedError.
+    obs_config.gripper_touch_forces = False
 
     cameras = [obs_config.wrist_camera, obs_config.front_camera]
     for cam in cameras:

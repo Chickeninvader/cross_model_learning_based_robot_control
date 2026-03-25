@@ -20,6 +20,7 @@ CHECKPOINT_ROOT="${WORKSPACE_ROOT}/output/lerobot"
 DATASET_PARENT="${WORKSPACE_ROOT}/datasets/lerobot"
 RLBENCH_ROOT="${WORKSPACE_ROOT}/datasets/rlbench"
 SAVE_ROOT=""
+ROBOT_SETUP="panda"
 
 POLICIES="smolvla,groot"
 STATES="eef,joint"
@@ -46,6 +47,7 @@ Options:
   --dataset_parent PATH      Parent of dataset roots (default: ${DATASET_PARENT})
   --rlbench_root PATH        RLBench scene-graph templates (default: ${RLBENCH_ROOT})
   --save_root PATH           Output root (default: output/rlbench_eval/<task>)
+  --robot_setup NAME         RLBench robot: panda,jaco,mico,sawyer,ur5 (default: ${ROBOT_SETUP})
   --policies CSV             Policies (default: ${POLICIES})
   --states CSV               States (default: ${STATES})
   --python BIN               Python executable (default: ${PYTHON_BIN})
@@ -70,6 +72,7 @@ while [[ $# -gt 0 ]]; do
     --dataset_parent) DATASET_PARENT="$2"; shift 2 ;;
     --rlbench_root) RLBENCH_ROOT="$2"; shift 2 ;;
     --save_root) SAVE_ROOT="$2"; shift 2 ;;
+    --robot_setup) ROBOT_SETUP="$2"; shift 2 ;;
     --policies) POLICIES="$2"; shift 2 ;;
     --states) STATES="$2"; shift 2 ;;
     --python) PYTHON_BIN="$2"; shift 2 ;;
@@ -85,6 +88,18 @@ if [[ -z "${SAVE_ROOT}" ]]; then
   SAVE_ROOT="${WORKSPACE_ROOT}/output/rlbench_eval/${TASK}"
 fi
 mkdir -p "${SAVE_ROOT}"
+
+ROBOT_SETUP="${ROBOT_SETUP,,}"
+case "${ROBOT_SETUP}" in
+  franka|franka_panda) ROBOT_SETUP="panda" ;;
+esac
+case "${ROBOT_SETUP}" in
+  panda|jaco|mico|sawyer|ur5) ;;
+  *)
+    echo "[ERROR] Unsupported --robot_setup='${ROBOT_SETUP}'. Use: panda, jaco, mico, sawyer, ur5." >&2
+    exit 1
+    ;;
+esac
 
 if ! [[ "${RUNS}" =~ ^[0-9]+$ ]] || [[ "${RUNS}" -le 0 ]]; then
   echo "[ERROR] --runs must be a positive integer, got: ${RUNS}" >&2
@@ -162,6 +177,8 @@ fi
 IFS=',' read -r -a POLICIES_ARR <<< "${POLICIES}"
 IFS=',' read -r -a STATES_ARR <<< "${STATES}"
 
+echo "[eval_rlbench_single_task] task=${TASK} robot_setup=${ROBOT_SETUP} save_root=${SAVE_ROOT} runs=${RUNS}"
+
 if [[ "${SUMMARIZE_ONLY}" -eq 0 ]]; then
   for policy in "${POLICIES_ARR[@]}"; do
     policy="$(echo "${policy}" | xargs)"
@@ -181,7 +198,11 @@ if [[ "${SUMMARIZE_ONLY}" -eq 0 ]]; then
         continue
       fi
 
-      save_path="${SAVE_ROOT}/${policy}_${state}"
+      if [[ "${ROBOT_SETUP}" == "panda" ]]; then
+        save_path="${SAVE_ROOT}/${policy}_${state}"
+      else
+        save_path="${SAVE_ROOT}/${policy}_${state}_${ROBOT_SETUP}"
+      fi
       cmd=(
         "${PYTHON_BIN}" "${WORKSPACE_ROOT}/src/inference/rlbench/eval.py"
         --task "${TASK}"
@@ -190,6 +211,7 @@ if [[ "${SUMMARIZE_ONLY}" -eq 0 ]]; then
         --seed "${SEED}"
         --max_steps "${MAX_STEPS}"
         --action_mode "${action_mode}"
+        --robot_setup "${ROBOT_SETUP}"
         --renderer "${RENDERER}"
         --checkpoint "${checkpoint_dir}"
         --dataset_root "${dataset_root}"

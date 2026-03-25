@@ -30,6 +30,10 @@ RLBENCH_ROOT="${WORKSPACE_ROOT}/datasets/rlbench"
 SAVE_ROOT="${WORKSPACE_ROOT}/output/rlbench_eval/all_tasks"
 DEFAULT_TASK_DESCRIPTION=""
 
+# RLBench robot (passed to eval.py --robot_setup). Non-panda outputs go under
+# ${SAVE_ROOT}/${policy}_${state}_${ROBOT_SETUP} to avoid overwriting panda runs.
+ROBOT_SETUP="panda"
+
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DEVICE=""
 DRY_RUN=0
@@ -57,6 +61,7 @@ Options:
   --all_dataset_prefix STR  Prefix for all-task dataset roots (default: ${ALL_DATASET_PREFIX})
   --rlbench_root PATH       RLBench templates root (default: ${RLBENCH_ROOT})
   --save_root PATH          Output root (default: ${SAVE_ROOT})
+  --robot_setup NAME        RLBench robot: panda,jaco,mico,sawyer,ur5 (default: ${ROBOT_SETUP})
   --default_task_description TEXT
                             Optional explicit override passed to eval.py
   --python BIN              Python executable (default: ${PYTHON_BIN})
@@ -90,6 +95,7 @@ while [[ $# -gt 0 ]]; do
     --all_dataset_prefix) ALL_DATASET_PREFIX="$2"; shift 2 ;;
     --rlbench_root) RLBENCH_ROOT="$2"; shift 2 ;;
     --save_root) SAVE_ROOT="$2"; shift 2 ;;
+    --robot_setup) ROBOT_SETUP="$2"; shift 2 ;;
     --default_task_description) DEFAULT_TASK_DESCRIPTION="$2"; shift 2 ;;
     --python) PYTHON_BIN="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
@@ -108,6 +114,43 @@ if [[ "${DATASET_MODE}" != "all" && "${DATASET_MODE}" != "task" ]]; then
   echo "[ERROR] --dataset_mode must be one of: all, task" >&2
   exit 1
 fi
+
+if [[ "${CHECKPOINT_ROOT}" != /* ]]; then
+  CHECKPOINT_ROOT="${WORKSPACE_ROOT}/${CHECKPOINT_ROOT}"
+fi
+if [[ "${DATASET_PARENT}" != /* ]]; then
+  DATASET_PARENT="${WORKSPACE_ROOT}/${DATASET_PARENT}"
+fi
+if [[ "${SAVE_ROOT}" != /* ]]; then
+  SAVE_ROOT="${WORKSPACE_ROOT}/${SAVE_ROOT}"
+fi
+
+if [[ "${RLBENCH_ROOT}" != /* ]]; then
+  if [[ -d "${WORKSPACE_ROOT}/${RLBENCH_ROOT}" ]]; then
+    RLBENCH_ROOT="${WORKSPACE_ROOT}/${RLBENCH_ROOT}"
+  elif [[ -d "${WORKSPACE_ROOT}/datasets/${RLBENCH_ROOT}" ]]; then
+    RLBENCH_ROOT="${WORKSPACE_ROOT}/datasets/${RLBENCH_ROOT}"
+  else
+    RLBENCH_ROOT="${WORKSPACE_ROOT}/${RLBENCH_ROOT}"
+  fi
+fi
+if [[ ! -d "${RLBENCH_ROOT}" ]]; then
+  echo "[ERROR] --rlbench_root does not exist: ${RLBENCH_ROOT}" >&2
+  echo "        Hint: try --rlbench_root datasets/<name> or an absolute path." >&2
+  exit 1
+fi
+
+ROBOT_SETUP="${ROBOT_SETUP,,}"
+case "${ROBOT_SETUP}" in
+  franka|franka_panda) ROBOT_SETUP="panda" ;;
+esac
+case "${ROBOT_SETUP}" in
+  panda|jaco|mico|sawyer|ur5) ;;
+  *)
+    echo "[ERROR] Unsupported --robot_setup='${ROBOT_SETUP}'. Use: panda, jaco, mico, sawyer, ur5." >&2
+    exit 1
+    ;;
+esac
 
 declare -a TASKS_ARR=()
 if [[ -n "${TASKS}" ]]; then
@@ -229,6 +272,8 @@ IFS=',' read -r -a STATES_ARR <<< "${STATES}"
 
 TASKS_CSV="$(IFS=','; echo "${TASKS_ARR[*]}")"
 
+echo "[eval_rlbench_all_tasks] robot_setup=${ROBOT_SETUP} save_root=${SAVE_ROOT} runs=${RUNS} tasks=${#TASKS_ARR[@]}"
+
 if [[ "${SUMMARIZE_ONLY}" -eq 0 ]]; then
   for policy in "${POLICIES_ARR[@]}"; do
     policy="$(echo "${policy}" | xargs)"
@@ -252,7 +297,11 @@ if [[ "${SUMMARIZE_ONLY}" -eq 0 ]]; then
         continue
       fi
 
-      save_path="${SAVE_ROOT}/${policy}_${state}"
+      if [[ "${ROBOT_SETUP}" == "panda" ]]; then
+        save_path="${SAVE_ROOT}/${policy}_${state}"
+      else
+        save_path="${SAVE_ROOT}/${policy}_${state}_${ROBOT_SETUP}"
+      fi
 
       cmd=(
         "${PYTHON_BIN}" "${WORKSPACE_ROOT}/src/inference/rlbench/eval.py"
@@ -262,6 +311,7 @@ if [[ "${SUMMARIZE_ONLY}" -eq 0 ]]; then
         --seed "${SEED}"
         --max_steps "${MAX_STEPS}"
         --action_mode "${action_mode}"
+        --robot_setup "${ROBOT_SETUP}"
         --renderer "${RENDERER}"
         --checkpoint "${checkpoint_dir}"
         --dataset_root "${dataset_root}"

@@ -399,7 +399,6 @@ def _evaluate_single_task(
         n_segments, boundaries = _segmentation_from_relationship_template(
             planner_obs, template_transitions, last_expert_idx
         )
-
         segment_instructions = _instructions_per_segment(
             n_segments, task_steps, task_description
         )
@@ -641,6 +640,39 @@ def _evaluate_single_task(
 def run_evaluation(args: argparse.Namespace) -> None:
     """Main entry point.  Loads model and env once, then iterates tasks."""
 
+    if args.aggregate_only or args.aggregate_root:
+        if not args.aggregate_root:
+            raise ValueError("--aggregate_only requires --aggregate_root.")
+        aggregate_root = Path(args.aggregate_root).expanduser()
+        report = aggregate_batch_results(str(aggregate_root), task_name=args.task)
+
+        output_json = (
+            Path(args.aggregate_output_json).expanduser()
+            if args.aggregate_output_json
+            else aggregate_root / "detailed_summary.json"
+        )
+        output_csv = (
+            Path(args.aggregate_output_csv).expanduser()
+            if args.aggregate_output_csv
+            else aggregate_root / "detailed_runs.csv"
+        )
+        output_overall_csv = (
+            Path(args.aggregate_output_overall_csv).expanduser()
+            if args.aggregate_output_overall_csv
+            else aggregate_root / "overall_metrics.csv"
+        )
+
+        output_json.parent.mkdir(parents=True, exist_ok=True)
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+        output_overall_csv.parent.mkdir(parents=True, exist_ok=True)
+        write_json(str(output_json), report)
+        write_csv(str(output_csv), list(report.get("per_run_details", [])))
+        write_csv(str(output_overall_csv), list(report.get("overall_metrics_rows", [])))
+        print(f"Aggregate summary JSON: {output_json}")
+        print(f"Aggregate per-run CSV: {output_csv}")
+        print(f"Aggregate overall CSV: {output_overall_csv}")
+        return
+
     args.robot_setup = _normalize_robot_setup(args.robot_setup)
     if args.robot_setup not in _SUPPORTED_ROBOTS:
         supported = ", ".join(sorted(_SUPPORTED_ROBOTS))
@@ -752,9 +784,10 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="panda",
         help=(
-            "RLBench robot setup. Supports panda, jaco, mico, sawyer, ur5 "
+            "RLBench robot: panda, jaco, mico, sawyer, ur5 "
             "(aliases: franka, franka_panda -> panda). "
-            "Non-panda robots are restricted to EEF action modes."
+            "Non-panda arms cannot use joint_velocity; use ee_planning or ee_ik. "
+            "scripts/core/eval_rlbench_all_tasks.sh passes this via --robot_setup."
         ),
     )
     parser.add_argument("--renderer", type=str, default="opengl", choices=["opengl", "opengl3"])
@@ -780,6 +813,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--save_path", type=str, default="output/rlbench_eval/default_task")
+    parser.add_argument(
+        "--aggregate_only",
+        action="store_true",
+        help="Skip policy/env evaluation and only aggregate existing outputs from --aggregate_root.",
+    )
     parser.add_argument(
         "--aggregate_root",
         type=str,
