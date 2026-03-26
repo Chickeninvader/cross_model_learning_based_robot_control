@@ -58,6 +58,87 @@ def _scan_mask_handles(image_data, max_frames=5):
     return sorted(handles)
 
 
+def decode_mask_array(mask_array):
+    """Decode RLBench mask array (H,W,3 RGB) or pass-through integer mask."""
+    arr = np.asarray(mask_array)
+    if arr.ndim == 2:
+        return arr.astype(np.int64, copy=False)
+    if arr.ndim == 3 and arr.shape[2] >= 3:
+        rgb = arr[:, :, :3]
+        if rgb.dtype != np.uint8:
+            # RLBench observations often store masks as float32 in [0,1].
+            # Scale before uint8 cast so handle-id encoding is preserved.
+            if np.issubdtype(rgb.dtype, np.floating) and float(np.max(rgb)) <= 1.0:
+                rgb = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+            else:
+                rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+        decoded = (
+            rgb[:, :, 0].astype(np.int64)
+            + rgb[:, :, 1].astype(np.int64) * 256
+            + rgb[:, :, 2].astype(np.int64) * 65536
+        )
+        return decoded
+    return np.zeros(arr.shape[:2], dtype=np.int64)
+
+
+def scan_mask_handles_from_mask_arrays(mask_arrays, max_frames=5):
+    """Return sorted non-zero handles from in-memory mask arrays."""
+    handles = set()
+    for mask in list(mask_arrays)[:max_frames]:
+        decoded = decode_mask_array(mask)
+        handles.update(int(h) for h in np.unique(decoded) if int(h) != 0)
+    return sorted(handles)
+
+
+def discover_object_mapping_from_handles(reference_mapping, actual_handles_sorted, robot_names=None):
+    """Build handle-to-name mapping using discovered handles and reference order."""
+    if robot_names is None:
+        robot_names = {"robot", "gripper"}
+
+    ref_robot = {h: n for h, n in reference_mapping.items() if n in robot_names}
+    ref_objects = {h: n for h, n in reference_mapping.items() if n not in robot_names}
+    ref_obj_handles_sorted = sorted(ref_objects.keys())
+
+    new_mapping = dict(ref_robot)
+    if not ref_obj_handles_sorted:
+        return new_mapping
+
+    actual_handles = set(actual_handles_sorted)
+
+    ref_obj_set = set(ref_obj_handles_sorted)
+    if ref_obj_set.issubset(actual_handles):
+        for h, name in ref_objects.items():
+            new_mapping[h] = name
+        return new_mapping
+
+    ref_base = ref_obj_handles_sorted[0]
+    ref_offsets = [h - ref_base for h in ref_obj_handles_sorted]
+
+    _stable_arm_handles = frozenset({10, 42, 43, 44, 45, 46, 48, 52, 55})
+    all_ref_handles = set(reference_mapping.keys())
+    exclude = all_ref_handles | _stable_arm_handles
+    candidates = sorted(actual_handles - exclude)
+
+    matched_base = None
+    for base in candidates:
+        expected = {base + off for off in ref_offsets}
+        if expected.issubset(actual_handles):
+            matched_base = base
+            break
+
+    if matched_base is not None:
+        ref_obj_names_ordered = [ref_objects[h] for h in ref_obj_handles_sorted]
+        for offset, obj_name in zip(ref_offsets, ref_obj_names_ordered):
+            new_mapping[matched_base + offset] = obj_name
+        return new_mapping
+
+    warnings.warn(
+        "discover_object_mapping_from_handles: could not find offset-matching base. "
+        "Falling back to reference mapping."
+    )
+    return dict(reference_mapping)
+
+
 def discover_object_mapping(reference_mapping, image_data, robot_names=None):
     """Build a handle-to-name mapping for the current variation by matching
     sorted non-robot handles against the reference variation's order.
@@ -86,71 +167,12 @@ def discover_object_mapping(reference_mapping, image_data, robot_names=None):
     dict[int, str]
         New mapping from *this variation's* actual handle IDs to object names.
     """
-    if robot_names is None:
-        robot_names = {"robot", "gripper"}
-
-    # Separate reference into robot vs non-robot handles
-    ref_robot = {h: n for h, n in reference_mapping.items() if n in robot_names}
-    ref_objects = {h: n for h, n in reference_mapping.items() if n not in robot_names}
-
-    # Sorted reference object handles -> ordered list of names
-    ref_obj_handles_sorted = sorted(ref_objects.keys())
-    ref_obj_names_ordered = [ref_objects[h] for h in ref_obj_handles_sorted]
-
-    # Robot/gripper handles are stable — keep exactly those from the reference
-    new_mapping = dict(ref_robot)
-
-    if not ref_obj_handles_sorted:
-        return new_mapping
-
-    # Discover actual handles from this variation's masks
-    actual_handles = set(_scan_mask_handles(image_data))
-
-    # Fast path: if the reference object handles all exist in the actual mask,
-    # this is the same (or compatible) variation — use them directly.
-    ref_obj_set = set(ref_obj_handles_sorted)
-    if ref_obj_set.issubset(actual_handles):
-        for h, name in ref_objects.items():
-            new_mapping[h] = name
-        return new_mapping
-
-    # The relative offsets between non-robot object handles are stable across
-    # variations — only the base ID shifts.  Use offset-pattern matching to
-    # find the correct handles.
-    ref_base = ref_obj_handles_sorted[0]
-    ref_offsets = [h - ref_base for h in ref_obj_handles_sorted]
-
-    # Panda arm joint handles that are stable across all variations.
-    # Used only to exclude false-positive offset matches during discovery;
-    # they are NOT added to the output mapping.
-    _stable_arm_handles = frozenset({10, 42, 43, 44, 45, 46, 48, 52, 55})
-
-    # Candidate bases: actual handles that are NOT in the reference mapping
-    # and NOT known stable arm joints.  Shifted object handles are always
-    # new IDs that didn't exist in the reference variation.
-    all_ref_handles = set(reference_mapping.keys())
-    exclude = all_ref_handles | _stable_arm_handles
-    candidates = sorted(actual_handles - exclude)
-
-    matched_base = None
-    for base in candidates:
-        expected = {base + off for off in ref_offsets}
-        if expected.issubset(actual_handles):
-            matched_base = base
-            break
-
-    if matched_base is not None:
-        for offset, obj_name in zip(ref_offsets, ref_obj_names_ordered):
-            new_mapping[matched_base + offset] = obj_name
-    else:
-        warnings.warn(
-            f"discover_object_mapping: could not find offset-matching base "
-            f"among {len(candidates)} candidate handles. "
-            f"Falling back to reference mapping."
-        )
-        return dict(reference_mapping)
-
-    return new_mapping
+    actual_handles_sorted = _scan_mask_handles(image_data)
+    return discover_object_mapping_from_handles(
+        reference_mapping,
+        actual_handles_sorted,
+        robot_names=robot_names,
+    )
 
 
 def extract_gripper_states(demo):
@@ -250,6 +272,11 @@ def _base_object_type(object_name):
     return base.replace('_', ' ')
 
 
+def base_object_type(object_name):
+    """Public wrapper for canonical object type parsing."""
+    return _base_object_type(object_name)
+
+
 def _rgb_to_color_name(rgb):
     """Map an RGB triplet to a coarse color name."""
     rgb_u8 = np.uint8([[rgb]])
@@ -284,6 +311,11 @@ def _rgb_to_color_name(rgb):
     if h < 160:
         return "purple"
     return "pink"
+
+
+def rgb_to_color_name(rgb):
+    """Public wrapper for coarse RGB->name mapping."""
+    return _rgb_to_color_name(rgb)
 
 
 def estimate_object_colors(

@@ -17,7 +17,7 @@ from rlbench.action_modes.gripper_action_modes import Discrete
 
 
 def build_obs_config(image_size: list[int], renderer: str) -> ObservationConfig:
-    """Build ObservationConfig for low-dim + wrist/front RGB only."""
+    """Build ObservationConfig for low-dim + RGB (+ front mask for runtime color cues)."""
     obs_config = ObservationConfig()
     obs_config.set_all_high_dim(False)
     obs_config.set_all_low_dim(True)
@@ -37,6 +37,9 @@ def build_obs_config(image_size: list[int], renderer: str) -> ObservationConfig:
         cam.image_size = image_size
         cam.depth_in_meters = False
         cam.masks_as_one_channel = False
+    # Keep wrist mask disabled to reduce payload; enable front mask so eval.py
+    # can infer object colors from runtime snapshots.
+    obs_config.front_camera.mask = True
 
     if renderer == "opengl":
         render_mode = RenderMode.OPENGL

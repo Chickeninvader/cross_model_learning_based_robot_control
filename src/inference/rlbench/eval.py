@@ -44,266 +44,28 @@ from src.utils.rlbench_eval_utils import (
 from src.utils.rlbench_rollout_io import save_observations, save_rollout_sidecars
 from src.utils.rlbench_utils import extract_eef_state, extract_joint_state
 from src.utils.rlbench_eval_aggregate import aggregate_batch_results
-from src.utils.scene_graph_language import generate_task_descriptions
+from src.utils.rlbench_eval_task_utils import (
+    SUPPORTED_ROBOTS,
+    gripper_change_indices,
+    instructions_per_segment,
+    load_relationship_transitions,
+    mean_or_none,
+    normalize_robot_setup,
+    resolve_relationship_template_path,
+    resolve_task_steps_from_relationship_template,
+    runtime_objects_meta_from_observations,
+    segment_ranges,
+    segment_state_metric,
+    segmentation_from_relationship_template,
+    task_steps_from_transitions,
+    validate_action_mode_for_robot,
+)
 from src.utils.rlbench_eval_setup import (
     build_action_mode,
     build_obs_config,
     write_csv,
     write_json,
 )
-
-_RELATIONSHIP_TASK_STEPS_CACHE: dict[tuple[str, bool], list[str]] = {}
-_SUPPORTED_ROBOTS: set[str] = {"panda", "jaco", "mico", "sawyer", "ur5"}
-_ROBOT_SETUP_ALIASES: dict[str, str] = {
-    "franka": "panda",
-    "franka_panda": "panda",
-}
-
-
-def _normalize_robot_setup(robot_setup: str) -> str:
-    normalized = str(robot_setup).strip().lower()
-    return _ROBOT_SETUP_ALIASES.get(normalized, normalized)
-
-
-def _validate_action_mode_for_robot(action_mode: str, robot_setup: str) -> None:
-    # Joint-state policy was trained specifically for Franka/Panda.
-    if robot_setup != "panda" and action_mode == "joint_velocity":
-        raise ValueError(
-            "Joint-state evaluation (action_mode=joint_velocity) is only supported "
-            "for robot_setup=panda (Franka). Use ee_planning/ee_ik for other robots."
-        )
-
-
-def _resolve_task_steps_from_relationship_template(
-    task: str,
-    rlbench_root: str | Path,
-    explicit_template_path: str | None,
-    *,
-    use_context_prompt: bool = False,
-) -> list[str]:
-    template_path = _resolve_relationship_template_path(task, rlbench_root, explicit_template_path)
-    if template_path is None:
-        return [""]
-
-    cache_key = (str(template_path.resolve()), bool(use_context_prompt))
-    cached = _RELATIONSHIP_TASK_STEPS_CACHE.get(cache_key)
-    if cached is None:
-        cached = _infer_task_steps_from_relationship_template(
-            template_path,
-            task,
-            use_context_prompt=use_context_prompt,
-        )
-        _RELATIONSHIP_TASK_STEPS_CACHE[cache_key] = cached
-    return cached if cached else [""]
-
-
-def _infer_task_steps_from_relationship_template(
-    template_path: Path,
-    task: str,
-    *,
-    use_context_prompt: bool = False,
-) -> list[str]:
-    """Generate ordered per-segment instructions from relationship template."""
-    try:
-        with open(template_path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except Exception:
-        return []
-
-    transitions = data.get("transitions")
-    if not isinstance(transitions, list) or not transitions:
-        return []
-
-    info_path = template_path.parent / "info.json"
-    objects_meta: dict[str, dict[str, str]] = {}
-    if info_path.is_file():
-        try:
-            with open(info_path, "r", encoding="utf-8") as handle:
-                info_data = json.load(handle)
-            raw_objects = info_data.get("objects", {})
-            if isinstance(raw_objects, dict):
-                for obj in raw_objects.values():
-                    if not isinstance(obj, dict):
-                        continue
-                    name = str(obj.get("name", "")).strip()
-                    if name:
-                        objects_meta[name] = {"type": name}
-        except Exception:
-            objects_meta = {}
-
-    episodes: list[dict[str, list[dict]]] = []
-    begin_sg: list[dict] = []
-    for transition in transitions:
-        if not isinstance(transition, dict):
-            continue
-        rels = transition.get("relationships", [])
-        if not isinstance(rels, list):
-            rels = []
-        end_sg = [r for r in rels if isinstance(r, dict)]
-        episodes.append({"begin_sg": list(begin_sg), "end_sg": end_sg})
-        begin_sg = end_sg
-
-    if not episodes:
-        return []
-
-    task_steps = generate_task_descriptions(
-        episodes,
-        objects_meta,
-        task,
-        use_context=use_context_prompt,
-    )
-    cleaned_steps = [str(s).strip() for s in task_steps if str(s).strip()]
-    return cleaned_steps
-
-
-def _gripper_change_indices(observations: list, threshold: float = 0.5) -> list[int]:
-    if not observations:
-        return []
-    gripper = np.asarray([float(obs.gripper_open) for obs in observations], dtype=np.float64)
-    indices: list[int] = []
-    for idx in range(1, gripper.shape[0]):
-        prev_open = gripper[idx - 1] > threshold
-        curr_open = gripper[idx] > threshold
-        if prev_open != curr_open:
-            indices.append(idx)
-    return indices
-
-
-def _segment_boundaries(change_indices: list[int], n_segments: int, last_index: int) -> list[int]:
-    needed = max(0, n_segments - 1)
-    boundaries = list(change_indices[:needed])
-    while len(boundaries) < needed:
-        boundaries.append(last_index)
-    return boundaries
-
-
-def _segment_ranges(boundaries: list[int], n_segments: int, last_index: int) -> list[tuple[int, int]]:
-    ranges: list[tuple[int, int]] = []
-    start = 0
-    for idx in range(n_segments):
-        end = boundaries[idx] if idx < len(boundaries) else last_index
-        end = int(max(start, min(end, last_index)))
-        ranges.append((start, end))
-        # Boundaries are segment END indices, so next segment starts at end+1.
-        # This avoids reusing the transition frame as both previous-end and next-start.
-        start = min(end + 1, last_index)
-    return ranges
-
-
-def _resolve_relationship_template_path(
-    task: str,
-    rlbench_root: str | Path,
-    explicit: str | None,
-) -> Path | None:
-    if explicit:
-        p = Path(explicit)
-        return p if p.is_file() else None
-    p = Path(rlbench_root) / task / f"{task}_relationship_template.json"
-    return p if p.is_file() else None
-
-
-def _load_relationship_transitions(template_path: Path) -> list[dict]:
-    with open(template_path, "r", encoding="utf-8") as handle:
-        data = json.load(handle)
-    transitions = data.get("transitions")
-    if not isinstance(transitions, list) or not transitions:
-        return []
-    return transitions
-
-
-def _segmentation_from_relationship_template(
-    observations: list,
-    transitions: list[dict],
-    last_index: int,
-    threshold: float = 0.5,
-) -> tuple[int, list[int]]:
-    """Number of segments = len(transitions). Boundaries end segment 0..n-2."""
-    n = len(transitions)
-    if n <= 1:
-        return max(1, n), []
-    gripper_open = [float(obs.gripper_open) > threshold for obs in observations]
-    boundaries: list[int] = []
-    search_from = 1
-    for i in range(n - 1):
-        t = transitions[i]
-        from_open = str(t.get("from_state", "")).lower() == "open"
-        to_open = str(t.get("to_state", "")).lower() == "open"
-        found: int | None = None
-        for idx in range(max(search_from, 1), len(observations)):
-            if gripper_open[idx - 1] == gripper_open[idx]:
-                continue
-            if gripper_open[idx - 1] == from_open and gripper_open[idx] == to_open:
-                found = idx
-                break
-        if found is None:
-            for idx in range(max(search_from, 1), len(observations)):
-                if gripper_open[idx - 1] != gripper_open[idx]:
-                    found = idx
-                    break
-        if found is None:
-            found = last_index
-        found = int(max(0, min(found, last_index)))
-        boundaries.append(found)
-        search_from = found + 1
-    return n, boundaries
-
-
-def _instructions_per_segment(
-    n_segments: int,
-    task_steps: list[str],
-    task_description: str,
-) -> list[str]:
-    td = (task_description or "").strip()
-    if n_segments <= 0:
-        return []
-    if n_segments == 1:
-        return [td if td else (task_steps[0] if task_steps else "")]
-    steps = [s.strip() for s in task_steps if s.strip()]
-    if len(steps) >= n_segments:
-        return steps[:n_segments]
-    if not steps:
-        return [td] * n_segments if td else [""] * n_segments
-    out = list(steps)
-    while len(out) < n_segments:
-        out.append(out[-1])
-    return out[:n_segments]
-
-
-def _quat_angle_deg(q_a: np.ndarray, q_b: np.ndarray) -> float:
-    qa = np.asarray(q_a, dtype=np.float64).reshape(-1)
-    qb = np.asarray(q_b, dtype=np.float64).reshape(-1)
-    qa_norm = np.linalg.norm(qa)
-    qb_norm = np.linalg.norm(qb)
-    if qa_norm < 1e-12 or qb_norm < 1e-12:
-        return 0.0
-    qa = qa / qa_norm
-    qb = qb / qb_norm
-    dot = float(np.dot(qa, qb))
-    dot = abs(max(-1.0, min(1.0, dot)))
-    return float(np.degrees(2.0 * np.arccos(dot)))
-
-
-def _segment_state_metric(expert_final_obs, policy_final_obs) -> dict[str, float]:
-    expert_eef = extract_eef_state(expert_final_obs).astype(np.float64)
-    policy_eef = extract_eef_state(policy_final_obs).astype(np.float64)
-    expert_joint = extract_joint_state(expert_final_obs).astype(np.float64)
-    policy_joint = extract_joint_state(policy_final_obs).astype(np.float64)
-
-    return {
-        "eef_l2": float(np.linalg.norm(policy_eef - expert_eef)),
-        "joint_l2": float(np.linalg.norm(policy_joint - expert_joint)),
-        "pos_l2": float(np.linalg.norm(policy_eef[:3] - expert_eef[:3])),
-        "rot_deg": _quat_angle_deg(policy_eef[3:7], expert_eef[3:7]),
-    }
-
-
-def _mean_or_none(values: list[float | None]) -> float | None:
-    clean = [float(v) for v in values if v is not None and not np.isnan(float(v))]
-    if not clean:
-        return None
-    return float(np.mean(np.asarray(clean, dtype=np.float64)))
-
-
 def _save_episode_outputs(
     observations: list,
     episode_dir: str,
@@ -348,10 +110,10 @@ def _evaluate_single_task(
 
     os.makedirs(save_path, exist_ok=True)
 
-    template_path = _resolve_relationship_template_path(
+    template_path = resolve_relationship_template_path(
         task_name, rlbench_root, args.relationship_template
     )
-    template_transitions = _load_relationship_transitions(template_path) if template_path else []
+    template_transitions = load_relationship_transitions(template_path) if template_path else []
     print(
         f"\nSegmentation from relationship template: {template_path} "
         f"({len(template_transitions)} transition(s) → {len(template_transitions)} episode(s))"
@@ -359,13 +121,13 @@ def _evaluate_single_task(
     if not template_transitions:
         raise ValueError(f"Relationship template missing or empty: {template_path}")
 
-    task_steps = _resolve_task_steps_from_relationship_template(
+    fallback_task_steps = resolve_task_steps_from_relationship_template(
         task_name,
         rlbench_root,
         args.relationship_template,
         use_context_prompt=args.with_context_prompt,
+        variation=args.variation,
     )
-    task_description = " ".join(task_steps).strip()
 
     task_class = task_file_to_task_class(task_name)
     task_env = env.get_task(task_class)
@@ -392,17 +154,32 @@ def _evaluate_single_task(
             max_attempts=args.planner_max_attempts,
         )
 
+        runtime_objects_meta = runtime_objects_meta_from_observations(
+            task=task_name,
+            rlbench_root=rlbench_root,
+            variation=args.variation,
+            planner_obs=planner_obs,
+        )
+        runtime_task_steps = task_steps_from_transitions(
+            template_transitions,
+            runtime_objects_meta,
+            task_name,
+            use_context_prompt=args.with_context_prompt,
+        )
+        task_steps = runtime_task_steps if runtime_task_steps else fallback_task_steps
+        task_description = " ".join(task_steps).strip()
+
         _descriptions, _initial_obs = task_env.reset_to_demo(planner_demo)
         last_expert_idx = max(0, len(planner_obs) - 1)
-        gripper_changes = _gripper_change_indices(planner_obs)
+        gripper_changes = gripper_change_indices(planner_obs)
 
-        n_segments, boundaries = _segmentation_from_relationship_template(
+        n_segments, boundaries = segmentation_from_relationship_template(
             planner_obs, template_transitions, last_expert_idx
         )
-        segment_instructions = _instructions_per_segment(
+        segment_instructions = instructions_per_segment(
             n_segments, task_steps, task_description
         )
-        ranges = _segment_ranges(boundaries, n_segments, last_expert_idx)
+        ranges = segment_ranges(boundaries, n_segments, last_expert_idx)
 
         initial_state = capture_task_env_state(task_env)
         if planner_state_snaps:
@@ -537,7 +314,7 @@ def _evaluate_single_task(
 
             expert_final_obs = planner_obs[seg_end]
             policy_final_obs = policy_rollout["observations"][-1]
-            dist = _segment_state_metric(expert_final_obs, policy_final_obs)
+            dist = segment_state_metric(expert_final_obs, policy_final_obs)
 
             episode_metric = {
                 "run_index": run_idx,
@@ -599,11 +376,11 @@ def _evaluate_single_task(
             {
                 "episode_index": ep_idx,
                 "num_samples": len(ep_rows),
-                "policy_success_rate": _mean_or_none([float(bool(ep["policy_success"])) for ep in ep_rows]),
-                "eef_l2_mean": _mean_or_none([ep.get("eef_l2") for ep in ep_rows]),
-                "joint_l2_mean": _mean_or_none([ep.get("joint_l2") for ep in ep_rows]),
-                "pos_l2_mean": _mean_or_none([ep.get("pos_l2") for ep in ep_rows]),
-                "rot_deg_mean": _mean_or_none([ep.get("rot_deg") for ep in ep_rows]),
+                "policy_success_rate": mean_or_none([float(bool(ep["policy_success"])) for ep in ep_rows]),
+                "eef_l2_mean": mean_or_none([ep.get("eef_l2") for ep in ep_rows]),
+                "joint_l2_mean": mean_or_none([ep.get("joint_l2") for ep in ep_rows]),
+                "pos_l2_mean": mean_or_none([ep.get("pos_l2") for ep in ep_rows]),
+                "rot_deg_mean": mean_or_none([ep.get("rot_deg") for ep in ep_rows]),
             }
         )
 
@@ -623,7 +400,7 @@ def _evaluate_single_task(
         "action_mode": args.action_mode,
         "num_episodes": max_episodes,
         "num_instruction_episodes": max_episodes,
-        "all_episode_success_rate": _mean_or_none(all_episode_success),
+        "all_episode_success_rate": mean_or_none(all_episode_success),
         "per_episode": per_episode_summary,
     }
 
@@ -673,13 +450,13 @@ def run_evaluation(args: argparse.Namespace) -> None:
         print(f"Aggregate overall CSV: {output_overall_csv}")
         return
 
-    args.robot_setup = _normalize_robot_setup(args.robot_setup)
-    if args.robot_setup not in _SUPPORTED_ROBOTS:
-        supported = ", ".join(sorted(_SUPPORTED_ROBOTS))
+    args.robot_setup = normalize_robot_setup(args.robot_setup)
+    if args.robot_setup not in SUPPORTED_ROBOTS:
+        supported = ", ".join(sorted(SUPPORTED_ROBOTS))
         raise ValueError(
             f"Unsupported robot_setup='{args.robot_setup}'. Supported: {supported}."
         )
-    _validate_action_mode_for_robot(args.action_mode, args.robot_setup)
+    validate_action_mode_for_robot(args.action_mode, args.robot_setup)
 
     task_list: list[str] = []
     if args.tasks:

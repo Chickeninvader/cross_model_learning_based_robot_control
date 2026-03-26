@@ -403,7 +403,7 @@ def _l2(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.linalg.norm(np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64)))
 
 
-def _quat_angle_deg(q_a: np.ndarray, q_b: np.ndarray) -> float:
+def quat_angle_deg(q_a: np.ndarray, q_b: np.ndarray) -> float:
     qa = np.asarray(q_a, dtype=np.float64).reshape(-1)
     qb = np.asarray(q_b, dtype=np.float64).reshape(-1)
     qa_norm = np.linalg.norm(qa)
@@ -415,6 +415,11 @@ def _quat_angle_deg(q_a: np.ndarray, q_b: np.ndarray) -> float:
     dot = float(np.dot(qa, qb))
     dot = abs(max(-1.0, min(1.0, dot)))
     return float(np.degrees(2.0 * np.arccos(dot)))
+
+
+def _quat_angle_deg(q_a: np.ndarray, q_b: np.ndarray) -> float:
+    """Backward-compatible alias for existing private call sites."""
+    return quat_angle_deg(q_a, q_b)
 
 
 def _aligned_mean_l2(seq_a: np.ndarray, seq_b: np.ndarray) -> float | None:
