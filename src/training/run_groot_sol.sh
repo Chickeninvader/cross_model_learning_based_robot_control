@@ -3,13 +3,13 @@
 #SBATCH -N 1
 #SBATCH -c 16
 #SBATCH --mem=64G
-#SBATCH -t 8:00:00
+#SBATCH -t 32:00:00
 #SBATCH -G a100:1
 #SBATCH -p general
 #SBATCH -q public
 #SBATCH -J groot_lerobot
-#SBATCH -o /scratch/kpham34/cross_model_learning_based_robot_control/output/slurm_log/slurm_groot_%j.out
-#SBATCH -e /scratch/kpham34/cross_model_learning_based_robot_control/output/slurm_log/slurm_groot_%j.err
+#SBATCH -o /scratch/kpham34/cross_model_learning_based_robot_control/output/lerobot/slurm_groot_%j.out
+#SBATCH -e /scratch/kpham34/cross_model_learning_based_robot_control/output/lerobot/slurm_groot_%j.err
 #SBATCH --export=NONE
 
 set -euo pipefail
