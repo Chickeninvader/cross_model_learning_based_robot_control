@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=../lib/init_script_logging.sh
+source "${SCRIPT_DIR}/../lib/init_script_logging.sh"
+
 # Generate Rerun (.rrd) files for a local LeRobot v3 dataset.
 #
 # Usage:
@@ -82,9 +87,6 @@ if ! [[ "$START_EPISODE" =~ ^[0-9]+$ ]]; then
   echo "ERROR: start_episode must be a non-negative integer (got: $START_EPISODE)" >&2
   exit 2
 fi
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Defaults (override via env vars if needed)
 BATCH_SIZE="${BATCH_SIZE:-16}"

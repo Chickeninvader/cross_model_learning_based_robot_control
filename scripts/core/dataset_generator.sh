@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=../lib/init_script_logging.sh
+source "${SCRIPT_DIR}/../lib/init_script_logging.sh"
 
 RLBENCH_ROOT="${RLBENCH_ROOT:-$REPO_ROOT/external/RLBench}"
 OUT_ROOT="${OUT_ROOT:-}"

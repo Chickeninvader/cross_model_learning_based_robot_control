@@ -7,6 +7,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+export REPO_ROOT
+# shellcheck source=../lib/init_script_logging.sh
+source "${SCRIPT_DIR}/../lib/init_script_logging.sh"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 EXT_DIR="$ROOT_DIR/external"
 

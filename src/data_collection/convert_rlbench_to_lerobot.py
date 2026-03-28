@@ -640,6 +640,22 @@ def convert(
     return out_dir
 
 
+def _collapse_concat_video_paths(paths: List[str]) -> List[str]:
+    """Drop consecutive duplicate paths for ffmpeg's concat demuxer.
+
+    Per-task LeRobot exports use one MP4 per camera with per-episode
+    ``from_timestamp`` / ``to_timestamp`` into that file. Appending the same
+    path once per episode makes ffmpeg repeat the entire file each time.
+    """
+    if not paths:
+        return []
+    out = [paths[0]]
+    for p in paths[1:]:
+        if p != out[-1]:
+            out.append(p)
+    return out
+
+
 def _concat_videos_ffmpeg(
     input_videos: List[str],
     output_path: str,
@@ -904,6 +920,7 @@ def merge_all_variations(
 
         # Re-index episodes and collect per-episode video files for concat
         episodes_df = episodes_df.sort_values("episode_index")
+        cam_paths_this_var: Dict[str, List[str]] = {k: [] for k in camera_keys}
         for _, ep_row in episodes_df.iterrows():
             old_ep_idx = int(ep_row["episode_index"])
             new_ep_idx = old_ep_idx + ep_offset
@@ -962,7 +979,7 @@ def merge_all_variations(
                 )
                 if not os.path.exists(src_video):
                     raise FileNotFoundError(f"Missing expected source video: {src_video}")
-                cam_to_video_inputs[cam_key].append(src_video)
+                cam_paths_this_var[cam_key].append(src_video)
 
             # Copy per-episode stats
             for col in ep_row.index:
@@ -970,6 +987,11 @@ def merge_all_variations(
                     ep_meta[col] = ep_row[col]
 
             all_episode_meta.append(ep_meta)
+
+        for cam_key in camera_keys:
+            cam_to_video_inputs[cam_key].extend(
+                _collapse_concat_video_paths(cam_paths_this_var[cam_key])
+            )
 
         variation_summaries.append({
             "name": var_name, "episodes": n_episodes, "frames": n_frames,
@@ -1184,6 +1206,7 @@ def merge_all_tasks_datasets(
         episodes_df = episodes_df.sort_values("episode_index")
         base_from = int(episodes_df.iloc[0]["dataset_from_index"]) if len(episodes_df) > 0 else 0
 
+        cam_paths_this_ds: Dict[str, List[str]] = {k: [] for k in camera_keys}
         for _, ep_row in episodes_df.iterrows():
             old_ep_idx = int(ep_row["episode_index"])
             new_ep_idx = old_ep_idx + ep_offset
@@ -1233,13 +1256,18 @@ def merge_all_tasks_datasets(
                 )
                 if not os.path.exists(src_video):
                     raise FileNotFoundError(f"Missing expected source video: {src_video}")
-                cam_to_video_inputs[cam_key].append(src_video)
+                cam_paths_this_ds[cam_key].append(src_video)
 
             for col in ep_row.index:
                 if col.startswith("stats/"):
                     ep_meta[col] = ep_row[col]
 
             all_episode_meta.append(ep_meta)
+
+        for cam_key in camera_keys:
+            cam_to_video_inputs[cam_key].extend(
+                _collapse_concat_video_paths(cam_paths_this_ds[cam_key])
+            )
 
         old_idx_to_str = {
             int(row["task_index"]): task_str for task_str, row in tasks_df.iterrows()

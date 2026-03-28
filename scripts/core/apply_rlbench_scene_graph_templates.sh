@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=../lib/init_script_logging.sh
+source "${SCRIPT_DIR}/../lib/init_script_logging.sh"
 
 DATASET_PATH=""
 APPLY_SCRIPT="$REPO_ROOT/src/data_collection/apply_template_batch.py"
