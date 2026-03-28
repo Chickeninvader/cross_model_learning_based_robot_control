@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
-CONVERTER="/workspace/src/data_collection/convert_rlbench_to_lerobot.py"
+CONVERTER="src/data_collection/convert_rlbench_to_lerobot.py"
 DATASET_PATH=""
 OUTPUT_ROOT=""
 EPISODE="0"
@@ -21,11 +21,10 @@ Usage:
   scripts/core/convert_rlbench_to_lerobot_batch.sh --dataset-path <path> [options]
 
 Required:
-  --dataset-path <path>       RLBench dataset root (e.g. /workspace/datasets/rlbench_trial_2)
+  --dataset-path <path>       RLBench dataset root (e.g. datasets/rlbench_<run_name>)
+  --output-root <path>       LeRobot output root (e.g. datasets/lerobot_<run_name>)
 
 Optional:
-  --output-root <path>        Output root for LeRobot datasets
-                              (default: /workspace/datasets/<dataset-folder-name>)
   --tasks <csv>               Comma-separated task names (default: all task folders)
   --episode <id>              Episode index (default: 0)
   --fps <num>                 Output FPS (default: 20)
@@ -37,14 +36,17 @@ Optional:
 
 Examples:
   scripts/core/convert_rlbench_to_lerobot_batch.sh \
-    --dataset-path /workspace/datasets/rlbench_trial_2
+    --dataset-path datasets/rlbench_<run_name> \
+    --output-root datasets/lerobot_<run_name>
 
   scripts/core/convert_rlbench_to_lerobot_batch.sh \
-    --dataset-path /workspace/datasets/rlbench_trial_2 \
+    --dataset-path datasets/rlbench_<run_name> \
+    --output-root datasets/lerobot_<run_name> \
     --use-context-prompt
 
   scripts/core/convert_rlbench_to_lerobot_batch.sh \
-    --dataset-path /workspace/datasets/rlbench_trial_2 \
+    --dataset-path datasets/rlbench_<run_name> \
+    --output-root datasets/lerobot_<run_name> \
     --tasks "lamp_on,put_rubbish_in_bin"
 EOF
 }
@@ -117,8 +119,9 @@ if [[ ! -f "$CONVERTER" ]]; then
 fi
 
 if [[ -z "$OUTPUT_ROOT" ]]; then
-  dataset_name="$(basename "$DATASET_PATH")"
-  OUTPUT_ROOT="/workspace/datasets/${dataset_name}"
+  echo "Error: --output-root is required." >&2
+  usage
+  exit 1
 fi
 
 case "$ACTION_SPACE" in

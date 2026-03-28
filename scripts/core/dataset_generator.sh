@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RLBENCH_ROOT="${RLBENCH_ROOT:-$PWD/external/RLBench}"
-OUT_ROOT="${OUT_ROOT:-$PWD/datasets/rlbench_trial_2}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+RLBENCH_ROOT="${RLBENCH_ROOT:-$REPO_ROOT/external/RLBench}"
+OUT_ROOT="${OUT_ROOT:-}"
 PY="${PY:-python}"
 PROCESSES="${PROCESSES:-4}"
 EPISODES_PER_TASK="${EPISODES_PER_TASK:-1}"
-START_VARIATION="${START_VARIATION:-0}"
+START_VARIATION="${START_VARIATION:-20}"
 IMAGE_WIDTH="${IMAGE_WIDTH:-256}"
 IMAGE_HEIGHT="${IMAGE_HEIGHT:-256}"
 RENDERER="${RENDERER:-opengl3}"
@@ -27,6 +30,9 @@ Notes:
   - <num_variations> must be a positive integer.
   - Episodes per variation defaults to 1. Override with:
       EPISODES_PER_TASK=<N> scripts/dataset_generator.sh ...
+  - OUT_ROOT (env var) is required: the RLBench dataset root to write into.
+    Example:
+      OUT_ROOT=datasets/rlbench_<run_name> scripts/dataset_generator.sh ...
   - Each task can be:
       1) a task python file path (e.g. .../put_banana_in_bin.py), or
       2) a task name (e.g. put_banana_in_bin).
@@ -70,9 +76,20 @@ if [ "${#task_names[@]}" -eq 0 ]; then
   exit 1
 fi
 
-export PYTHONPATH="$PWD/external/RLBench:$PWD/external/lerobot/src:${PYTHONPATH:-}"
+if [[ -z "$OUT_ROOT" ]]; then
+  echo "Error: OUT_ROOT env var is required (dataset output root)." >&2
+  echo "Example: OUT_ROOT=datasets/rlbench_<run_name> $0 $NUM_VARIATIONS <task1> [task2 ...]" >&2
+  usage
+  exit 1
+fi
 
-cd "$PWD/external/RLBench"
+if [[ "$OUT_ROOT" != /* ]]; then
+  OUT_ROOT="$REPO_ROOT/$OUT_ROOT"
+fi
+
+export PYTHONPATH="$REPO_ROOT/external/RLBench:$REPO_ROOT/external/lerobot/src:${PYTHONPATH:-}"
+
+cd "$RLBENCH_ROOT"
 mkdir -p "$OUT_ROOT"
 
 echo "--------------------------------------"

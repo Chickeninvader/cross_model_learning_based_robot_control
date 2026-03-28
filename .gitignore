@@ -49,3 +49,5 @@ runs/
 external/
 src/install.sh
 scripts/install.sh
+.cursor/
+.claude/

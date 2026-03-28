@@ -4,27 +4,67 @@ set -euo pipefail
 # Generate Rerun (.rrd) files for a local LeRobot v3 dataset.
 #
 # Usage:
-#   bash scripts/generate_lerobot_rrd.sh <task> <eef|joint> [num_episodes]
+#   bash scripts/core/generate_lerobot_rrd.sh --dataset-path <path> [--start-episode N] [--num-episodes K]
 #
 # Examples:
-#   bash scripts/generate_lerobot_rrd.sh put_rubbish_in_bin eef 4
-#   bash scripts/generate_lerobot_rrd.sh put_rubbish_in_bin joint 4
+#   bash scripts/core/generate_lerobot_rrd.sh \
+#     --dataset-path datasets/lerobot_trial_2/push_button_eef \
+#     --start-episode 0 \
+#     --num-episodes 4
 #
 # Output:
 #   Writes one .rrd per episode into:
 #     <dataset_root>/output/
 
-TASK="${1:-}"
-ACTION_SPACE="${2:-}"
-NUM_EPISODES="${3:-4}"
+DATASET_PATH=""
+START_EPISODE="0"
+NUM_EPISODES="4"
 
-if [[ -z "$TASK" || -z "$ACTION_SPACE" ]]; then
-  echo "Usage: bash scripts/generate_lerobot_rrd.sh <task> <eef|joint> [num_episodes]" >&2
-  exit 2
-fi
+usage() {
+  cat <<'EOF'
+Generate Rerun (.rrd) files for a local LeRobot v3 dataset.
 
-if [[ "$ACTION_SPACE" != "eef" && "$ACTION_SPACE" != "joint" ]]; then
-  echo "ERROR: action_space must be 'eef' or 'joint' (got: $ACTION_SPACE)" >&2
+Usage:
+  bash scripts/core/generate_lerobot_rrd.sh --dataset-path <path> [options]
+
+Required:
+  --dataset-path <path>   Path to one dataset folder, e.g. datasets/lerobot_trial_2/push_button_eef
+
+Optional:
+  --start-episode <N>     First episode index to export (default: 0)
+  --num-episodes <K>      Number of episodes to export (default: 4)
+  -h, --help              Show this help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dataset-path)
+      DATASET_PATH="${2:-}"
+      shift 2
+      ;;
+    --start-episode)
+      START_EPISODE="${2:-}"
+      shift 2
+      ;;
+    --num-episodes)
+      NUM_EPISODES="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "ERROR: Unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z "$DATASET_PATH" ]]; then
+  usage >&2
   exit 2
 fi
 
@@ -38,27 +78,27 @@ if [[ "$NUM_EPISODES" -lt 1 ]]; then
   exit 2
 fi
 
+if ! [[ "$START_EPISODE" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: start_episode must be a non-negative integer (got: $START_EPISODE)" >&2
+  exit 2
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Defaults (override via env vars if needed)
-DATASETS_ROOT="${DATASETS_ROOT:-$REPO_ROOT/datasets/lerobot_without_prompt}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
 TOLERANCE_S="${TOLERANCE_S:-1e-4}"
 VIDEO_BACKEND="${VIDEO_BACKEND:-pyav}"
 DISPLAY_COMPRESSED_IMAGES="${DISPLAY_COMPRESSED_IMAGES:-0}"
 
-DATASET_ID="${TASK}_${ACTION_SPACE}"
-DATASET_ROOT="$DATASETS_ROOT/$DATASET_ID"
+DATASET_ROOT="$DATASET_PATH"
+DATASET_ID="$(basename "$DATASET_ROOT")"
 OUTPUT_DIR="$DATASET_ROOT/output"
 
 if [[ ! -d "$DATASET_ROOT" ]]; then
   echo "ERROR: dataset folder not found: $DATASET_ROOT" >&2
-  if [[ -d "$DATASETS_ROOT" ]]; then
-    echo "Available datasets matching '$TASK':" >&2
-    ls -1 "$DATASETS_ROOT" 2>/dev/null | grep -E "^${TASK}_(eef|joint)$" >&2 || true
-  fi
   exit 2
 fi
 
@@ -81,10 +121,11 @@ fi
 
 echo "Dataset:  $DATASET_ROOT"
 echo "Output:   $OUTPUT_DIR"
-echo "Episodes: 0..$((NUM_EPISODES-1))"
+echo "Episodes: $START_EPISODE..$((START_EPISODE + NUM_EPISODES - 1))"
 
-ep=0
-while [[ "$ep" -lt "$NUM_EPISODES" ]]; do
+ep="$START_EPISODE"
+end_ep=$((START_EPISODE + NUM_EPISODES - 1))
+while [[ "$ep" -le "$end_ep" ]]; do
   echo "[run] episode $ep"
 
   cmd=(

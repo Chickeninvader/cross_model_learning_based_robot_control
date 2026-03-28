@@ -1,120 +1,111 @@
-# RLBench Scene Graph Data Collection
+# Data Collection Quick Reference
 
-This folder contains the scene-graph annotation and conversion tooling used by this repository.
+The canonical project documentation now lives in the repository-root
+`README.md`. This file keeps only the data-collection-specific quick reference.
 
-The recommended way to run the pipeline is through scripts in `scripts/core/`.
+## Main Files
 
-## Recommended Pipeline
+- `src/data_collection/RLBench_scene_graph_collection.ipynb`
+- `src/data_collection/apply_template_batch.py`
+- `src/data_collection/convert_rlbench_to_lerobot.py`
+- `src/utils/scene_graph_utils.py`
+- `scripts/core/dataset_generator.sh`
+- `scripts/core/apply_rlbench_scene_graph_templates.sh`
+- `scripts/core/convert_rlbench_to_lerobot_batch.sh`
 
-1. Generate RLBench task data (raw episodes).
-2. Create `info.json` for each task.
-3. Annotate one reference variation and save relationship template.
-4. Apply templates to all target tasks/variations.
-5. Convert RLBench -> LeRobot datasets.
-6. Merge all converted tasks into `all_task_eef` / `all_task_joint`.
+## Quick Workflow
 
-## 1) Generate RLBench raw data
-
-Use:
-
-```bash
-cd /workspace
-scripts/core/dataset_generator.sh <num_variations> <task1> [task2 ...]
-```
-
-Example:
+### 1. Generate raw RLBench data
 
 ```bash
-scripts/core/dataset_generator.sh 20 put_rubbish_in_bin meat_on_grill
+OUT_ROOT=datasets/rlbench_<run_name> bash scripts/core/dataset_generator.sh 20 put_rubbish_in_bin meat_on_grill
 ```
 
-Default output is under `datasets/rlbench_trial_2`.
+This writes to `OUT_ROOT` (required). Note that the current script default is
+`START_VARIATION=20`; set `START_VARIATION=0` if you want to start from variation
+0.
 
-## 2) Create `info.json` (once per task)
+### 2. Create `info.json` and annotate a template
 
-Open and run:
-
-- `src/data_collection/create_info_json.ipynb`
-
-Output:
-
-- `datasets/<rlbench_root>/<task>/info.json`
-
-`info.json` defines:
-
-- objects
-- relation types
-- object handle mapping (`object_mapping`)
-
-## 3) Annotate and save template
-
-Open and run:
+Open:
 
 - `src/data_collection/RLBench_scene_graph_collection.ipynb`
 
-Annotate one representative variation (usually `variation0`) and save:
+This notebook now covers both:
 
-- `<task>_relationship_template.json`
+- creating or updating `info.json`
+- saving `<task>_relationship_template.json`
 
-## 4) Apply templates in batch
+Expected task-level outputs:
 
-Use:
+- `$OUT_ROOT/<task>/info.json`
+- `$OUT_ROOT/<task>/<task>_relationship_template.json`
+
+### 3. Apply the template to all variations
 
 ```bash
-cd /workspace
-scripts/core/apply_rlbench_trial2_templates.sh \
-  --dataset-path /workspace/datasets/rlbench_trial_2 \
+bash scripts/core/apply_rlbench_scene_graph_templates.sh \
+  --dataset-path "$OUT_ROOT" \
   --episode 0 \
   --camera front
 ```
 
-Optional subset:
+Scene-graph-only run:
 
 ```bash
-scripts/core/apply_rlbench_trial2_templates.sh \
-  --dataset-path /workspace/datasets/rlbench_trial_2 \
+bash scripts/core/apply_rlbench_scene_graph_templates.sh \
+  --dataset-path "$OUT_ROOT" \
   --tasks "lamp_on,put_rubbish_in_bin" \
   --skip-videos
 ```
 
-Per variation outputs:
+Per-variation outputs:
 
 - `<task>_scene_graph.json`
 - `object_color_map.json`
-- optional videos (`episode_overlay.mp4`, `episode_mask.mp4`, `episode_mask_encoded.mp4`)
+- `episode_overlay.mp4`
+- `episode_mask.mp4`
+- `episode_mask_encoded.mp4`
 
-## 5) Convert RLBench -> LeRobot
-
-Use:
+### 4. Convert RLBench -> LeRobot
 
 ```bash
-cd /workspace
-scripts/core/convert_rlbench_to_lerobot_batch.sh \
-  --dataset-path /workspace/datasets/rlbench_trial_2 \
-  --output-root /workspace/datasets/lerobot_trial_2 \
+bash scripts/core/convert_rlbench_to_lerobot_batch.sh \
+  --dataset-path "$OUT_ROOT" \
+  --output-root datasets/lerobot_<run_name> \
   --action-space both
 ```
 
-Optional:
+Useful options:
 
 - `--tasks "task_a,task_b"`
 - `--use-context-prompt`
-- `--strict` (fail on task/variation error)
+- `--strict`
+- `--no-merge-all-tasks`
 
-Default behavior is fault-tolerant: missing/broken variations are skipped.
+## Cursor Guidance
+This data-collection guide is designed to work with the repo's Cursor rules and skills:
 
-## 6) Final merged datasets
+- Project rules: `.cursor/rules/python-robotics-src.mdc` and `.cursor/rules/shell-pipeline-scripts.mdc` to keep Python/shell conventions consistent.
+- Pipeline workflow skill: `.cursor/skills/robotics-pipeline-workflow/SKILL.md` for the correct step ordering (generate raw RLBench data -> create `info.json` and relationship templates -> apply templates across variations -> convert to LeRobot).
 
-After batch conversion, final merged datasets are created automatically:
+## Important Notes
 
-- `all_task_eef`
-- `all_task_joint`
+- `info.json` stores a reference `object_mapping`, not a fixed mapping that can
+  be reused blindly for every variation.
+- `apply_template_batch.py` re-resolves the actual per-variation handle mapping
+  through `discover_object_mapping()` before writing scene graphs.
+- object color names come from heuristic estimation in
+  `scene_graph_utils.py`; they are useful prompts, not guaranteed labels.
+- notebooks and scripts should be launched from the repo root with
+  `src` available on `PYTHONPATH`.
 
-under your `--output-root` (for example `datasets/lerobot_trial_2`).
+## Fast Troubleshooting
 
-## Quick Troubleshooting
-
-- Missing `low_dim_obs.pkl` in a variation: conversion skips that variation and continues.
-- Missing relationship template in a task: template apply script skips that task.
-- Need only scene graphs quickly: add `--skip-videos` in template apply step.
+- Missing `low_dim_obs.pkl`: conversion skips that variation unless `--strict`
+  is enabled.
+- Missing `<task>_relationship_template.json`: batch template apply skips that
+  task.
+- Need only JSON outputs: use `--skip-videos`.
+- Broader environment/debug notes live in `TROUBLESHOOTING.md`.
 
