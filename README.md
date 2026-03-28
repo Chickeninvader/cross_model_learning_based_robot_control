@@ -257,6 +257,35 @@ the top of `scripts/core/transfer_dataset_to_server.sh` (for example
 `REMOTE_HOST`, `REMOTE_DATASETS_DIR`). The transfer is resumable—if a run is
 interrupted, rerun the same command to continue.
 
+### Submit LeRobot training jobs (`training_script_log.sh`)
+
+From the **repository root** on Sol, this script submits **four** training runs (SmolVLA + GR00T, each in **eef** and **joint** modes) via `sbatch`, using the per-task LeRobot folders produced by conversion (`<task>_eef` and `<task>_joint` under a shared base directory).
+
+**Arguments (order matters):**
+
+1. **`<task_name>`** (required) — e.g. `lamp_on`, `put_rubbish_in_bin`. Must match dataset folder names `<task_name>_eef` and `<task_name>_joint`.
+2. **`--dataset-base <path>`** or **`-p <path>`** (optional) — parent directory that **contains** those folders, not the leaf dataset path. Default is `datasets/lerobot_trial_2`, or whatever you set in the environment variable **`DATASET_BASE`** before running the script.
+3. **`--debug`** or **`-d`** (optional) — run the model scripts **locally** (no `sbatch`) with a tiny step count for a quick sanity check.
+
+**Common mistake:** there is **no** `--dataset-root` flag. The script builds dataset roots itself as `<dataset-base>/<task_name>_eef` and `<dataset-base>/<task_name>_joint`. If you only pass `--dataset-root ...`, the shell treats the path as a second positional argument and you get `unexpected argument`.
+
+Examples:
+
+```bash
+# Default base: datasets/lerobot_trial_2 (or $DATASET_BASE if set)
+./src/training/training_script_log.sh put_rubbish_in_bin
+
+# Explicit base directory (same layout as conversion output-root)
+./src/training/training_script_log.sh put_rubbish_in_bin --dataset-base datasets/lerobot_trial_2
+
+# Short local test instead of sbatch
+./src/training/training_script_log.sh lamp_on --debug
+```
+
+If a folder like `datasets/lerobot_trial_2/<task>_eef` is missing, that model/mode pair is **skipped** with a message.
+
+For per-model flags and environment variables (`OUTPUT_DIR`, `WANDB_ENABLE`, etc.), see `src/training/run_smolvla_sol.sh` and `src/training/run_groot_sol.sh`.
+
 ### 6. Export `.rrd` files for inspection
 
 The current visualization script uses `--dataset-path`; the older positional

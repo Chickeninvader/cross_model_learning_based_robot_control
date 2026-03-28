@@ -3,13 +3,13 @@
 #SBATCH -N 1
 #SBATCH -c 16
 #SBATCH --mem=64G
-#SBATCH -t 8:00:00
+#SBATCH -t 32:00:00
 #SBATCH -G a100:1
 #SBATCH -p general
 #SBATCH -q public
 #SBATCH -J smolvla_lerobot
-#SBATCH -o /scratch/kpham34/cross_model_learning_based_robot_control/output/slurm_log/slurm_smolvla_%j.out
-#SBATCH -e /scratch/kpham34/cross_model_learning_based_robot_control/output/slurm_log/slurm_smolvla_%j.err
+#SBATCH -o /scratch/kpham34/cross_model_learning_based_robot_control/output/lerobot/slurm_smolvla_%j.out
+#SBATCH -e /scratch/kpham34/cross_model_learning_based_robot_control/output/lerobot/slurm_smolvla_%j.err
 #SBATCH --export=NONE
 
 set -euo pipefail
@@ -24,7 +24,8 @@ set -euo pipefail
 # Environment variable overrides:
 #   TASK_NAME, DATASET_KIND, DATASET_ID, DATASET_ROOT
 #   BATCH_SIZE, NUM_STEPS, SAVE_FREQ, LOG_FREQ, NUM_PROCESSES, NUM_WORKERS
-#   MIXED_PRECISION, VIDEO_BACKEND, WANDB_ENABLE, POLICY_PATH, POLICY_DEVICE
+#   MIXED_PRECISION, VIDEO_BACKEND, WANDB_ENABLE, WANDB_DISABLE_ARTIFACT
+#   WANDB_MODE, WANDB_CACHE_DIR, POLICY_PATH, POLICY_DEVICE
 # ---------------------------------------------------------------------------
 
 REPO_ROOT="/scratch/kpham34/cross_model_learning_based_robot_control"
@@ -136,6 +137,8 @@ export LOG_FREQ="${LOG_FREQ:-50}"
 export NUM_PROCESSES="${NUM_PROCESSES:-1}"
 export NUM_WORKERS="${NUM_WORKERS:-8}"
 export WANDB_ENABLE="${WANDB_ENABLE:-true}"
+export WANDB_DISABLE_ARTIFACT="${WANDB_DISABLE_ARTIFACT:-true}"
+export WANDB_MODE="${WANDB_MODE:-online}"
 
 if [[ "${DEBUG_MODE}" -eq 1 ]]; then
   # Debug mode only reduces step count; batch size remains unchanged.
@@ -148,6 +151,11 @@ export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_HOME}/hub}"
 mkdir -p "${HF_HOME}" "${TRANSFORMERS_CACHE}" "${HF_DATASETS_CACHE}" "${HUGGINGFACE_HUB_CACHE}"
+
+# Keep WandB cache in project space and disable large artifact uploads by default.
+# This prevents ~/.cache/wandb from growing rapidly during long runs.
+export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-${REPO_ROOT}/output/wandb_cache}"
+mkdir -p "${WANDB_CACHE_DIR}"
 
 if [[ ! -d "${DATASET_ROOT}" ]]; then
   echo "Error: dataset directory not found: ${DATASET_ROOT}"
@@ -172,6 +180,9 @@ echo "NUM_WORKERS      : ${NUM_WORKERS}"
 echo "MIXED_PRECISION  : ${MIXED_PRECISION}"
 echo "VIDEO_BACKEND    : ${VIDEO_BACKEND}"
 echo "WANDB_ENABLE     : ${WANDB_ENABLE}"
+echo "WANDB_MODE       : ${WANDB_MODE}"
+echo "WANDB_DISABLE_ARTIFACT : ${WANDB_DISABLE_ARTIFACT}"
+echo "WANDB_CACHE_DIR  : ${WANDB_CACHE_DIR}"
 echo "RENAME_MAP       : ${RENAME_MAP}"
 echo "DEBUG_MODE       : ${DEBUG_MODE}"
 if [[ ${#EXTRA_TRAIN_ARGS[@]} -gt 0 ]]; then
@@ -207,6 +218,8 @@ accelerate launch \
   --dataset.video_backend="${VIDEO_BACKEND}" \
   --rename_map="${RENAME_MAP}" \
   --wandb.enable="${WANDB_ENABLE}" \
+  --wandb.mode="${WANDB_MODE}" \
+  --wandb.disable_artifact="${WANDB_DISABLE_ARTIFACT}" \
   "${EXTRA_TRAIN_ARGS[@]}"
 
 echo "Saved outputs to: ${OUTPUT_DIR}"
