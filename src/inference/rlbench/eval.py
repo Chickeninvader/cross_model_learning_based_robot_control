@@ -63,6 +63,8 @@ from src.utils.rlbench_eval_task_utils import (
 from src.utils.rlbench_eval_setup import (
     build_action_mode,
     build_obs_config,
+    infer_expected_with_context_prompt,
+    load_checkpoint_train_dataset_metadata,
     write_csv,
     write_json,
 )
@@ -105,6 +107,7 @@ def _evaluate_single_task(
     args: argparse.Namespace,
     rlbench_root: Path,
     save_path: str,
+    eval_metadata: dict[str, object],
 ) -> dict:
     """Run evaluation for one task.  Env and policy stay alive across calls."""
 
@@ -168,7 +171,6 @@ def _evaluate_single_task(
         )
         task_steps = runtime_task_steps if runtime_task_steps else fallback_task_steps
         task_description = " ".join(task_steps).strip()
-
         _descriptions, _initial_obs = task_env.reset_to_demo(planner_demo)
         last_expert_idx = max(0, len(planner_obs) - 1)
         gripper_changes = gripper_change_indices(planner_obs)
@@ -193,7 +195,6 @@ def _evaluate_single_task(
         for ep_idx in range(n_segments):
             step_text = segment_instructions[ep_idx]
             seg_start, seg_end = ranges[ep_idx]
-
             # Advance the effective start by offset frames so the policy
             # begins from a snapshot captured during the live planner run
             # rather than the imperfect reset_to_demo reconstruction.
@@ -351,6 +352,16 @@ def _evaluate_single_task(
             "seed": run_seed,
             "variation": args.variation,
             "robot_setup": args.robot_setup,
+            "with_context_prompt": bool(args.with_context_prompt),
+            "requested_with_context_prompt": eval_metadata.get("requested_with_context_prompt"),
+            "expected_with_context_prompt": eval_metadata.get("expected_with_context_prompt"),
+            "prompt_inference_source": eval_metadata.get("inference_source"),
+            "checkpoint": args.checkpoint,
+            "dataset_root": args.dataset_root,
+            "pretrained_model_dir": eval_metadata.get("pretrained_model_dir"),
+            "train_config_path": eval_metadata.get("train_config_path"),
+            "train_dataset_repo_id": eval_metadata.get("train_dataset_repo_id"),
+            "train_dataset_root": eval_metadata.get("train_dataset_root"),
             "task_description": task_description,
             "task_steps": task_steps,
             "segment_instructions": segment_instructions,
@@ -398,6 +409,16 @@ def _evaluate_single_task(
         "seed": args.seed,
         "robot_setup": args.robot_setup,
         "action_mode": args.action_mode,
+        "with_context_prompt": bool(args.with_context_prompt),
+        "requested_with_context_prompt": eval_metadata.get("requested_with_context_prompt"),
+        "expected_with_context_prompt": eval_metadata.get("expected_with_context_prompt"),
+        "prompt_inference_source": eval_metadata.get("inference_source"),
+        "checkpoint": args.checkpoint,
+        "dataset_root": args.dataset_root,
+        "pretrained_model_dir": eval_metadata.get("pretrained_model_dir"),
+        "train_config_path": eval_metadata.get("train_config_path"),
+        "train_dataset_repo_id": eval_metadata.get("train_dataset_repo_id"),
+        "train_dataset_root": eval_metadata.get("train_dataset_root"),
         "num_episodes": max_episodes,
         "num_instruction_episodes": max_episodes,
         "all_episode_success_rate": mean_or_none(all_episode_success),
@@ -487,13 +508,32 @@ def run_evaluation(args: argparse.Namespace) -> None:
     )
 
     rlbench_root = Path(args.rlbench_root).resolve() if args.rlbench_root else (_project_root / "datasets" / "rlbench")
-
+    eval_metadata: dict[str, object] = {
+        "requested_with_context_prompt": bool(args.with_context_prompt),
+        "checkpoint_path_input": args.checkpoint,
+        "dataset_root_input": args.dataset_root,
+    }
+    eval_metadata.update(load_checkpoint_train_dataset_metadata(args.checkpoint))
+    prompt_mode_meta = infer_expected_with_context_prompt(
+        dataset_root=args.dataset_root,
+        train_dataset_root=eval_metadata.get("train_dataset_root"),
+    )
+    eval_metadata.update(prompt_mode_meta)
+    expected_with_context = prompt_mode_meta.get("expected_with_context_prompt")
+    if isinstance(expected_with_context, bool) and bool(args.with_context_prompt) != expected_with_context:
+        print(
+            "[eval] with_context_prompt mismatch detected; "
+            f"requested={bool(args.with_context_prompt)} expected={expected_with_context}. "
+            "Auto-aligning to expected mode from dataset metadata."
+        )
+        args.with_context_prompt = expected_with_context
+    eval_metadata["with_context_prompt"] = bool(args.with_context_prompt)
     all_summaries: list[dict] = []
     for task_name in task_list:
         task_save_path = os.path.join(args.save_path, task_name) if len(task_list) > 1 else args.save_path
         try:
             summary = _evaluate_single_task(
-                task_name, env, policy, args, rlbench_root, task_save_path,
+                task_name, env, policy, args, rlbench_root, task_save_path, eval_metadata,
             )
             all_summaries.append(summary)
         except Exception as exc:

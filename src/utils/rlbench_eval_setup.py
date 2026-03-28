@@ -117,3 +117,142 @@ def discover_task_roots(aggregate_root: Path, fallback_task_name: str) -> list[t
         if any(_is_policy_state_dir(p) for p in child.iterdir() if p.is_dir()):
             task_roots.append((child.name, child))
     return task_roots
+
+
+def _read_first_task_string(dataset_root: str | None) -> str | None:
+    if not dataset_root:
+        return None
+    tasks_path = Path(dataset_root).expanduser() / "meta" / "tasks.parquet"
+    if not tasks_path.is_file():
+        return None
+
+    try:
+        import pyarrow.parquet as pq  # type: ignore
+
+        table = pq.read_table(tasks_path, columns=[], use_threads=False)
+        # The index written by pandas is usually restored as "__index_level_0__".
+        # Read full table if needed to access index-like column.
+        if "__index_level_0__" not in table.column_names:
+            table = pq.read_table(tasks_path, use_threads=False)
+        if "__index_level_0__" in table.column_names and table.num_rows > 0:
+            value = table["__index_level_0__"][0].as_py()
+            return str(value) if value is not None else None
+    except Exception:
+        pass
+
+    try:
+        import pandas as pd  # type: ignore
+
+        df = pd.read_parquet(tasks_path)
+        if len(df.index) > 0:
+            return str(df.index[0])
+    except Exception:
+        return None
+    return None
+
+
+def infer_expected_with_context_prompt(
+    *,
+    dataset_root: str | None,
+    train_dataset_root: str | None,
+) -> dict[str, object]:
+    """Infer whether eval should use context prompt to match training style."""
+    out: dict[str, object] = {
+        "expected_with_context_prompt": None,
+        "inference_source": None,
+        "sample_task_text": None,
+    }
+
+    sample = _read_first_task_string(dataset_root)
+    if sample:
+        out["sample_task_text"] = sample
+        out["expected_with_context_prompt"] = sample.startswith(
+            "This prompt describes a robotic manipulation task using scene graphs."
+        )
+        out["inference_source"] = "dataset_tasks_parquet"
+        return out
+
+    root_for_heuristic = str(train_dataset_root or dataset_root or "")
+    lowered = root_for_heuristic.lower()
+    if "lerobot_trial_3" in lowered or "lerobot_trial3" in lowered:
+        out["expected_with_context_prompt"] = True
+        out["inference_source"] = "dataset_root_heuristic_trial3"
+    elif "lerobot_trial_2" in lowered or "lerobot_trial2" in lowered:
+        out["expected_with_context_prompt"] = False
+        out["inference_source"] = "dataset_root_heuristic_trial2"
+
+    return out
+
+
+def _resolve_pretrained_model_dir(checkpoint_path: str | Path) -> Path | None:
+    """Resolve a user checkpoint path to a LeRobot pretrained_model directory."""
+    p = Path(checkpoint_path).expanduser()
+
+    if (p / "config.json").is_file():
+        return p
+
+    if (p / "pretrained_model" / "config.json").is_file():
+        return p / "pretrained_model"
+
+    last = p / "checkpoints" / "last" / "pretrained_model"
+    if (last / "config.json").is_file():
+        return last
+
+    ckpt_root = p / "checkpoints"
+    if not ckpt_root.is_dir():
+        return None
+
+    candidates: list[Path] = []
+    for ckpt_dir in ckpt_root.iterdir():
+        if not ckpt_dir.is_dir():
+            continue
+        pm = ckpt_dir / "pretrained_model"
+        if (pm / "config.json").is_file():
+            candidates.append(pm)
+
+    if not candidates:
+        return None
+
+    def _score(pm_dir: Path) -> tuple[int, str]:
+        name = pm_dir.parent.name
+        return (int(name) if name.isdigit() else -1, name)
+
+    candidates.sort(key=_score)
+    return candidates[-1]
+
+
+def load_checkpoint_train_dataset_metadata(checkpoint_path: str | None) -> dict[str, str | None]:
+    """Read dataset provenance from checkpoint train_config.json if available."""
+    out: dict[str, str | None] = {
+        "checkpoint_path_input": checkpoint_path,
+        "pretrained_model_dir": None,
+        "train_config_path": None,
+        "train_dataset_repo_id": None,
+        "train_dataset_root": None,
+    }
+    if not checkpoint_path:
+        return out
+
+    pm_dir = _resolve_pretrained_model_dir(checkpoint_path)
+    if pm_dir is None:
+        return out
+
+    out["pretrained_model_dir"] = str(pm_dir)
+    train_config_path = pm_dir / "train_config.json"
+    if not train_config_path.is_file():
+        return out
+
+    out["train_config_path"] = str(train_config_path)
+    try:
+        with open(train_config_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return out
+
+    dataset_cfg = payload.get("dataset", {}) if isinstance(payload, dict) else {}
+    if isinstance(dataset_cfg, dict):
+        repo_id = dataset_cfg.get("repo_id")
+        root = dataset_cfg.get("root")
+        out["train_dataset_repo_id"] = str(repo_id) if repo_id is not None else None
+        out["train_dataset_root"] = str(root) if root is not None else None
+    return out

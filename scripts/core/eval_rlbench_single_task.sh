@@ -20,7 +20,9 @@ CHECKPOINT_ROOT="${WORKSPACE_ROOT}/output/lerobot"
 DATASET_PARENT="${WORKSPACE_ROOT}/datasets/lerobot"
 RLBENCH_ROOT="${WORKSPACE_ROOT}/datasets/rlbench"
 SAVE_ROOT=""
+SAVE_ROOT_SET=0
 ROBOT_SETUP="panda"
+WITH_CONTEXT_PROMPT=0
 
 POLICIES="smolvla,groot"
 STATES="eef,joint"
@@ -46,7 +48,8 @@ Options:
   --checkpoint_root PATH     Root of training outputs (default: ${CHECKPOINT_ROOT})
   --dataset_parent PATH      Parent of dataset roots (default: ${DATASET_PARENT})
   --rlbench_root PATH        RLBench scene-graph templates (default: ${RLBENCH_ROOT})
-  --save_root PATH           Output root (default: output/rlbench_eval/<task>)
+  --save_root PATH           Output root (default: output/rlbench_eval/<task>[_with_context_prompt])
+  --with_context_prompt      Use context prompt instructions and save root suffix
   --robot_setup NAME         RLBench robot: panda,jaco,mico,sawyer,ur5 (default: ${ROBOT_SETUP})
   --policies CSV             Policies (default: ${POLICIES})
   --states CSV               States (default: ${STATES})
@@ -71,7 +74,8 @@ while [[ $# -gt 0 ]]; do
     --checkpoint_root) CHECKPOINT_ROOT="$2"; shift 2 ;;
     --dataset_parent) DATASET_PARENT="$2"; shift 2 ;;
     --rlbench_root) RLBENCH_ROOT="$2"; shift 2 ;;
-    --save_root) SAVE_ROOT="$2"; shift 2 ;;
+    --save_root) SAVE_ROOT="$2"; SAVE_ROOT_SET=1; shift 2 ;;
+    --with_context_prompt) WITH_CONTEXT_PROMPT=1; shift ;;
     --robot_setup) ROBOT_SETUP="$2"; shift 2 ;;
     --policies) POLICIES="$2"; shift 2 ;;
     --states) STATES="$2"; shift 2 ;;
@@ -84,8 +88,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "${SAVE_ROOT}" ]]; then
-  SAVE_ROOT="${WORKSPACE_ROOT}/output/rlbench_eval/${TASK}"
+if [[ "${SAVE_ROOT_SET}" -eq 0 ]]; then
+  if [[ "${WITH_CONTEXT_PROMPT}" -eq 1 ]]; then
+    SAVE_ROOT="${WORKSPACE_ROOT}/output/rlbench_eval/${TASK}_with_context_prompt"
+  else
+    SAVE_ROOT="${WORKSPACE_ROOT}/output/rlbench_eval/${TASK}"
+  fi
 fi
 mkdir -p "${SAVE_ROOT}"
 
@@ -153,6 +161,50 @@ find_latest_training_dir() {
   echo "${best_path}"
 }
 
+infer_trial_rlbench_root_from_dataset_parent() {
+  local base suffix candidate
+  base="$(basename "${DATASET_PARENT}")"
+  suffix=""
+  if [[ "${base}" =~ ^lerobot_trial_([0-9]+)$ ]]; then
+    suffix="${BASH_REMATCH[1]}"
+  elif [[ "${base}" =~ ^lerobot_trial([0-9]+)$ ]]; then
+    suffix="${BASH_REMATCH[1]}"
+  fi
+  [[ -n "${suffix}" ]] || return 1
+  candidate="${WORKSPACE_ROOT}/datasets/rlbench_trial_${suffix}"
+  [[ -d "${candidate}" ]] || return 1
+  echo "${candidate}"
+}
+
+# CoppeliaSim uses Qt (xcb). RLBench headless=True still launches the sim GUI stack.
+run_with_display_if_needed() {
+  if [[ -n "${DISPLAY:-}" ]]; then
+    "$@"
+    return $?
+  fi
+  if command -v xvfb-run >/dev/null 2>&1; then
+    echo "[eval_rlbench_single_task] DISPLAY unset; using xvfb-run for CoppeliaSim/Qt" >&2
+    xvfb-run -a "$@"
+    return $?
+  fi
+  echo "[ERROR] DISPLAY is not set and xvfb-run was not found. CoppeliaSim/Qt needs an X server." >&2
+  echo "  Install xvfb (e.g. apt install xvfb) or run: Xvfb :99 -screen 0 1024x768x24 & export DISPLAY=:99" >&2
+  echo "  See TROUBLESHOOTING.md (RLBench headless rendering)." >&2
+  return 1
+}
+
+template_path="${RLBENCH_ROOT}/${TASK}/${TASK}_relationship_template.json"
+if [[ ! -f "${template_path}" ]]; then
+  if inferred_rlbench_root="$(infer_trial_rlbench_root_from_dataset_parent)"; then
+    inferred_template="${inferred_rlbench_root}/${TASK}/${TASK}_relationship_template.json"
+    if [[ -f "${inferred_template}" ]]; then
+      echo "[eval_rlbench_single_task] relationship template missing at ${template_path}" >&2
+      echo "[eval_rlbench_single_task] auto-switching rlbench_root to ${inferred_rlbench_root}" >&2
+      RLBENCH_ROOT="${inferred_rlbench_root}"
+    fi
+  fi
+fi
+
 declare -a VARIATIONS=()
 if [[ -n "${VARIATION_LIST}" ]]; then
   IFS=',' read -r -a VARIATIONS <<< "${VARIATION_LIST}"
@@ -177,7 +229,7 @@ fi
 IFS=',' read -r -a POLICIES_ARR <<< "${POLICIES}"
 IFS=',' read -r -a STATES_ARR <<< "${STATES}"
 
-echo "[eval_rlbench_single_task] task=${TASK} robot_setup=${ROBOT_SETUP} save_root=${SAVE_ROOT} runs=${RUNS}"
+echo "[eval_rlbench_single_task] task=${TASK} robot_setup=${ROBOT_SETUP} save_root=${SAVE_ROOT} runs=${RUNS} with_context_prompt=${WITH_CONTEXT_PROMPT}"
 
 if [[ "${SUMMARIZE_ONLY}" -eq 0 ]]; then
   for policy in "${POLICIES_ARR[@]}"; do
@@ -224,9 +276,12 @@ if [[ "${SUMMARIZE_ONLY}" -eq 0 ]]; then
       if [[ -n "${DEVICE}" ]]; then
         cmd+=(--device "${DEVICE}")
       fi
+      if [[ "${WITH_CONTEXT_PROMPT}" -eq 1 ]]; then
+        cmd+=(--with_context_prompt)
+      fi
       echo "Command: ${cmd[*]}"
       if [[ "${DRY_RUN}" -eq 0 ]]; then
-        "${cmd[@]}"
+        run_with_display_if_needed "${cmd[@]}"
       fi
     done
   done

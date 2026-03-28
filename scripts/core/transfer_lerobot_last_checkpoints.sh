@@ -13,6 +13,8 @@ REMOTE_OUTPUT_DIR="${REMOTE_OUTPUT_DIR:-/scratch/kpham34/cross_model_learning_ba
 LOCAL_OUTPUT_DIR="${LOCAL_OUTPUT_DIR:-$HOME/Desktop/cross_model_learning_based_robot_control/output/lerobot}"
 STATE_FILE="${STATE_FILE:-$LOCAL_OUTPUT_DIR/.transferred_last_checkpoints.tsv}"
 SSH_CONTROL_PATH="${SSH_CONTROL_PATH:-$HOME/.ssh/cm-%r@%h:%p}"
+MAX_PARALLEL_TRANSFERS="${MAX_PARALLEL_TRANSFERS:-$(nproc)}"
+SCP_ENABLE_COMPRESSION="${SCP_ENABLE_COMPRESSION:-1}"
 
 mkdir -p "$LOCAL_OUTPUT_DIR"
 touch "$STATE_FILE"
@@ -22,6 +24,15 @@ SSH_COMMON_OPTS=(
     -o ControlPersist=600
     -o "ControlPath=$SSH_CONTROL_PATH"
 )
+RSYNC_SSH_CMD=(ssh "${SSH_COMMON_OPTS[@]}")
+RSYNC_OPTS=(
+    -a
+    --partial
+    --append-verify
+)
+if [[ "$SCP_ENABLE_COMPRESSION" == "1" ]]; then
+    RSYNC_OPTS+=(--compress)
+fi
 
 log() {
     printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
@@ -60,7 +71,7 @@ state_add() {
 }
 
 bootstrap_existing_local() {
-    local run_dir run_name last_link resolved_target local_ckpt_root ckpt_dir ckpt_name
+    local run_dir run_name last_link resolved_target local_ckpt_root
     shopt -s nullglob
     for run_dir in "$LOCAL_OUTPUT_DIR"/*; do
         [[ -d "$run_dir" ]] || continue
@@ -78,6 +89,9 @@ bootstrap_existing_local() {
         fi
 
         # Fallback for already-copied runs that do not have a local `last` symlink.
+        # Only trust an explicit local `checkpoints/last` directory marker.
+        # Do not infer completion from numeric checkpoint directories because
+        # interrupted transfers can create partial trees that look valid.
         local_ckpt_root="$run_dir/checkpoints"
         [[ -d "$local_ckpt_root" ]] || continue
         if [[ -d "$local_ckpt_root/last" ]]; then
@@ -86,17 +100,6 @@ bootstrap_existing_local() {
                 state_add "$run_name" "$resolved_target" "bootstrap-local"
             fi
         fi
-        for ckpt_dir in "$local_ckpt_root"/*; do
-            [[ -d "$ckpt_dir" ]] || continue
-            ckpt_name="$(basename "$ckpt_dir")"
-            [[ "$ckpt_name" =~ ^[0-9]+$ ]] || continue
-            if [[ -d "$ckpt_dir/pretrained_model" || -d "$ckpt_dir/training_state" ]]; then
-                resolved_target="${REMOTE_OUTPUT_DIR}/${run_name}/checkpoints/${ckpt_name}"
-                if ! state_has "$run_name" "$resolved_target"; then
-                    state_add "$run_name" "$resolved_target" "bootstrap-local"
-                fi
-            fi
-        done
     done
 }
 
@@ -132,24 +135,39 @@ transfer_one() {
     local_ckpt_root="$local_run_dir/checkpoints"
     local_ckpt_dirname="$(basename "$remote_ckpt_path")"
 
-    mkdir -p "$local_ckpt_root"
-    log "Transferring $run_name ($local_ckpt_dirname)"
-    scp "${SSH_COMMON_OPTS[@]}" -r "${REMOTE_HOST}:${remote_ckpt_path}" "$local_ckpt_root/"
+    mkdir -p "$local_ckpt_root/$local_ckpt_dirname"
+    log "Transferring $run_name ($local_ckpt_dirname) via rsync"
+    rsync "${RSYNC_OPTS[@]}" -e "${RSYNC_SSH_CMD[*]}" \
+        "${REMOTE_HOST}:${remote_ckpt_path}/" \
+        "$local_ckpt_root/$local_ckpt_dirname/"
     if [[ "$local_ckpt_dirname" != "last" ]]; then
         ln -sfn "$local_ckpt_dirname" "$local_ckpt_root/last"
     fi
-    state_add "$run_name" "$remote_ckpt_path" "scp"
+    state_add "$run_name" "$remote_ckpt_path" "rsync"
 }
 
 main() {
-    local line run_name remote_ckpt_path transferred_count skipped_count
+    local run_name remote_ckpt_path transferred_count skipped_count failed_count pid
+    local -a pids
     transferred_count=0
     skipped_count=0
+    failed_count=0
+    pids=()
+
+    if ! [[ "$MAX_PARALLEL_TRANSFERS" =~ ^[1-9][0-9]*$ ]]; then
+        log "Invalid MAX_PARALLEL_TRANSFERS=$MAX_PARALLEL_TRANSFERS (must be positive int), using 1"
+        MAX_PARALLEL_TRANSFERS=1
+    fi
+    if ! command -v rsync >/dev/null 2>&1; then
+        log "rsync not found on local machine. Please install rsync and rerun."
+        return 1
+    fi
 
     start_master_connection
     trap stop_master_connection EXIT
 
     bootstrap_existing_local
+    log "Starting transfer scan with MAX_PARALLEL_TRANSFERS=$MAX_PARALLEL_TRANSFERS SCP_ENABLE_COMPRESSION=$SCP_ENABLE_COMPRESSION"
 
     while IFS=$'\t' read -r run_name remote_ckpt_path; do
         [[ -n "${run_name:-}" && -n "${remote_ckpt_path:-}" ]] || continue
@@ -160,11 +178,28 @@ main() {
             continue
         fi
 
-        transfer_one "$run_name" "$remote_ckpt_path"
-        transferred_count=$((transferred_count + 1))
+        transfer_one "$run_name" "$remote_ckpt_path" &
+        pids+=("$!")
+
+        # Throttle background jobs to configured concurrency.
+        while (( $(jobs -pr | wc -l) >= MAX_PARALLEL_TRANSFERS )); do
+            sleep 0.2
+        done
     done < <(list_remote_last_targets)
 
-    log "Done. transferred=$transferred_count skipped=$skipped_count state_file=$STATE_FILE"
+    for pid in "${pids[@]}"; do
+        if wait "$pid"; then
+            transferred_count=$((transferred_count + 1))
+        else
+            failed_count=$((failed_count + 1))
+            log "A transfer job failed (pid=$pid)"
+        fi
+    done
+
+    log "Done. transferred=$transferred_count skipped=$skipped_count failed=$failed_count state_file=$STATE_FILE"
+    if (( failed_count > 0 )); then
+        return 1
+    fi
 }
 
 main "$@"

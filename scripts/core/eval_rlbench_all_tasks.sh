@@ -27,8 +27,10 @@ DATASET_MODE="all"   # all|task
 ALL_DATASET_PREFIX="all_task"
 
 RLBENCH_ROOT="${WORKSPACE_ROOT}/datasets/rlbench"
-SAVE_ROOT="${WORKSPACE_ROOT}/output/rlbench_eval/all_tasks"
+SAVE_ROOT=""
+SAVE_ROOT_SET=0
 DEFAULT_TASK_DESCRIPTION=""
+WITH_CONTEXT_PROMPT=0
 
 # RLBench robot (passed to eval.py --robot_setup). Non-panda outputs go under
 # ${SAVE_ROOT}/${policy}_${state}_${ROBOT_SETUP} to avoid overwriting panda runs.
@@ -60,7 +62,8 @@ Options:
   --dataset_mode MODE       all|task (default: ${DATASET_MODE})
   --all_dataset_prefix STR  Prefix for all-task dataset roots (default: ${ALL_DATASET_PREFIX})
   --rlbench_root PATH       RLBench templates root (default: ${RLBENCH_ROOT})
-  --save_root PATH          Output root (default: ${SAVE_ROOT})
+  --save_root PATH          Output root (default: dynamic by prompt mode)
+  --with_context_prompt     Use context prompt instructions and default save root suffix
   --robot_setup NAME        RLBench robot: panda,jaco,mico,sawyer,ur5 (default: ${ROBOT_SETUP})
   --default_task_description TEXT
                             Optional explicit override passed to eval.py
@@ -94,7 +97,8 @@ while [[ $# -gt 0 ]]; do
     --dataset_mode) DATASET_MODE="$2"; shift 2 ;;
     --all_dataset_prefix) ALL_DATASET_PREFIX="$2"; shift 2 ;;
     --rlbench_root) RLBENCH_ROOT="$2"; shift 2 ;;
-    --save_root) SAVE_ROOT="$2"; shift 2 ;;
+    --save_root) SAVE_ROOT="$2"; SAVE_ROOT_SET=1; shift 2 ;;
+    --with_context_prompt) WITH_CONTEXT_PROMPT=1; shift ;;
     --robot_setup) ROBOT_SETUP="$2"; shift 2 ;;
     --default_task_description) DEFAULT_TASK_DESCRIPTION="$2"; shift 2 ;;
     --python) PYTHON_BIN="$2"; shift 2 ;;
@@ -113,6 +117,14 @@ fi
 if [[ "${DATASET_MODE}" != "all" && "${DATASET_MODE}" != "task" ]]; then
   echo "[ERROR] --dataset_mode must be one of: all, task" >&2
   exit 1
+fi
+
+if [[ "${SAVE_ROOT_SET}" -eq 0 ]]; then
+  if [[ "${WITH_CONTEXT_PROMPT}" -eq 1 ]]; then
+    SAVE_ROOT="${WORKSPACE_ROOT}/output/rlbench_eval/all_tasks_with_context_prompt"
+  else
+    SAVE_ROOT="${WORKSPACE_ROOT}/output/rlbench_eval/all_tasks"
+  fi
 fi
 
 if [[ "${CHECKPOINT_ROOT}" != /* ]]; then
@@ -265,6 +277,39 @@ dataset_root_for() {
   fi
 }
 
+infer_trial_rlbench_root_from_dataset_parent() {
+  local base suffix candidate
+  base="$(basename "${DATASET_PARENT}")"
+  suffix=""
+  if [[ "${base}" =~ ^lerobot_trial_([0-9]+)$ ]]; then
+    suffix="${BASH_REMATCH[1]}"
+  elif [[ "${base}" =~ ^lerobot_trial([0-9]+)$ ]]; then
+    suffix="${BASH_REMATCH[1]}"
+  fi
+  [[ -n "${suffix}" ]] || return 1
+  candidate="${WORKSPACE_ROOT}/datasets/rlbench_trial_${suffix}"
+  [[ -d "${candidate}" ]] || return 1
+  echo "${candidate}"
+}
+
+# CoppeliaSim uses Qt (xcb). RLBench headless=True still launches the sim GUI stack.
+# When DISPLAY is unset, Qt aborts unless we provide a virtual framebuffer.
+run_with_display_if_needed() {
+  if [[ -n "${DISPLAY:-}" ]]; then
+    "$@"
+    return $?
+  fi
+  if command -v xvfb-run >/dev/null 2>&1; then
+    echo "[eval_rlbench_all_tasks] DISPLAY unset; using xvfb-run for CoppeliaSim/Qt" >&2
+    xvfb-run -a "$@"
+    return $?
+  fi
+  echo "[ERROR] DISPLAY is not set and xvfb-run was not found. CoppeliaSim/Qt needs an X server." >&2
+  echo "  Install xvfb (e.g. apt install xvfb) or run: Xvfb :99 -screen 0 1024x768x24 & export DISPLAY=:99" >&2
+  echo "  See TROUBLESHOOTING.md (RLBench headless rendering)." >&2
+  return 1
+}
+
 mkdir -p "${SAVE_ROOT}"
 
 IFS=',' read -r -a POLICIES_ARR <<< "${POLICIES}"
@@ -272,7 +317,20 @@ IFS=',' read -r -a STATES_ARR <<< "${STATES}"
 
 TASKS_CSV="$(IFS=','; echo "${TASKS_ARR[*]}")"
 
-echo "[eval_rlbench_all_tasks] robot_setup=${ROBOT_SETUP} save_root=${SAVE_ROOT} runs=${RUNS} tasks=${#TASKS_ARR[@]}"
+first_task="${TASKS_ARR[0]}"
+template_path="${RLBENCH_ROOT}/${first_task}/${first_task}_relationship_template.json"
+if [[ ! -f "${template_path}" ]]; then
+  if inferred_rlbench_root="$(infer_trial_rlbench_root_from_dataset_parent)"; then
+    inferred_template="${inferred_rlbench_root}/${first_task}/${first_task}_relationship_template.json"
+    if [[ -f "${inferred_template}" ]]; then
+      echo "[eval_rlbench_all_tasks] relationship template missing at ${template_path}" >&2
+      echo "[eval_rlbench_all_tasks] auto-switching rlbench_root to ${inferred_rlbench_root}" >&2
+      RLBENCH_ROOT="${inferred_rlbench_root}"
+    fi
+  fi
+fi
+
+echo "[eval_rlbench_all_tasks] robot_setup=${ROBOT_SETUP} save_root=${SAVE_ROOT} runs=${RUNS} tasks=${#TASKS_ARR[@]} with_context_prompt=${WITH_CONTEXT_PROMPT}"
 
 if [[ "${SUMMARIZE_ONLY}" -eq 0 ]]; then
   for policy in "${POLICIES_ARR[@]}"; do
@@ -285,7 +343,6 @@ if [[ "${SUMMARIZE_ONLY}" -eq 0 ]]; then
 
       # For multi-task checkpoint we use the first task's dataset root as
       # reference (the policy was trained on the joint dataset).
-      first_task="${TASKS_ARR[0]}"
       dataset_root="$(dataset_root_for "${first_task}" "${state}")"
 
       if ! checkpoint_dir="$(find_latest_all_task_training_dir "${policy}" "${state}")"; then
@@ -324,9 +381,12 @@ if [[ "${SUMMARIZE_ONLY}" -eq 0 ]]; then
       if [[ -n "${DEVICE}" ]]; then
         cmd+=(--device "${DEVICE}")
       fi
+      if [[ "${WITH_CONTEXT_PROMPT}" -eq 1 ]]; then
+        cmd+=(--with_context_prompt)
+      fi
       echo "Command: ${cmd[*]}"
       if [[ "${DRY_RUN}" -eq 0 ]]; then
-        "${cmd[@]}"
+        run_with_display_if_needed "${cmd[@]}"
       fi
     done
   done

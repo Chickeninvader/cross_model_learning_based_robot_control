@@ -142,6 +142,8 @@ def convert(
     episode_index_in_rlbench: int = 0,
     use_context_prompt: bool = False,
     action_space: str = "eef",
+    image_width: int | None = 128,
+    image_height: int | None = 128,
 ):
     """Convert one RLBench variation into a LeRobot v3 dataset.
 
@@ -166,6 +168,9 @@ def convert(
         Which control/action space to export:
           - "eef"   : observation.state + action (delta EEF)  [x y z qx qy qz qw gripper]
             - "joint" : observation.state + action (joint velocity) [q0..q6 gripper]
+    image_width, image_height : int | None
+        Target video width/height for LeRobot RGB mp4s. Both must be positive.
+        If either is None or <= 0, frames keep the native RLBench PNG resolution.
     """
     # -- Paths ---------------------------------------------------------------
     var_dir = os.path.join(rlbench_root, task_name, f"variation{variation}")
@@ -180,6 +185,20 @@ def convert(
     out_dir = os.path.join(output_root, dataset_name)
 
     print(f"[INFO] Converting {var_dir} -> {out_dir}")
+
+    use_resize = (
+        image_width is not None
+        and image_height is not None
+        and int(image_width) > 0
+        and int(image_height) > 0
+    )
+    video_size: tuple[int, int] | None = (
+        (int(image_width), int(image_height)) if use_resize else None
+    )
+    if use_resize:
+        print(f"[INFO] Encoding videos at {video_size[0]}x{video_size[1]} (downscaled from PNGs)")
+    else:
+        print("[INFO] Encoding videos at native PNG resolution")
 
     # -- Load sources --------------------------------------------------------
     observations = load_rlbench_demo(pkl_path)
@@ -314,8 +333,16 @@ def convert(
                 f"chunk-{chunk_idx:03d}", f"file-{file_idx:03d}.mp4",
             )
             print(f"    Creating video {vid_out}")
-            images_to_video(img_dir, vid_out, start_frame, end_frame, fps,
-                            codec=VIDEO_CODEC, pix_fmt=PIX_FMT)
+            images_to_video(
+                img_dir,
+                vid_out,
+                start_frame,
+                end_frame,
+                fps,
+                codec=VIDEO_CODEC,
+                pix_fmt=PIX_FMT,
+                output_size=video_size,
+            )
 
         # -- Build parquet rows ----------------------------------------------
         timestamps = np.arange(n_frames, dtype=np.float64) / fps
@@ -438,8 +465,12 @@ def convert(
     # Write meta/info.json
     # =======================================================================
     from PIL import Image
-    sample_img = Image.open(os.path.join(front_rgb_dir, "0.png"))
-    img_w, img_h = sample_img.size
+
+    if use_resize:
+        img_w, img_h = int(image_width), int(image_height)
+    else:
+        sample_img = Image.open(os.path.join(front_rgb_dir, "0.png"))
+        img_w, img_h = sample_img.size
 
     splits = {
         "train": f"0:{n_episodes}",
@@ -1353,6 +1384,18 @@ def parse_args():
                    help="Root directory for output LeRobot datasets")
     p.add_argument("--fps", type=int, default=20,
                    help="Frames per second for the output dataset")
+    p.add_argument(
+        "--image_width",
+        type=int,
+        default=128,
+        help="LeRobot RGB video width (default: 128). Use 0 with --image_height 0 to keep native PNG size.",
+    )
+    p.add_argument(
+        "--image_height",
+        type=int,
+        default=128,
+        help="LeRobot RGB video height (default: 128). Use 0 with --image_width 0 to keep native PNG size.",
+    )
     p.add_argument("--episode", type=int, default=0,
                    help="Episode index inside the RLBench variation directory")
     p.add_argument("--use_context_prompt", action="store_true",
@@ -1442,6 +1485,16 @@ if __name__ == "__main__":
     print(f"[INFO] Variations to process: {variation_nums}")
     print(f"[INFO] Action spaces to export: {action_spaces}")
     print(f"[INFO] Strict variation mode: {args.strict_variations}")
+    if args.image_width <= 0 and args.image_height <= 0:
+        conv_image_w, conv_image_h = None, None
+        print("[INFO] LeRobot video resolution: native (from RLBench PNGs)")
+    elif args.image_width > 0 and args.image_height > 0:
+        conv_image_w, conv_image_h = args.image_width, args.image_height
+        print(f"[INFO] LeRobot video resolution: {conv_image_w}x{conv_image_h}")
+    else:
+        raise SystemExit(
+            "Invalid --image_width/--image_height: both must be positive, or both 0 for native resolution."
+        )
 
     overall_failed = False
 
@@ -1468,6 +1521,8 @@ if __name__ == "__main__":
                         episode_index_in_rlbench=args.episode,
                         use_context_prompt=args.use_context_prompt,
                         action_space=action_space,
+                        image_width=conv_image_w,
+                        image_height=conv_image_h,
                     )
                     successful_vars.append(var_num)
                 except Exception as e:

@@ -342,10 +342,13 @@ def images_to_video(
     fps: int = 10,
     codec: str = "libopenh264",
     pix_fmt: str = "yuv420p",
+    output_size: Optional[Tuple[int, int]] = None,
 ) -> str:
     """Encode a range of numbered PNGs [frame_start..frame_end] into an MP4.
 
     Images are expected as ``<image_dir>/<index>.png``.
+    If ``output_size`` is ``(width, height)``, frames are scaled with ffmpeg
+    before encode (use even dimensions for ``yuv420p``).
     Returns the output_path.
     """
     import tempfile, shutil
@@ -368,10 +371,17 @@ def images_to_video(
             "-framerate", str(fps),
             "-i", os.path.join(tmp_dir, "%06d.png"),
             "-frames:v", str(n_frames),
-            "-c:v", codec,
-            "-pix_fmt", pix_fmt,
-            output_path,
         ]
+        if output_size is not None:
+            ow, oh = int(output_size[0]), int(output_size[1])
+            cmd.extend(["-vf", f"scale={ow}:{oh}:flags=lanczos"])
+        cmd.extend(
+            [
+                "-c:v", codec,
+                "-pix_fmt", pix_fmt,
+                output_path,
+            ]
+        )
         subprocess.run(cmd, check=True, capture_output=True)
     finally:
         shutil.rmtree(tmp_dir)

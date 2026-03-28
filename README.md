@@ -352,6 +352,57 @@ bash scripts/core/eval.sh --all_tasks \
   --rlbench_root datasets/rlbench_<run_name>
 ```
 
+### Prompt-mode behavior (important)
+
+The eval pipeline now records and auto-aligns instruction style to match the
+training dataset style for the loaded checkpoint:
+
+- `lerobot_trial_2` style -> concise instruction text (no context block)
+- `lerobot_trial_3` style -> full context prompt text
+
+How it works:
+
+- wrappers pass `--checkpoint` and `--dataset_root` to `eval.py`
+- `eval.py` reads checkpoint `train_config.json` and dataset
+  `meta/tasks.parquet` to infer expected style
+- if requested prompt mode conflicts with expected training style, eval logs a
+  mismatch and auto-switches to the expected mode
+
+Practical implication:
+
+- you can still pass `--with_context_prompt`, but eval will override it when it
+  would mismatch the checkpoint's training-style dataset
+- this prevents evaluating a trial-2 model with trial-3 style prompts (and
+  vice-versa)
+
+### Which checkpoint is selected automatically?
+
+`scripts/core/eval_rlbench_all_tasks.sh` and
+`scripts/core/eval_rlbench_single_task.sh` discover checkpoints from
+`--checkpoint_root` (default: `output/lerobot`) by naming pattern:
+
+- policy name (`groot` or `smolvla`)
+- state (`eef` or `joint`)
+- task/all-task tags
+- newest timestamp-like suffix
+
+If you keep your runs under `output/lerobot`, you usually do **not** need to
+provide explicit checkpoint paths.
+
+For strict debugging, point `--checkpoint_root` to an isolated folder containing
+only the model(s) you want to compare.
+
+### RLBench root selection note
+
+If `--rlbench_root` does not contain `<task>_relationship_template.json`, the
+wrappers attempt auto-fallback from dataset naming:
+
+- `dataset_parent=.../lerobot_trial_2` -> try `datasets/rlbench_trial_2`
+- `dataset_parent=.../lerobot_trial_3` -> try `datasets/rlbench_trial_3`
+
+If your project convention is different (for example both trial2 and trial3
+datasets use `rlbench_trial_2` templates), pass `--rlbench_root` explicitly.
+
 ### Summarize-only mode
 
 ```bash
@@ -366,8 +417,7 @@ bash scripts/core/eval.sh --all_tasks \
 
 ### Advanced `eval.py` options
 
-`src/inference/rlbench/eval.py` contains newer evaluation features that are not
-all exposed by the thin shell wrappers yet, including:
+`src/inference/rlbench/eval.py` contains advanced evaluation features:
 
 - `--robot_setup` with support for `panda`, `jaco`, `mico`, `sawyer`, `ur5`
 - `--with_context_prompt` for context-rich per-segment instructions
@@ -397,6 +447,9 @@ Current evaluation behavior:
 - otherwise, evaluation falls back to legacy instruction/gripper-change logic
 - `joint_velocity` is restricted to `robot_setup=panda`
 - non-Panda robots should use `ee_planning` or `ee_ik`
+- prompt mode may be auto-aligned to training dataset style (recorded in output
+  metadata fields `requested_with_context_prompt`, `expected_with_context_prompt`,
+  and `with_context_prompt`)
 
 Outputs typically include:
 
@@ -406,6 +459,39 @@ Outputs typically include:
 - `detailed_summary.json`
 - `detailed_runs.csv`
 - `overall_metrics.csv`
+
+### Output directory structure (`output/rlbench_eval`)
+
+Single-task wrapper (default):
+
+```text
+output/rlbench_eval/<task>[/_with_context_prompt]/
+└── <policy>_<state>[_<robot_setup>]/
+    ├── run_000/
+    │   ├── planner/episodes/episode0/...
+    │   ├── policy/episodes/episode0/...
+    │   └── metrics.json
+    ├── summary.json
+    ├── per_run_metrics.json
+    └── per_run_metrics.csv
+```
+
+All-task wrapper (default):
+
+```text
+output/rlbench_eval/all_tasks[_with_context_prompt]/
+├── <policy>_<state>[_<robot_setup>]/
+│   ├── <task_1>/run_000/.../metrics.json
+│   ├── <task_2>/run_000/.../metrics.json
+│   └── all_tasks_summary.json
+├── detailed_summary.json
+├── detailed_runs.csv
+└── overall_metrics.csv
+```
+
+For debugging comparisons, prefer explicit save roots, e.g.
+`output/rlbench_eval_debug/trial2_auto_aligned_check` and
+`output/rlbench_eval_debug/trial3_auto_aligned_check`.
 
 Notebook for inspection:
 

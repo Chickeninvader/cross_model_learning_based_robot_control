@@ -7,6 +7,9 @@ DATASET_PATH=""
 OUTPUT_ROOT=""
 EPISODE="0"
 FPS="20"
+# LeRobot RGB video size (ffmpeg scale). Set both to 0 for native PNG resolution (e.g. 256x256).
+IMAGE_WIDTH="${IMAGE_WIDTH:-128}"
+IMAGE_HEIGHT="${IMAGE_HEIGHT:-128}"
 ACTION_SPACE="both"
 USE_CONTEXT_PROMPT="false"
 TASKS_CSV=""
@@ -28,6 +31,8 @@ Optional:
   --tasks <csv>               Comma-separated task names (default: all task folders)
   --episode <id>              Episode index (default: 0)
   --fps <num>                 Output FPS (default: 20)
+  --image-width <n>           LeRobot video width (default: env IMAGE_WIDTH or 128; 0 = native)
+  --image-height <n>         LeRobot video height (default: env IMAGE_HEIGHT or 128; 0 = native)
   --action-space <mode>       eef|joint|both (default: both)
   --use-context-prompt        Enable context prompt mode
   --no-merge-all-tasks        Skip final merge to all_task_eef/joint
@@ -71,6 +76,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --fps)
       FPS="${2:-}"
+      shift 2
+      ;;
+    --image-width)
+      IMAGE_WIDTH="${2:-}"
+      shift 2
+      ;;
+    --image-height)
+      IMAGE_HEIGHT="${2:-}"
       shift 2
       ;;
     --action-space)
@@ -142,6 +155,15 @@ if ! [[ "$FPS" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
+if ! [[ "$IMAGE_WIDTH" =~ ^[0-9]+$ && "$IMAGE_HEIGHT" =~ ^[0-9]+$ ]]; then
+  echo "Error: --image-width and --image-height must be non-negative integers" >&2
+  exit 1
+fi
+if [[ "$IMAGE_WIDTH" -eq 0 && "$IMAGE_HEIGHT" -ne 0 ]] || [[ "$IMAGE_HEIGHT" -eq 0 && "$IMAGE_WIDTH" -ne 0 ]]; then
+  echo "Error: for native resolution, both --image-width and --image-height must be 0" >&2
+  exit 1
+fi
+
 mkdir -p "$OUTPUT_ROOT"
 
 declare -a TASKS=()
@@ -176,6 +198,7 @@ echo "RLBench dataset path: $DATASET_PATH"
 echo "LeRobot output root:  $OUTPUT_ROOT"
 echo "Episode:              $EPISODE"
 echo "FPS:                  $FPS"
+echo "Image width x height:   ${IMAGE_WIDTH}x${IMAGE_HEIGHT} (0x0 = native PNG size)"
 echo "Action space:         $ACTION_SPACE"
 echo "Use context prompt:   $USE_CONTEXT_PROMPT"
 echo "Merge all tasks:      $MERGE_ALL_TASKS"
@@ -198,6 +221,8 @@ for task in "${TASKS[@]}"; do
     --rlbench_root "$DATASET_PATH"
     --output_root "$OUTPUT_ROOT"
     --fps "$FPS"
+    --image_width "$IMAGE_WIDTH"
+    --image_height "$IMAGE_HEIGHT"
     --episode "$EPISODE"
     --action_space "$ACTION_SPACE"
   )

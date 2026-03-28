@@ -14,6 +14,10 @@ def split_task_description_into_steps(task_description: str) -> list[str]:
     if not text:
         return [""]
 
+    # Keep ConceptGraphs-style context prompts as one exact instruction string.
+    if text.startswith("This prompt describes a robotic manipulation task using scene graphs."):
+        return [text]
+
     if "|" in text:
         parts = [part.strip() for part in text.split("|")]
     elif "\n" in text:
