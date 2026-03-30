@@ -50,4 +50,5 @@ external/
 src/install.sh
 scripts/install.sh
 .cursor/
-.claude/
+.claude/*
+.claude/settings.local.json
