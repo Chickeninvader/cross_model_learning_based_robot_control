@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Tee stdout/stderr to:
-#   ${REPO_ROOT}/output/script_logs/<path-to-script-under-repo>/<stem>_YYYYMMDD_HHMMSS.log
+#   ${REPO_ROOT}/output/script_logs/<path-to-script-under-repo>/<stem>/<timestamp>.log
 #
 # Usage (from a repo shell script, after set -euo pipefail):
 #   SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,9 +46,13 @@ _STEM="$(basename -- "${_CALLER_ABS}")"
 _STEM="${_STEM%.sh}"
 _TS="$(date +%Y%m%d_%H%M%S)"
 _LOG_ROOT="${SCRIPT_LOG_ROOT:-${REPO_ROOT}/output/script_logs}"
-_LOG_DIR="${_LOG_ROOT}/${_REL_DIR}"
+if [[ -n "${_REL_DIR}" ]]; then
+  _LOG_DIR="${_LOG_ROOT}/${_REL_DIR}/${_STEM}"
+else
+  _LOG_DIR="${_LOG_ROOT}/${_STEM}"
+fi
 mkdir -p "${_LOG_DIR}"
-SCRIPT_LOG_FILE="${_LOG_DIR}/${_STEM}_${_TS}.log"
+SCRIPT_LOG_FILE="${_LOG_DIR}/${_TS}.log"
 export SCRIPT_LOG_FILE
 
 echo "Script log file: ${SCRIPT_LOG_FILE}" >&2

@@ -349,19 +349,16 @@ Environment overrides are listed at the top of
 
 ## RLBench Evaluation
 
-### Canonical wrappers
+### Shell entrypoint (`scripts/core/eval.sh`)
 
-The maintained shell entrypoints are:
+One script covers **single-task** (default) and **all-task** (`--all_tasks`)
+evaluation. Run `./scripts/core/eval.sh --help` for the full flag list.
 
-- `scripts/core/eval.sh`
-- `scripts/core/eval_rlbench_single_task.sh`
-- `scripts/core/eval_rlbench_all_tasks.sh`
-- `src/inference/rlbench/eval.sh` as a compatibility wrapper
-
-### Single-task evaluation
+**Single-task** (checkpoint folder names must match the **task** plus policy and
+`eef` / `joint` under `--checkpoint_root`):
 
 ```bash
-bash scripts/core/eval.sh \
+./scripts/core/eval.sh \
   --task put_rubbish_in_bin \
   --runs 10 \
   --variation 0 \
@@ -369,10 +366,11 @@ bash scripts/core/eval.sh \
   --rlbench_root datasets/rlbench_<run_name>
 ```
 
-### All-task evaluation
+**All-task** (checkpoint folder names must include a multi-task tag such as
+`all_task`; override with `--checkpoint_tags`):
 
 ```bash
-bash scripts/core/eval.sh --all_tasks \
+./scripts/core/eval.sh --all_tasks \
   --tasks put_rubbish_in_bin,put_banana_in_bin,lamp_on,push_button,meat_on_grill \
   --runs 10 \
   --variation 0 \
@@ -380,6 +378,12 @@ bash scripts/core/eval.sh --all_tasks \
   --dataset_parent datasets/lerobot_<run_name> \
   --rlbench_root datasets/rlbench_<run_name>
 ```
+
+**Resume:** add `--skip_completed` to reuse per-task outputs when
+`summary.json` matches the current run settings (see help text).
+
+For debugging, you can call `src/inference/rlbench/eval.py` directly (same
+arguments the shell builds).
 
 ### Prompt-mode behavior (important)
 
@@ -406,9 +410,8 @@ Practical implication:
 
 ### Which checkpoint is selected automatically?
 
-`scripts/core/eval_rlbench_all_tasks.sh` and
-`scripts/core/eval_rlbench_single_task.sh` discover checkpoints from
-`--checkpoint_root` (default: `output/lerobot`) by naming pattern:
+`scripts/core/eval.sh` discovers checkpoints from `--checkpoint_root`
+(default: `output/lerobot`) by naming pattern:
 
 - policy name (`groot` or `smolvla`)
 - state (`eef` or `joint`)

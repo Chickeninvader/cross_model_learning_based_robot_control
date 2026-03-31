@@ -435,6 +435,62 @@ def _evaluate_single_task(
     return summary
 
 
+def _norm_compare_path(path: str | None) -> str:
+    if not path:
+        return ""
+    return os.path.normpath(os.path.abspath(os.path.expanduser(path)))
+
+
+def _load_task_summary_json(task_save_path: str) -> dict | None:
+    summary_path = os.path.join(task_save_path, "summary.json")
+    if not os.path.isfile(summary_path):
+        return None
+    try:
+        with open(summary_path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _existing_summary_matches_args(
+    summary: dict,
+    task_name: str,
+    args: argparse.Namespace,
+) -> bool:
+    """True if on-disk summary.json matches current eval knobs (safe to skip re-run)."""
+    if summary.get("task") != task_name:
+        return False
+    try:
+        if int(summary.get("runs", -1)) != int(args.runs):
+            return False
+        if int(summary.get("variation", -(2**31))) != int(args.variation):
+            return False
+        if int(summary.get("seed", -(2**31))) != int(args.seed):
+            return False
+    except (TypeError, ValueError):
+        return False
+    if summary.get("robot_setup") != args.robot_setup:
+        return False
+    if summary.get("action_mode") != args.action_mode:
+        return False
+    if bool(summary.get("with_context_prompt")) != bool(args.with_context_prompt):
+        return False
+    if args.checkpoint is not None:
+        ck_s = summary.get("checkpoint")
+        if ck_s is None:
+            return False
+        if _norm_compare_path(str(ck_s)) != _norm_compare_path(args.checkpoint):
+            return False
+    if args.dataset_root is not None:
+        ds_s = summary.get("dataset_root")
+        if ds_s is None:
+            return False
+        if _norm_compare_path(str(ds_s)) != _norm_compare_path(args.dataset_root):
+            return False
+    return True
+
+
 def run_evaluation(args: argparse.Namespace) -> None:
     """Main entry point.  Loads model and env once, then iterates tasks."""
 
@@ -531,6 +587,20 @@ def run_evaluation(args: argparse.Namespace) -> None:
     all_summaries: list[dict] = []
     for task_name in task_list:
         task_save_path = os.path.join(args.save_path, task_name) if len(task_list) > 1 else args.save_path
+        if args.skip_completed:
+            cached = _load_task_summary_json(task_save_path)
+            if cached is not None and _existing_summary_matches_args(cached, task_name, args):
+                print(
+                    f"\n[skip_completed] Task {task_name}: reusing {task_save_path}/summary.json "
+                    f"(runs={args.runs} variation={args.variation} seed={args.seed})."
+                )
+                all_summaries.append(cached)
+                continue
+            if cached is not None:
+                print(
+                    f"\n[skip_completed] Task {task_name}: existing summary.json does not match "
+                    "current settings; re-evaluating."
+                )
         try:
             summary = _evaluate_single_task(
                 task_name, env, policy, args, rlbench_root, task_save_path, eval_metadata,
@@ -604,7 +674,7 @@ def parse_args() -> argparse.Namespace:
             "RLBench robot: panda, jaco, mico, sawyer, ur5 "
             "(aliases: franka, franka_panda -> panda). "
             "Non-panda arms cannot use joint_velocity; use ee_planning or ee_ik. "
-            "scripts/core/eval_rlbench_all_tasks.sh passes this via --robot_setup."
+            "scripts/core/eval.sh passes this via --robot_setup."
         ),
     )
     parser.add_argument("--renderer", type=str, default="opengl", choices=["opengl", "opengl3"])
@@ -630,6 +700,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--save_path", type=str, default="output/rlbench_eval/default_task")
+    parser.add_argument(
+        "--skip_completed",
+        action="store_true",
+        help=(
+            "If task output dir already has summary.json matching this run's "
+            "task, runs, variation, seed, robot_setup, action_mode, with_context_prompt, "
+            "checkpoint, and dataset_root, skip re-evaluating that task."
+        ),
+    )
     parser.add_argument(
         "--aggregate_only",
         action="store_true",
