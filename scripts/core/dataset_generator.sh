@@ -11,7 +11,7 @@ OUT_ROOT="${OUT_ROOT:-}"
 PY="${PY:-python}"
 PROCESSES="${PROCESSES:-4}"
 EPISODES_PER_TASK="${EPISODES_PER_TASK:-1}"
-START_VARIATION="${START_VARIATION:-20}"
+START_VARIATION="${START_VARIATION:-0}"
 IMAGE_WIDTH="${IMAGE_WIDTH:-256}"
 IMAGE_HEIGHT="${IMAGE_HEIGHT:-256}"
 RENDERER="${RENDERER:-opengl3}"
@@ -32,6 +32,8 @@ Notes:
   - <num_variations> must be a positive integer.
   - Episodes per variation defaults to 1. Override with:
       EPISODES_PER_TASK=<N> scripts/dataset_generator.sh ...
+  - Start variation defaults to 0. Override with:
+      START_VARIATION=<N> scripts/dataset_generator.sh ...
   - OUT_ROOT (env var) is required: the RLBench dataset root to write into.
     Example:
       OUT_ROOT=datasets/rlbench_<run_name> scripts/dataset_generator.sh ...
@@ -94,9 +96,16 @@ export PYTHONPATH="$REPO_ROOT/external/RLBench:$REPO_ROOT/external/lerobot/src:$
 cd "$RLBENCH_ROOT"
 mkdir -p "$OUT_ROOT"
 
+supports_start_variation=0
+if [ -f "$RLBENCH_ROOT/rlbench/dataset_generator.py" ] && \
+   rg -q -- '--start_variation' "$RLBENCH_ROOT/rlbench/dataset_generator.py"; then
+  supports_start_variation=1
+fi
+
 echo "--------------------------------------"
 echo "Variations per task: $NUM_VARIATIONS"
 echo "Episodes per variation: $EPISODES_PER_TASK"
+echo "Start variation: $START_VARIATION"
 echo "Tasks to generate: ${#task_names[@]}"
 printf '%s\n' "${task_names[@]}"
 echo "Output path: $OUT_ROOT"
@@ -112,15 +121,24 @@ for task_name in "${task_names[@]}"; do
   echo "Running task: $task_name"
   echo "======================================"
 
-  if "$PY" -m rlbench.dataset_generator \
-    --tasks "$task_name" \
-    --episodes_per_task "$EPISODES_PER_TASK" \
-    --variations "$NUM_VARIATIONS" \
-    --start_variation "$START_VARIATION" \
-    --processes "$PROCESSES" \
-    --image_size "$IMAGE_WIDTH" "$IMAGE_HEIGHT" \
-    --renderer "$RENDERER" \
-    --save_path "$OUT_ROOT"; then
+  cmd=(
+    "$PY" -m rlbench.dataset_generator
+    --tasks "$task_name"
+    --episodes_per_task "$EPISODES_PER_TASK"
+    --variations "$NUM_VARIATIONS"
+    --processes "$PROCESSES"
+    --image_size "$IMAGE_WIDTH" "$IMAGE_HEIGHT"
+    --renderer "$RENDERER"
+    --save_path "$OUT_ROOT"
+  )
+
+  if [ "$supports_start_variation" -eq 1 ]; then
+    cmd+=(--start_variation "$START_VARIATION")
+  elif [ "$START_VARIATION" != "0" ]; then
+    echo "Warning: this RLBench checkout does not support --start_variation; ignoring START_VARIATION=$START_VARIATION" >&2
+  fi
+
+  if "${cmd[@]}"; then
     success_tasks+=("$task_name")
   else
     echo "Task failed: $task_name"

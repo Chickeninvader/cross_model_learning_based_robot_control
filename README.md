@@ -51,7 +51,16 @@ repo is the RLBench/LeRobot path described below.
 
 ## Setup
 
-### 1. External dependencies
+### 1. Conda environment
+
+For local runs outside Docker, Conda is required. From the repository root:
+
+```bash
+conda env create -f environment.yml
+conda activate rlbench_gui
+```
+
+### 2. External dependencies
 
 From the repository root:
 
@@ -61,35 +70,7 @@ bash scripts/core/setup_external.sh
 
 This prepares `external/RLBench` and `external/lerobot`.
 
-`external/RLBench` is cloned from this project's RLBench fork:
-
-```bash
-https://github.com/chickeninvader/upstream.git
-```
-
-`setup_external.sh` uses HTTPS for RLBench so it can clone on machines that do
-not have GitHub SSH keys configured.
-
-If you already have local RLBench changes in `external/RLBench` and want to
-publish them to your fork for deployment:
-
-```bash
-git -C external/RLBench remote -v
-git -C external/RLBench remote add upstream https://github.com/stepjam/RLBench.git
-git -C external/RLBench add .
-git -C external/RLBench commit -m "Track project-specific RLBench changes"
-git -C external/RLBench push -u origin main
-```
-
-Note: make sure the push runs inside `external/RLBench` or uses
-`git -C external/RLBench ...`; a plain `git push -u origin main` from the repo
-root pushes this repository, not the nested RLBench fork.
-
-If cloning RLBench still fails, the fork is likely private or the repository
-name is wrong. In that case, make the fork accessible or update the URL in
-`scripts/core/setup_external.sh`.
-
-### 2. Python path
+### 3. Python path
 
 For local shell runs and notebooks, start from the repository root and export:
 
@@ -99,7 +80,9 @@ export PYTHONPATH="$PWD:$PWD/src:$PWD/external/RLBench:$PWD/external/lerobot/src
 
 This matters especially for notebooks and `src/data_collection/apply_template_batch.py`.
 
-### 3. Optional Docker workflow
+### 4. Optional Docker workflow
+
+If you use Docker, you do not need the local Conda environment above.
 
 If you use the provided container setup, start it from the repository root:
 
@@ -128,13 +111,13 @@ Optional defaults in `scripts/core/dataset_generator.sh`:
 
 - RLBench root: `external/RLBench` (override with `RLBENCH_ROOT`)
 - episodes per variation: `1`
-- start variation: `20`
+- start variation: `0`
 - renderer: `opengl3`
 
-If you want a fresh run from variation 0, override the default:
+To start from a non-zero variation, override the default:
 
 ```bash
-START_VARIATION=0 bash scripts/core/dataset_generator.sh 5 lamp_on push_button
+START_VARIATION=20 bash scripts/core/dataset_generator.sh 5 lamp_on push_button
 ```
 
 Useful environment overrides:
