@@ -194,3 +194,13 @@ Use current files:
 
 Do not use removed legacy paths like `infer_rlbench.py` or task-specific eval script names.
 
+
+## Cursor Rules and Skills
+This repo includes Cursor rules and skills under `.cursor/` to keep the agent consistent with how this pipeline is meant to be used:
+
+- Project rules: `.cursor/rules/*.mdc` (short, always-on conventions like path/import norms and pipeline safety/repro guidelines)
+- Project skills:
+  - `.cursor/skills/robotics-pipeline-workflow/SKILL.md` for the step ordering from dataset generation -> scene graph templates -> LeRobot conversion -> upload to training host -> training -> checkpoint download -> evaluation
+  - `.cursor/skills/robotics-eval-and-experiments/SKILL.md` for fair evaluation comparisons, metrics logging, and experiment result summaries
+
+When working on data collection (`info.json` -> relationship templates), start from `src/data_collection/README.md` and follow the pipeline skill for the correct step ordering.

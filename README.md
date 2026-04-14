@@ -582,15 +582,6 @@ To reduce drift, the documentation is now split intentionally:
 - `src/data_collection/README.md`: short data-collection quick reference
 - `TROUBLESHOOTING.md`: debugging notes and environment-specific fixes
 
-## Cursor Rules and Skills
-This repo includes Cursor rules and skills under `.cursor/` to keep the agent consistent with how this pipeline is meant to be used:
-
-- Project rules: `.cursor/rules/*.mdc` (short, always-on conventions like path/import norms and pipeline safety/repro guidelines)
-- Project skills:
-  - `.cursor/skills/robotics-pipeline-workflow/SKILL.md` for the step ordering from dataset generation -> scene graph templates -> LeRobot conversion -> upload to training host -> training -> checkpoint download -> evaluation
-  - `.cursor/skills/robotics-eval-and-experiments/SKILL.md` for fair evaluation comparisons, metrics logging, and experiment result summaries
-
-When working on data collection (`info.json` -> relationship templates), start from `src/data_collection/README.md` and follow the pipeline skill for the correct step ordering.
 
 ## Troubleshooting
 
@@ -602,3 +593,17 @@ See `TROUBLESHOOTING.md` for:
 - `.rrd` export problems
 - Sol/flash-attn and `torchcodec` issues
 - evaluation path confusion
+
+## Showcase and demo videos
+
+-  [Poster (ASU Capstone Showcase)](https://showcase.asucapstone.com/survey/10407)
+
+Example RLBench policy runs (When a task has two subtasks, they are numbered `_1` and `_2`)
+
+| Demo | Take 1 | Take 2 |
+|------|--------|--------|
+| `lamp_on` | [`video/lamp_on.mp4`](video/lamp_on.mp4) | — |
+| `meat_on_grill` | [`video/meat_on_grill_1.mp4`](video/meat_on_grill_1.mp4) | [`video/meat_on_grill_2.mp4`](video/meat_on_grill_2.mp4) |
+| `push_button` | [`video/push_button.mp4`](video/push_button.mp4) | — |
+| `put_banana_in_bin` | [`video/put_banana_in_bin_1.mp4`](video/put_banana_in_bin_1.mp4) | [`video/put_banana_in_bin_2.mp4`](video/put_banana_in_bin_2.mp4) |
+| `put_rubbish_in_bin` | [`video/put_rubbish_in_bin_1.mp4`](video/put_rubbish_in_bin_1.mp4) | [`video/put_rubbish_in_bin_2.mp4`](video/put_rubbish_in_bin_2.mp4) |
