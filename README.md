@@ -7,6 +7,21 @@ training -> RLBench evaluation pipeline used in this project.
 `src/data_collection/README.md` is kept as a short quick reference, and
 `TROUBLESHOOTING.md` collects operational/debug notes.
 
+
+## Showcase and demo videos
+
+[Poster (ASU Capstone Showcase)](https://showcase.asucapstone.com/survey/10407)
+
+Example RLBench policy runs (When a task has two subtasks, they are numbered `_1` and `_2`)
+
+| Demo | Take 1 | Take 2 |
+|------|--------|--------|
+| `lamp_on` | [`video/lamp_on.mp4`](video/lamp_on.mp4) | — |
+| `meat_on_grill` | [`video/meat_on_grill_1.mp4`](video/meat_on_grill_1.mp4) | [`video/meat_on_grill_2.mp4`](video/meat_on_grill_2.mp4) |
+| `push_button` | [`video/push_button.mp4`](video/push_button.mp4) | — |
+| `put_banana_in_bin` | [`video/put_banana_in_bin_1.mp4`](video/put_banana_in_bin_1.mp4) | [`video/put_banana_in_bin_2.mp4`](video/put_banana_in_bin_2.mp4) |
+| `put_rubbish_in_bin` | [`video/put_rubbish_in_bin_1.mp4`](video/put_rubbish_in_bin_1.mp4) | [`video/put_rubbish_in_bin_2.mp4`](video/put_rubbish_in_bin_2.mp4) |
+
 ## Current Status
 
 The codebase already reflects substantial recent work. The current pipeline
@@ -594,16 +609,3 @@ See `TROUBLESHOOTING.md` for:
 - Sol/flash-attn and `torchcodec` issues
 - evaluation path confusion
 
-## Showcase and demo videos
-
--  [Poster (ASU Capstone Showcase)](https://showcase.asucapstone.com/survey/10407)
-
-Example RLBench policy runs (When a task has two subtasks, they are numbered `_1` and `_2`)
-
-| Demo | Take 1 | Take 2 |
-|------|--------|--------|
-| `lamp_on` | [`video/lamp_on.mp4`](video/lamp_on.mp4) | — |
-| `meat_on_grill` | [`video/meat_on_grill_1.mp4`](video/meat_on_grill_1.mp4) | [`video/meat_on_grill_2.mp4`](video/meat_on_grill_2.mp4) |
-| `push_button` | [`video/push_button.mp4`](video/push_button.mp4) | — |
-| `put_banana_in_bin` | [`video/put_banana_in_bin_1.mp4`](video/put_banana_in_bin_1.mp4) | [`video/put_banana_in_bin_2.mp4`](video/put_banana_in_bin_2.mp4) |
-| `put_rubbish_in_bin` | [`video/put_rubbish_in_bin_1.mp4`](video/put_rubbish_in_bin_1.mp4) | [`video/put_rubbish_in_bin_2.mp4`](video/put_rubbish_in_bin_2.mp4) |
