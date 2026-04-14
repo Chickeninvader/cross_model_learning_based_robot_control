@@ -589,23 +589,3 @@ Notebook for inspection:
 
 - `src/inference/rlbench/inspect_eval_run.ipynb`
 
-## Documentation Policy
-
-To reduce drift, the documentation is now split intentionally:
-
-- `README.md`: canonical project overview and active workflow
-- `src/data_collection/README.md`: short data-collection quick reference
-- `TROUBLESHOOTING.md`: debugging notes and environment-specific fixes
-
-
-## Troubleshooting
-
-See `TROUBLESHOOTING.md` for:
-
-- RLBench rendering/display issues
-- missing scene-graph/template artifacts
-- LeRobot conversion failures
-- `.rrd` export problems
-- Sol/flash-attn and `torchcodec` issues
-- evaluation path confusion
-
