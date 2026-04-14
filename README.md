@@ -100,8 +100,32 @@ pipeline and download the shared weights from:
 https://drive.google.com/drive/folders/1kXG7FoKQNmraj1NjDM-65lYpO7_2kS4w?usp=sharing
 ```
 
-Place the downloaded checkpoints where your evaluation workflow expects them,
-then continue with the inference/evaluation steps below.
+Place the downloaded zip files under `output/lerobot/` and extract them so the
+checkpoint folders land in the expected prompt-mode directories:
+
+```text
+output/lerobot/
+├── with_context_prompt/
+│   └── smolvla_all_task_eef_20260328_182423/
+└── without_context_prompt/
+    └── smolvla_all_task_eef_20260328_173446/
+```
+
+Each extracted run directory should contain checkpoint weights under
+`checkpoints/last/pretrained_model/` and/or
+`checkpoints/020000/pretrained_model/`, including `model.safetensors`.
+
+Example:
+
+```bash
+mkdir -p output/lerobot/with_context_prompt
+mkdir -p output/lerobot/without_context_prompt
+
+unzip output/lerobot/with_context_prompt/smolvla_all_task_eef_20260328_182423.zip -d .
+unzip output/lerobot/without_context_prompt/smolvla_all_task_eef_20260328_173446.zip -d .
+```
+
+After that, continue with the inference/evaluation steps below.
 
 If you need to reproduce or extend training from scratch, continue with the
 full end-to-end workflow below, including dataset generation, conversion,
