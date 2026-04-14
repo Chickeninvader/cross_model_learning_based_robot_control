@@ -60,10 +60,28 @@ bash scripts/core/setup_external.sh
 ```
 
 This prepares `external/OvSGTR`, `external/LASER`,
-`external/lang-segment-anything`, and `external/lerobot`.
+`external/lang-segment-anything`, `external/RLBench`, and `external/lerobot`.
 
-`external/RLBench` is also expected by the dataset and evaluation scripts, but
-it is not cloned by `setup_external.sh`; place it at `external/RLBench`.
+`external/RLBench` is cloned from this project's RLBench fork:
+
+```bash
+git@github.com:chickeninvader/upstream.git
+```
+
+If you already have local RLBench changes in `external/RLBench` and want to
+publish them to your fork for deployment:
+
+```bash
+git -C external/RLBench remote -v
+git -C external/RLBench remote add upstream https://github.com/stepjam/RLBench.git
+git -C external/RLBench add .
+git -C external/RLBench commit -m "Track project-specific RLBench changes"
+git -C external/RLBench push -u origin main
+```
+
+Note: make sure the push runs inside `external/RLBench` or uses
+`git -C external/RLBench ...`; a plain `git push -u origin main` from the repo
+root pushes this repository, not the nested RLBench fork.
 
 ### 2. Python path
 
@@ -557,4 +575,3 @@ See `TROUBLESHOOTING.md` for:
 - `.rrd` export problems
 - Sol/flash-attn and `torchcodec` issues
 - evaluation path confusion
-

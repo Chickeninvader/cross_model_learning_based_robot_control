@@ -2,7 +2,7 @@
 # ============================================================
 # Clone external dependencies into external/
 # Run from the project root:
-#   bash scripts/setup_external.sh
+#   bash scripts/core/setup_external.sh
 # ============================================================
 set -euo pipefail
 
@@ -11,8 +11,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 export REPO_ROOT
 # shellcheck source=../lib/init_script_logging.sh
 source "${SCRIPT_DIR}/../lib/init_script_logging.sh"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-EXT_DIR="$ROOT_DIR/external"
+EXT_DIR="$REPO_ROOT/external"
+
+RLBENCH_REPO_URL="git@github.com:chickeninvader/upstream.git"
 
 mkdir -p "$EXT_DIR"
 
@@ -46,6 +47,9 @@ clone_if_missing "LASER" \
 clone_if_missing "lang-segment-anything" \
     "https://github.com/luca-medeiros/lang-segment-anything.git" \
     ""  # latest main
+
+clone_if_missing "RLBench" \
+    "$RLBENCH_REPO_URL"
 
 clone_if_missing "lerobot" \
     "https://github.com/huggingface/lerobot.git" \
