@@ -13,7 +13,7 @@ export REPO_ROOT
 source "${SCRIPT_DIR}/../lib/init_script_logging.sh"
 EXT_DIR="$REPO_ROOT/external"
 
-RLBENCH_REPO_URL="https://github.com/chickeninvader/upstream.git"
+RLBENCH_REPO_URL="https://github.com/chickeninvader/RLBench.git"
 
 mkdir -p "$EXT_DIR"
 
