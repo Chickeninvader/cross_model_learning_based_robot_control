@@ -59,14 +59,16 @@ From the repository root:
 bash scripts/core/setup_external.sh
 ```
 
-This prepares `external/OvSGTR`, `external/LASER`,
-`external/lang-segment-anything`, `external/RLBench`, and `external/lerobot`.
+This prepares `external/RLBench` and `external/lerobot`.
 
 `external/RLBench` is cloned from this project's RLBench fork:
 
 ```bash
-git@github.com:chickeninvader/upstream.git
+https://github.com/chickeninvader/upstream.git
 ```
+
+`setup_external.sh` uses HTTPS for RLBench so it can clone on machines that do
+not have GitHub SSH keys configured.
 
 If you already have local RLBench changes in `external/RLBench` and want to
 publish them to your fork for deployment:
@@ -82,6 +84,10 @@ git -C external/RLBench push -u origin main
 Note: make sure the push runs inside `external/RLBench` or uses
 `git -C external/RLBench ...`; a plain `git push -u origin main` from the repo
 root pushes this repository, not the nested RLBench fork.
+
+If cloning RLBench still fails, the fork is likely private or the repository
+name is wrong. In that case, make the fork accessible or update the URL in
+`scripts/core/setup_external.sh`.
 
 ### 2. Python path
 
