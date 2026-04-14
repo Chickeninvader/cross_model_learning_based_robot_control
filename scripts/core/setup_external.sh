@@ -14,6 +14,8 @@ source "${SCRIPT_DIR}/../lib/init_script_logging.sh"
 EXT_DIR="$REPO_ROOT/external"
 
 RLBENCH_REPO_URL="https://github.com/chickeninvader/RLBench.git"
+LEROBOT_REPO_URL="https://github.com/huggingface/lerobot.git"
+LEROBOT_COMMIT="8fff0fde7c79f23a93d845d1a50e985de01f8b8a"
 
 mkdir -p "$EXT_DIR"
 
@@ -21,6 +23,7 @@ clone_if_missing() {
     local name="$1"
     local url="$2"
     local branch="${3:-}"
+    local commit="${4:-}"
     local dest="$EXT_DIR/$name"
 
     if [ -d "$dest" ]; then
@@ -32,6 +35,11 @@ clone_if_missing() {
         else
             git clone "$url" "$dest"
         fi
+
+        if [ -n "$commit" ]; then
+            echo "[checkout] $name → $commit"
+            git -C "$dest" checkout "$commit"
+        fi
     fi
 }
 
@@ -42,7 +50,9 @@ clone_if_missing "RLBench" \
     "main"
 
 clone_if_missing "lerobot" \
-    "https://github.com/huggingface/lerobot.git"
+    "$LEROBOT_REPO_URL" \
+    "" \
+    "$LEROBOT_COMMIT"
 
 echo ""
 echo "All external dependencies are ready in $EXT_DIR"
