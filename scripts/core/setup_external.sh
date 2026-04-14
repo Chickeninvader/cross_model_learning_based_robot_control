@@ -20,20 +20,26 @@ mkdir -p "$EXT_DIR"
 clone_if_missing() {
     local name="$1"
     local url="$2"
+    local branch="${3:-}"
     local dest="$EXT_DIR/$name"
 
     if [ -d "$dest" ]; then
         echo "[skip] $name already exists at $dest"
     else
         echo "[clone] $name → $dest"
-        git clone "$url" "$dest"
+        if [ -n "$branch" ]; then
+            git clone --branch "$branch" --single-branch "$url" "$dest"
+        else
+            git clone "$url" "$dest"
+        fi
     fi
 }
 
 # ---- Repositories ----
 
 clone_if_missing "RLBench" \
-    "$RLBENCH_REPO_URL"
+    "$RLBENCH_REPO_URL" \
+    "main"
 
 clone_if_missing "lerobot" \
     "https://github.com/huggingface/lerobot.git"
