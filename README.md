@@ -93,6 +93,20 @@ docker compose up -d
 Do not run `docker compose` from `external/RLBench`; the tracked
 `docker-compose.yml` lives at the repo root.
 
+If you only want to run inference/evaluation, you can skip the full training
+pipeline and download the shared weights from:
+
+```text
+https://drive.google.com/drive/folders/1kXG7FoKQNmraj1NjDM-65lYpO7_2kS4w?usp=sharing
+```
+
+Place the downloaded checkpoints where your evaluation workflow expects them,
+then continue with the inference/evaluation steps below.
+
+If you need to reproduce or extend training from scratch, continue with the
+full end-to-end workflow below, including dataset generation, conversion,
+transfer, training, checkpoint download, and evaluation.
+
 ## End-to-End Workflow
 
 ### 1. Generate RLBench raw data
